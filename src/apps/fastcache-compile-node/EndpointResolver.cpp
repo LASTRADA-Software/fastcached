@@ -103,11 +103,13 @@ std::optional<std::string> ProbeRouteHost(IRouteProbe const& probe, std::span<st
 
 std::vector<std::string> SchedulerProbeTargets::Targets() const
 {
-    // A name is skipped: the probe resolves nothing. Repeats are asked once.
+    // A name is skipped: the probe resolves nothing. So is a host no answer for could survive -- a
+    // voter's own scheduler is dialled on loopback, and the route to loopback leaves from loopback.
+    // Repeats are asked once.
     std::vector<std::string> targets;
     for (auto const& endpoint: _schedulers.Current())
         if (auto const host = HostOfEndpoint(endpoint);
-            IsIpLiteralHost(host) && std::ranges::find(targets, host) == targets.end())
+            IsIpLiteralHost(host) && IsUsableRouteHost(host) && std::ranges::find(targets, host) == targets.end())
             targets.emplace_back(host);
     return targets;
 }
@@ -184,16 +186,21 @@ bool EndpointResolver::RefreshLocked()
     auto cfg = _config.Current();
     NoticePinned(cfg.advertise);
 
+    // Where to ask is due as well when it MOVED: a voter's targets are the peers its applied state
+    // records, which arrive after the start probed the default route alone -- and a split-tunnel
+    // machine reaches those peers from another address than its default route's.
+    auto targets = _targets.Targets();
     auto const now = _clock.now();
-    auto const due = stale || !_lastProbe.has_value() || now - *_lastProbe >= RefreshInterval;
+    auto const due = stale || !_lastProbe.has_value() || now - *_lastProbe >= RefreshInterval || targets != _lastTargets;
     if (due && FollowsRoute(cfg))
     {
         _lastProbe = now;
         // Nothing usable keeps the last route host: a machine that dropped off the network still
         // answers wherever it comes back, and an empty or loopback endpoint helps nobody. The probe
         // is stamped either way, so a lost route is asked again at the next event or interval.
-        if (auto found = ProbeRouteHost(_probe, _targets.Targets()))
+        if (auto found = ProbeRouteHost(_probe, targets))
             _routeHost.Set(*std::move(found));
+        _lastTargets = std::move(targets);
     }
 
     // The live route host, over whatever the snapshot carries: a reload candidate was shaped by the

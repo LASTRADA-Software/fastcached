@@ -4,8 +4,10 @@
 #include "NodeAnnounce.hpp"
 #include "NodeConfig.hpp"
 #include "NodeDefaults.hpp"
+#include "NodeFormation.hpp"
 #include "SchedulerLink.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostEvents.hpp>
@@ -490,9 +492,61 @@ TEST_CASE("An empty route host leaves the configuration with none", "[node][endp
 
 TEST_CASE("The preferred targets are the IP literals among where this node registers", "[node][endpoint]")
 {
-    FixedSchedulers const schedulers { { "10.0.0.1:6675", "sched.lan:6675", "[fd00::1]:6675", "10.0.0.1:6676" } };
+    // Never a loopback one: a voter's own scheduler is dialled there, and the route to loopback
+    // leaves from loopback, which no answer survives.
+    FixedSchedulers const schedulers {
+        { "127.0.0.1:6674", "10.0.0.1:6675", "sched.lan:6675", "[fd00::1]:6675", "10.0.0.1:6676", "[::1]:6674" }
+    };
     SchedulerProbeTargets const targets { schedulers };
     CHECK(targets.Targets() == std::vector<std::string> { "10.0.0.1", "fd00::1" });
+}
+
+TEST_CASE("A voter probes the peer voters its applied state records before the default route", "[node][endpoint][roaming]")
+{
+    // A laptop voter on a split-tunnel VPN: its default route leaves through the home LAN, while the
+    // office voters are reached through the tunnel. Advertising the default route's address would
+    // name one the office cannot dial. RED before a voter's targets held its recorded peers: the
+    // targets were its own loopback scheduler alone, which no probe answer survives.
+    auto const voter = Testing::FirstStart(NodeConfig {});
+    REQUIRE(ServesScheduler(voter));
+    AppliedSchedulers schedulers { voter, AsConfigured };
+    auto state = Cluster::ClusterState {};
+    state.members = { Cluster::ClusterMember { .id = "office",
+                                               .raftEndpoint = "10.20.0.1:6680",
+                                               .schedulerEndpoint = "10.20.0.1:6674",
+                                               .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
+                                               .seat = Cluster::MemberSeat::Voter,
+                                               .publicKey = {} } };
+
+    FakeRouteProbe probe;
+    probe.Answer("10.20.0.1", "10.8.0.7");      // through the tunnel
+    probe.Answer(DefaultRoute, "192.168.1.20"); // the home LAN
+    SchedulerProbeTargets const targets { schedulers };
+    FixedConfig const config { WildcardNode("192.168.1.20") };
+    core::platform::ManualClock clock;
+    RouteHostCell routeHost { "192.168.1.20" };
+    AnnouncedEndpoint node { AdvertisedEndpoint(config.Current()) };
+    AnnouncedEndpoint raft { RaftSelfEndpoint(config.Current()) };
+    AtomicMetricsSink metrics;
+    CapturingLogger logger;
+    EndpointResolver resolver { config, probe, targets, clock, routeHost, node, raft, metrics, logger };
+
+    // Before the state is applied the voter knows no peer, and the default route answers.
+    resolver.Refresh();
+    REQUIRE(node.Current() == "192.168.1.20:6674");
+
+    // The state arrives: the NEXT refresh probes again at once, inside the interval and with no
+    // event, because where to ask moved -- and the peer is asked before the default route.
+    schedulers.Applied(state);
+    CHECK(targets.Targets() == std::vector<std::string> { "10.20.0.1" });
+    resolver.Refresh();
+    CHECK(probe.Asked() == std::vector<std::string> { DefaultRoute, "10.20.0.1" });
+    CHECK(node.Current() == "10.8.0.7:6674");
+    CHECK(raft.Current() == "10.8.0.7:6680");
+
+    // And unchanged targets inside the interval ask nothing more.
+    resolver.Refresh();
+    CHECK(probe.Asked().size() == 2);
 }
 
 TEST_CASE("A network change re-probes on the resolver's own thread", "[node][endpoint][host-events]")

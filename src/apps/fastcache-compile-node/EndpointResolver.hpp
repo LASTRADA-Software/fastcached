@@ -55,8 +55,12 @@ class IProbeTargets
 };
 
 /// Production's: the IP-literal hosts of where this node registers (`ISchedulerEndpointSource`), so
-/// a machine with several routes advertises the address its fleet actually reaches it from. A
-/// scheduler named by a host NAME is skipped: the probe resolves nothing.
+/// a machine with several routes advertises the address its fleet actually reaches it from. For a
+/// worker or a learner those are its fleet's voters; for a VOTER its own scheduler (loopback, which
+/// no probe answer survives) and then the other voters its applied state records
+/// (`AppliedSchedulers`), so a split-tunnel voter advertises the address its peers reach. A
+/// scheduler named by a host NAME is skipped: the probe resolves nothing, and resolving one here
+/// would put an unbounded DNS wait on every refresh.
 class SchedulerProbeTargets final: public IProbeTargets
 {
   public:
@@ -73,14 +77,14 @@ class SchedulerProbeTargets final: public IProbeTargets
     ISchedulerEndpointSource const& _schedulers;
 };
 
+class IEndpointMoveSink;
+
 /// Something that re-derives the endpoints this node publishes, when it is due.
 ///
 /// The heartbeat and the presence loop call it at the top of every round, so a round never
 /// announces an address a network change has already invalidated -- whichever thread heard the
 /// change first. A seam so a worker case can drive registrations with the endpoint it publishes
 /// itself.
-class IEndpointMoveSink;
-
 class IEndpointRefresh
 {
   public:
@@ -237,9 +241,10 @@ static_assert(RowsInEnumeratorOrder(UnusableRouteHosts, &UnusableRouteHostRow::r
 /// The sole publisher of this node's endpoints: the `0xFC` one every registration and lease check
 /// reads, and the Raft one consensus advertises.
 ///
-/// **Probing is gated, deriving is not.** A probe runs when an event marked the route stale or
-/// `RefreshInterval` has passed since the last one; every `Refresh` re-derives both endpoints from
-/// the configuration in force with the last route host applied, so a reload that re-pins
+/// **Probing is gated, deriving is not.** A probe runs when an event marked the route stale,
+/// `RefreshInterval` has passed since the last one, or the preferred targets moved since it (a
+/// voter's arrive with the state it applies, after the start probed the default route); every `Refresh` re-derives both
+/// endpoints from the configuration in force with the last route host applied, so a reload that re-pins
 /// `--advertise` is published at the next refresh and a reload that changes nothing keeps the
 /// roamed address. A probe that finds nothing usable keeps the last route host: this never
 /// publishes an empty or loopback address because the network went away.
@@ -346,6 +351,7 @@ class EndpointResolver final: public IHostEventSink, public IEndpointRefresh
     /// all refresh, and a probe and its publication are one step.
     std::mutex _refreshMutex;
     std::optional<core::platform::SteadyTimePoint> _lastProbe; ///< Guarded by `_refreshMutex`.
+    std::vector<std::string> _lastTargets;                     ///< What it asked; guarded by `_refreshMutex`.
     std::string _pinnedNoticed;                                ///< Guarded by `_refreshMutex`.
 
     /// Set by an event, consumed by the next refresh. Written under `_wakeMutex` so the
