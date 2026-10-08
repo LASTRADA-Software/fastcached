@@ -181,7 +181,10 @@ TEST_CASE("A learner refuses an outsider NotAMember and never tells it where the
     CHECK(ErrorOf(AskBoth(responder, Wire::Op::Lease, ThisMachine()).answer)
           == std::optional { Wire::ErrorCode::NotLeader });
 
-    for (auto const& row: Testing::OpsOfFamily(Wire::VerbFamily::Scheduler))
+    auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
+    // Asked of the table rather than assumed: a sweep over nothing would pass.
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::Lease, &Wire::OpDescriptor::code));
+    for (auto const& row: verbs)
     {
         INFO("verb " << row.name);
         auto const [refusePeer, answer] = AskBoth(responder, row.code, Outsider());
@@ -268,7 +271,10 @@ TEST_CASE("A learner's redirect moves no counter", "[node][scheduling-redirect]"
     REQUIRE(Readings(metrics) != before);
     auto const baseline = Readings(metrics);
 
-    for (auto const& row: Testing::OpsOfFamily(Wire::VerbFamily::Scheduler))
+    auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
+    // Asked of the table rather than assumed: a sweep over nothing would pass.
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::Lease, &Wire::OpDescriptor::code));
+    for (auto const& row: verbs)
         for (auto const& peer: { ThisMachine(), Outsider() })
             static_cast<void>(AskBoth(responder, row.code, peer));
     CHECK(Readings(metrics) == baseline);
