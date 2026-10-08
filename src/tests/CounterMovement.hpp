@@ -24,8 +24,13 @@ namespace FastCache::Testing
 
 /// Every counter's reading, keyed by its exported name -- EVERY counter, so one that moved and was
 /// not expected is in the answer as surely as one that was.
+///
+/// **Keyed by name, so it relies on every exported name being unique**: two counters sharing one
+/// would collapse into a single row and a movement of either could hide behind the other. That is
+/// pinned by "A counter's exported name is unique" (`Metrics/PrometheusFormatter_test.cpp`).
 using CounterReadings = std::map<std::string_view, std::uint64_t>;
 
+/// The name a counter is exported under.
 /// @param counter A counter.
 /// @return Its exported name, through the catalogue's one lookup; a counter with no row reads as a
 ///         name nobody could expect.
@@ -35,6 +40,7 @@ using CounterReadings = std::map<std::string_view, std::uint64_t>;
     return row != nullptr ? row->prometheusName : std::string_view { "<no catalogue row>" };
 }
 
+/// Read every counter of @p metrics once.
 /// @param metrics The sink.
 /// @return One reading per counter, by name.
 [[nodiscard]] inline CounterReadings CounterReadingsOf(IMetricsSink const& metrics)

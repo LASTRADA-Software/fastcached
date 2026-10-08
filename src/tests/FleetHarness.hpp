@@ -19,7 +19,9 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/CompileReplySeal.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/ProvenIdentity.hpp>
+#include <FastCache/Server/AdminCredential.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -42,19 +44,30 @@
 #include <CompileCorrelation.hpp>
 #include <Dispatch.hpp>
 #include <WorkerProtocol.hpp>
+#include <apps/fastcache-compile-node/ConsensusStanding.hpp>
+#include <apps/fastcache-compile-node/DiscoveryTier.hpp>
 #include <apps/fastcache-compile-node/EndpointDialer.hpp>
+#include <apps/fastcache-compile-node/FleetSummaryResponder.hpp>
+#include <apps/fastcache-compile-node/FleetTextResponder.hpp>
 #include <apps/fastcache-compile-node/FrameEndpoint.hpp>
+#include <apps/fastcache-compile-node/LiveStatsResponder.hpp>
+#include <apps/fastcache-compile-node/MachineStandingTestUtils.hpp>
 #include <apps/fastcache-compile-node/NodeConfig.hpp>
 #include <apps/fastcache-compile-node/NodeFormation.hpp>
+#include <apps/fastcache-compile-node/NodeFrameSurface.hpp>
 #include <apps/fastcache-compile-node/NodeMembership.hpp>
 #include <apps/fastcache-compile-node/NodePresenceTier.hpp>
+#include <apps/fastcache-compile-node/NodeProofResponder.hpp>
 #include <apps/fastcache-compile-node/NodeRoster.hpp>
+#include <apps/fastcache-compile-node/NodeStatusResponder.hpp>
 #include <apps/fastcache-compile-node/Responders.hpp>
 #include <apps/fastcache-compile-node/SchedulerLink.hpp>
 #include <apps/fastcache-compile-node/SchedulingRedirect.hpp>
 #include <apps/fastcache-compile-node/SessionResponder.hpp>
+#include <apps/fastcache-compile-node/SharedCacheResponder.hpp>
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
+#include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/ExactAudience.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
@@ -212,15 +225,19 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// Add a LEARNER's `0xFC` surface at @p endpoint: a node running consensus and no scheduler,
     /// which answers the fleet's scheduling verbs with the leader it follows (#1639).
     ///
-    /// Routed through production's `MergedResponder`, with only two owners present: the
-    /// `SchedulingRedirectResponder` for the `Scheduler` family, and the `SessionResponder` every built
-    /// node has. Every other family is refused as one served nowhere -- on a real learner the node,
-    /// live, fleet and shared-cache owners would answer, and building them needs an I/O loop this
-    /// harness does not run. The redirect reads a `KnownSchedulingLeader` that a
-    /// `SchedulingLeaderPublisher` feeds from the role observer's endpoint and every pass's reading,
-    /// as `ConsensusTier`'s two observers do. A request passes production's header gate
-    /// (`Node::DecideHeaderRefusal`) before `Answer`, for the caller `SetCallerHost` and
-    /// `SetCallerIdentity` describe.
+    /// Composed by production's own `ComposeSurfaceComponents` and routed by production's
+    /// `MergedResponder`, over the owners a built learner has: the `SchedulingRedirectResponder` for the
+    /// `Scheduler` family, and the every-node owners (`NodeStatus`, live stats, fleet text, session,
+    /// the fleet's shared cache), the identity prover a node running consensus serves, and the
+    /// fleet-summary owner its identity key answers with -- each built as `main` builds it, over
+    /// sources nothing attaches. Enrollment is refused for the reason a learner gives
+    /// (`EnrollmentAbsenceOf`). It is a learner running **no cache tier and no worker tier**, the two
+    /// components a configuration may add, so those families are refused as served nowhere. The request
+    /// cap is therefore production's fold -- the shared cache's, the largest -- and not the redirect's
+    /// own 64 KiB. The redirect reads a `KnownSchedulingLeader` that a `SchedulingLeaderPublisher`
+    /// feeds from the role observer's endpoint and every pass's reading, as `ConsensusTier`'s two
+    /// observers do. A request passes production's header gate (`Node::DecideHeaderRefusal`) before
+    /// `Answer`, for the caller `SetCallerHost` and `SetCallerIdentity` describe.
     ///
     /// **What a learner endpoint models, and what it does not:**
     /// - the verbs a LAUNCHER sends it, presenting no credential: the scheduling family, and
@@ -242,7 +259,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         RefuseTaken(endpoint, "a learner");
         if (std::ranges::contains(_workerEndpoints, endpoint))
             throw std::runtime_error { "FleetHarness: a learner at " + endpoint + " would shadow the worker there" };
-        _redirectingLearners.push_back(std::make_unique<RedirectingLearner>(std::move(endpoint), _wallClock));
+        _redirectingLearners.push_back(
+            std::make_unique<RedirectingLearner>(std::move(endpoint), _clock, _wallClock, _logger));
         Hear(*_redirectingLearners.back());
     }
 
@@ -1000,10 +1018,9 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// @param frame The complete request.
     /// @param credential What the client presents: a machine ticket to a scheduler, or to a worker
     ///        address `VerifyTicketsAtWorker` named, is decided by that machine's verifier (see the
-    ///        class comment); presented to a learner, it is refused by throwing -- a learner endpoint
-    ///        models no `AUTH` (`AddRedirectingLearner`); anything else is answered `Ok` and admits
-    ///        nothing, as a surface with
-    ///        nothing to verify answers it.
+    ///        class comment); presented to a learner, it is refused by throwing, since a learner
+    ///        endpoint models no `AUTH` (`AddRedirectingLearner`); anything else is answered `Ok` and
+    ///        admits nothing, as a surface with nothing to verify answers it.
     /// @param budget Ignored; nothing here blocks.
     /// @return The outcome, decoded by the launcher's own client code.
     [[nodiscard]] Cc::CacheOutcome Exchange(std::string_view hostPort,
@@ -1012,6 +1029,12 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                             Cc::ExchangeBudget budget) override
     {
         (void) budget;
+        // A learner endpoint models no AUTH (see `AddRedirectingLearner`): refused loudly, BEFORE the
+        // call is logged, rather than answered `Ok` by `AnswerAuthenticated`'s fallback, which would
+        // verify nothing in silence.
+        if (credential.Configured() && FindRedirectingLearner(hostPort) != nullptr)
+            throw std::runtime_error { "FleetHarness: a learner endpoint models no AUTH, and " + std::string { hostPort }
+                                       + " was presented a credential" };
         // Logged BEFORE the answer, so the log is in the order requests were SENT --
         // an exchange nested inside this one's compile hook would otherwise appear
         // to have happened first. Its outcome is filled in below, by index rather
@@ -1027,11 +1050,6 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             // the seeded "nothing was reached", which is `Unreached`.
             return Cc::CacheOutcome {};
 
-        // A learner endpoint models no AUTH (see `AddRedirectingLearner`): refused loudly rather than
-        // answered `Ok` by `AnswerAuthenticated`'s fallback, which would verify nothing in silence.
-        if (credential.Configured() && FindRedirectingLearner(hostPort) != nullptr)
-            throw std::runtime_error { "FleetHarness: a learner endpoint models no AUTH, and " + std::string { hostPort }
-                                       + " was presented a credential" };
         auto reply = credential.Configured() ? AnswerAuthenticated(hostPort, frame, credential) : Answer(hostPort, frame);
         // The launcher's own framing, over a socket that replays what the addressed
         // scheduler actually produced. Asserting against hand-written reply bytes
@@ -1157,24 +1175,74 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// Declaration order is construction order, and every member below borrows one above it.
     struct RedirectingLearner
     {
-        /// @param at How clients address it.
+        /// @param at How clients address it, and its node id.
+        /// @param clock The harness's clock, which its shared cache and live-stats loop read.
         /// @param wallClock The harness's wall clock, which its session component reads.
-        RedirectingLearner(std::string at, core::platform::ManualWallClock& wallClock):
+        /// @param logger Where its components log.
+        RedirectingLearner(std::string at,
+                           core::platform::ManualClock& clock,
+                           core::platform::ManualWallClock& wallClock,
+                           ILogger& logger):
             endpoint { std::move(at) },
-            session { verifier, FastCache::Node::SessionKeys {}, random, wallClock, metrics }
+            cfg { LearnerConfig(endpoint) },
+            identity { TestKeyPair(endpoint) },
+            loop { clock },
+            liveStats { liveSources, fold, AdminCredential {}, loop, metrics },
+            session { verifier, FastCache::Node::SessionKeys {}, random, wallClock, metrics },
+            sharedCache { cfg, fold, clock, metrics, logger, nullptr, FastCache::Node::ReconcileOn::Caller },
+            nodeProof { cfg.nodeId, identity, fold, consensusStanding, random, metrics, logger },
+            surface { FastCache::Node::ComposeSurfaceComponents(
+                nullptr,
+                nullptr,
+                &redirect,
+                nullptr,
+                nodeStatus,
+                std::unexpected { FastCache::Node::EnrollmentAbsenceOf(cfg, false)
+                                      .value_or(FastCache::Node::EnrollmentAbsence::NoIdentityKey) },
+                liveStats,
+                fleetText,
+                &nodeProof,
+                &formation,
+                session,
+                sharedCache) }
         {
         }
 
+        /// A learner's configuration: the mode its formation record holds, and the predicate `main`
+        /// asks before it builds the redirect -- refused here when it would not.
+        /// @param nodeId Its id.
+        /// @return The configuration.
+        /// @throws std::runtime_error when the configuration would not redirect the scheduling verbs.
+        [[nodiscard]] static FastCache::Node::NodeConfig LearnerConfig(std::string const& nodeId)
+        {
+            auto cfg = FastCache::Node::NodeConfig {};
+            cfg.nodeId = nodeId;
+            cfg.formation = FastCache::Node::NodeFormationView {
+                .mode = Cluster::NodeMode::Learner,
+                .clusterId = std::string { ClusterId },
+                .createdAtUnixSeconds = 0,
+                .foundedHere = false,
+                .fleetMembers = {},
+                .fleetSchedulers = {},
+            };
+            if (!FastCache::Node::RedirectsScheduling(cfg))
+                throw std::runtime_error { "FleetHarness: a learner's configuration does not redirect scheduling" };
+            return cfg;
+        }
+
         std::string endpoint;
+        FastCache::Node::NodeConfig cfg; ///< What `main` would have built it from.
+        Ed25519KeyPair identity;         ///< Its identity key: what its node-proof and formation answers sign.
         /// Its own sink, standing for the one sink `main` hands every component on a node's surface.
         ///
-        /// **Any component on this surface that gains a sink is handed THIS one** -- the redirect
+        /// **Every component on this surface that holds a sink is handed THIS one** -- the redirect
         /// included, should it ever count -- so a case asserting that the learner counted nothing
-        /// reads every counter the surface could move. Today only the session component holds it; the
-        /// redirect, the router and the endpoint's gate count nothing on the scheduling path at all.
+        /// reads every counter the surface could move. The redirect, the router and the endpoint's
+        /// header gate count nothing on the scheduling path today.
         AtomicMetricsSink metrics;
         /// The fold a node composes when it is not open -- this machine, and a key roster of the
-        /// state it applied (`Hear`) -- so a launcher on the learner's own machine is a member.
+        /// state it applied (`Hear`) -- so a launcher on the learner's own machine is a member. Every
+        /// component asks it, as every component of a node asks `membership.Oracle()`.
         Distributed::LoopbackMembership loopback;
         Distributed::KeyRosterMembership keys;
         Distributed::AnyOfMembership fold { { &loopback, &keys } };
@@ -1182,16 +1250,34 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         FastCache::Node::KnownSchedulingLeader knownLeader;
         FastCache::Node::SchedulingLeaderPublisher publisher { knownLeader };
         FastCache::Node::SchedulingRedirectResponder redirect { fold, knownLeader };
-        /// The session component every built node has, over no roster: every ticket it is shown is
-        /// refused -- counted, on `metrics`.
+        /// The every-node owners, built as `main` builds them over a source slot nothing attaches --
+        /// each answers that it has nothing to read. Built for their place on the surface, whose
+        /// request cap is their fold.
+        LiveStatsSourceSlot liveSources;
+        SilentNodeStatus describe;
+        FixedStanding const standing {};
+        FastCache::Node::NodeStatusResponder nodeStatus { describe, liveSources, fold, standing, metrics };
+        /// What the live-stats owner is bound to; never turned, since no case here subscribes.
+        core::net::testing::TestLoop loop;
+        FastCache::Node::LiveStatsResponder liveStats;
+        FastCache::Node::FleetTextResponder fleetText { liveSources, fold, AdminCredential {}, metrics };
+        /// The session owner, over no roster: every ticket it is shown is refused -- counted, on `metrics`.
         ExactAudience audience { endpoint };
         Distributed::SpentTickets spent;
         Distributed::TicketVerifier verifier { nullptr, audience, spent };
         ScriptedSecureRandom random;
         FastCache::Node::SessionResponder session;
-        /// The router `main` puts in front of the components: the scheduling verbs to the redirect.
-        FastCache::Node::MergedResponder surface { FastCache::Node::SurfaceComponents { .scheduler = &redirect,
-                                                                                        .session = &session } };
+        /// The fleet's shared cache every node builds, dormant: nothing names this machine.
+        FastCache::Node::SharedCacheService sharedCache;
+        /// The identity prover a node running consensus serves, over a standing slot nothing attaches.
+        FastCache::Node::ConsensusStandingSlot consensusStanding;
+        FastCache::Node::NodeProofResponder nodeProof;
+        /// What it answers `FLEET-SUMMARY` with, signed under `identity`.
+        FastCache::Node::FixedFleetSummary const summary { CompileCacheWire::FleetSummary {
+            .clusterId = std::string { ClusterId }, .nodeId = endpoint } };
+        FastCache::Node::FleetSummaryResponder formation { summary, identity };
+        /// Production's composition of all of the above, routed by production's router.
+        FastCache::Node::MergedResponder surface;
     };
 
     /// What @p learner's consensus tier tells it at a pass: who leads -- the harness's leader, whose
@@ -1232,13 +1318,14 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
 
     /// What @p learner's surface answers @p frame with, through the gate its endpoint asks of every
     /// header -- production's `Node::DecideHeaderRefusal`: the surface-wide cap, admission, the
-    /// credential and per-verb ceiling, the in-flight budget -- and `Answer` only for a request it lets
-    /// through. The cap is the surface's own `MaxRequestBytes()`, the fold the endpoint reads.
+    /// per-verb ceiling, the in-flight budget -- and `Answer` only for a request it lets through. The
+    /// cap is the surface's own `MaxRequestBytes()`, the fold over every owner composed, which the
+    /// endpoint reads.
     ///
-    /// Two inputs are fixed rather than read, each for a stated reason, as `FormationHarness::Gate`
-    /// fixes them: the in-flight budget is 0 because the harness answers one request at a time to
-    /// completion, so nothing else is ever in flight on this surface; and the connection established
-    /// no credential, because `Exchange` refuses to present one to a learner (`AddRedirectingLearner`).
+    /// The in-flight budget is fixed at 0 rather than read, as `FormationHarness::Gate` fixes it: the
+    /// harness answers one request at a time to completion, so nothing else is ever in flight on this
+    /// surface. The peer carries no authenticated machine because `Exchange` refuses to present a
+    /// credential to a learner (`AddRedirectingLearner`), so no `AUTH` ever established one.
     /// @param learner Which learner.
     /// @param frame The request.
     /// @return The reply; empty, which closes, for a frame with no header.

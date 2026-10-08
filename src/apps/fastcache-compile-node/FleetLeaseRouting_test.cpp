@@ -7,14 +7,15 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <Dispatch.hpp>
@@ -23,6 +24,7 @@
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
+using Catch::Matchers::ContainsSubstring;
 using FastCache::Testing::Unwrap;
 
 namespace
@@ -467,6 +469,11 @@ TEST_CASE("A launcher pointed at its own learner is redirected to the leader and
     // counter for this path at all, so no change to any of them short of handing one a sink can turn
     // this line red. It is a TRIPWIRE for that change: whichever of them gains a sink is handed the
     // learner's (`FleetHarness::RedirectingLearner::metrics`), and a counted redirect is red here.
+    //
+    // **And what it does not cover at all: the endpoint's serving loop** (`ServeConnection` in
+    // `FrameEndpoint.cpp`, which writes the gate's refusal, steps over the refused payload and arms the
+    // verb's window). The harness runs the gate, never that loop, so anything the loop itself counted
+    // on this path would move no counter here.
     auto const moved = Testing::CountersMoved(counted, fleet.RedirectingLearnerMetrics(Learner));
     INFO("counters moved: " << moved);
     CHECK(moved.empty());
@@ -505,35 +512,54 @@ TEST_CASE("A launcher pointed at a learner that knows no leader compiles locally
     CHECK(moved.empty());
 }
 
-TEST_CASE("A learner's port refuses a frame over its request cap before it redirects", "[node][fleet][scheduling-redirect]")
+TEST_CASE("A learner's port refuses a MINT-TICKET over the verb's own ceiling at the header",
+          "[node][fleet][scheduling-redirect]")
 {
     // The harness's learner is gated by the endpoint's own header decision (`DecideHeaderRefusal`),
-    // not by a copy of part of it: the surface-wide cap is asked BEFORE admission and before the
-    // redirect, so a LEASE declaring more than the scheduler surface takes is refused for its size --
-    // a gate asking only `RefusePeer` would have redirected it, and this case would be green there
-    // for no reason.
+    // not by a copy of part of it. A verb's own ceiling is one of the steps a copy asking only
+    // `RefusePeer` leaves out: `MINT-TICKET` from this machine is admitted at the door, and its
+    // `OpTable` row bounds it to `MaxMintTicketPayload`. Over that it is refused `PayloadTooLarge`
+    // before a payload byte is read -- on a built node too, whose surface-wide cap is far larger.
     Testing::FleetHarness fleet;
     fleet.AddScheduler(std::string { SchedulerA });
     fleet.AddRedirectingLearner(std::string { Learner });
     fleet.ElectLeader(SchedulerA);
 
-    auto const lease = [&fleet](std::size_t payloadBytes) {
-        auto const payload = std::vector<std::byte>(payloadBytes);
-        return fleet.Exchange(
-            Learner,
-            Wire::Detail::EncodeRequest(Wire::CurrentVersion, Wire::Op::Lease, { std::span<std::byte const> { payload } }),
-            Cc::Credential {},
-            Cc::ExchangeBudget {});
+    // A request whose header DECLARES exactly @p declared payload bytes: the field is length-prefixed,
+    // so its own size is the declaration less that prefix -- read back from the header, not assumed.
+    auto const mint = [&fleet](std::size_t declared) {
+        auto const frameOf = [](std::size_t fieldBytes) {
+            auto const field = std::vector<std::byte>(fieldBytes);
+            return Wire::Detail::EncodeRequest(
+                Wire::CurrentVersion, Wire::Op::MintTicket, { std::span<std::byte const> { field } });
+        };
+        auto const prefix = Unwrap(Wire::DecodeRequestHeader(frameOf(0))).payloadLength;
+        auto frame = frameOf(declared - prefix);
+        REQUIRE(Unwrap(Wire::DecodeRequestHeader(frame)).payloadLength == declared);
+        return fleet.Exchange(Learner, std::move(frame), Cc::Credential {}, Cc::ExchangeBudget {});
     };
 
-    // The control: a LEASE inside the cap is redirected, so the refusal below is the size's doing.
-    auto const within = lease(1);
+    // The control: AT the ceiling the request is served -- and refused by the session component for
+    // what it says, never for its size.
+    auto const within = mint(Wire::MaxMintTicketPayload);
     CHECK(within.kind == Cc::CacheOutcomeKind::Rejected);
-    CHECK(within.code == Wire::ErrorCode::NotLeader);
+    CHECK(within.code == Wire::ErrorCode::MalformedFrame);
 
-    auto const over = lease(Node::SchedulingRedirectResponder::RequestBytes + 1);
+    auto const over = mint(Wire::MaxMintTicketPayload + 1);
     CHECK(over.kind == Cc::CacheOutcomeKind::Rejected);
     CHECK(over.code == Wire::ErrorCode::PayloadTooLarge);
+
+    // And the surface-wide cap is a BUILT node's: the fold over every owner a learner composes, the
+    // fleet's shared cache included -- not the redirect's own 64 KiB. A LEASE past that is still
+    // redirected, as it is in production; a surface holding only the redirect would refuse it here.
+    auto const leasePayload = std::vector<std::byte>(Node::SchedulingRedirectResponder::RequestBytes + 1);
+    auto const lease = fleet.Exchange(
+        Learner,
+        Wire::Detail::EncodeRequest(Wire::CurrentVersion, Wire::Op::Lease, { std::span<std::byte const> { leasePayload } }),
+        Cc::Credential {},
+        Cc::ExchangeBudget {});
+    CHECK(lease.kind == Cc::CacheOutcomeKind::Rejected);
+    CHECK(lease.code == Wire::ErrorCode::NotLeader);
 }
 
 TEST_CASE("The fleet harness refuses a learner sharing an endpoint with anything else", "[node][fleet][scheduling-redirect]")
@@ -546,18 +572,28 @@ TEST_CASE("The fleet harness refuses a learner sharing an endpoint with anything
     fleet.RegisterWorker(SchedulerA, Worker, Toolchain);
     fleet.AddRedirectingLearner(std::string { Learner });
 
-    CHECK_THROWS_AS(fleet.AddRedirectingLearner(std::string { SchedulerA }), std::runtime_error);
-    CHECK_THROWS_AS(fleet.AddRedirectingLearner(std::string { Worker }), std::runtime_error);
-    CHECK_THROWS_AS(fleet.AddRedirectingLearner(std::string { Learner }), std::runtime_error);
-    CHECK_THROWS_AS(fleet.AddScheduler(std::string { Learner }), std::runtime_error);
-    CHECK_THROWS_AS(fleet.AddScheduler(std::string { SchedulerA }), std::runtime_error);
-    CHECK_THROWS_AS(fleet.RegisterWorker(SchedulerA, Learner, Toolchain), std::runtime_error);
-    CHECK_THROWS_AS(fleet.AddWorkerAddress(std::string { Learner }), std::runtime_error);
-    // And a credential presented to it, which no learner endpoint models.
-    CHECK_THROWS_AS(
+    CHECK_THROWS_WITH(fleet.AddRedirectingLearner(std::string { SchedulerA }),
+                      ContainsSubstring("a learner at sched-a:6676 would share"));
+    CHECK_THROWS_WITH(fleet.AddRedirectingLearner(std::string { Worker }),
+                      ContainsSubstring("would shadow the worker there"));
+    CHECK_THROWS_WITH(fleet.AddRedirectingLearner(std::string { Learner }),
+                      ContainsSubstring("a learner at learner-c:6674 would share"));
+    CHECK_THROWS_WITH(fleet.AddScheduler(std::string { Learner }),
+                      ContainsSubstring("a scheduler at learner-c:6674 would share"));
+    CHECK_THROWS_WITH(fleet.AddScheduler(std::string { SchedulerA }),
+                      ContainsSubstring("a scheduler at sched-a:6676 would share"));
+    CHECK_THROWS_WITH(fleet.RegisterWorker(SchedulerA, Learner, Toolchain),
+                      ContainsSubstring("would be shadowed by the learner there"));
+    CHECK_THROWS_WITH(fleet.AddWorkerAddress(std::string { Learner }),
+                      ContainsSubstring("would be shadowed by the learner there"));
+    // And a credential presented to it, which no learner endpoint models -- refused before the call is
+    // logged, so the log never shows an exchange that did not happen.
+    auto const logged = fleet.Calls().size();
+    CHECK_THROWS_WITH(
         fleet.Exchange(Learner,
                        Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = Toolchain, .key = Key, .acceptedCodecs = {} }),
                        fleet.TicketFor("some-machine", std::string { Learner }),
                        Cc::ExchangeBudget {}),
-        std::runtime_error);
+        ContainsSubstring("a learner endpoint models no AUTH"));
+    CHECK(fleet.Calls().size() == logged);
 }
