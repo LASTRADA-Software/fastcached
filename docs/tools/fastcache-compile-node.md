@@ -3714,11 +3714,11 @@ is what a healthy build gets, once per exchange.
 
 A scheduling verb is never answered that way, because `unimplemented-verb` tells a client
 *this build is too old* and the build is current. A node that runs consensus but no
-scheduler — a learner — answers every scheduling verb `not-leader` naming the leader's
-`0xFC` endpoint, once the caller is admitted, so a launcher pointed at its own machine's
-learner follows it to the leader; it names nobody once the leader has been silent past
-the consensus tier's election timeout, and it refuses `RELEASE` `dispatch-not-permitted`,
-having granted no lease. A node running no consensus at all refuses the capacity verbs
+scheduler — a learner — refuses `RELEASE` `dispatch-not-permitted`, having granted no
+lease, and answers every other scheduling verb `not-leader` naming the leader's `0xFC`
+endpoint, once the caller is admitted, so a launcher pointed at its own machine's learner
+follows it to the leader; it names nobody once the leader has been silent past the
+consensus tier's election timeout. A node running no consensus at all refuses the capacity verbs
 (`REGISTER`, `HEARTBEAT`, `WITHDRAW`, `LEASE`, `RELEASE`, `NODE-ANNOUNCE`)
 `dispatch-not-permitted` and the cluster verbs `no-cluster`, the codes `fastcached` gives
 for the same verbs. None of these is counted.

@@ -500,10 +500,10 @@ TEST_CASE("The daemon and a node running no worker refuse a cordon with one code
 TEST_CASE("The daemon and a node running no consensus refuse each scheduling verb with one code",
           "[node][merged-responder][scheduling-redirect]")
 {
-    // #1639's M3 ruling, enforced across the two binaries rather than restated in each: neither
-    // endpoint schedules, so a client asking either for capacity is told `DispatchNotPermitted` and
-    // one asking about a cluster `NoCluster`, by both. Asked of the SURFACES on the wire, as the cordon
-    // case above asks them, so a row moved on either side is red here.
+    // #1639: one condition is one code on both binaries, enforced across them rather than restated in
+    // each. Neither endpoint schedules, so a client asking either for capacity is told
+    // `DispatchNotPermitted` and one asking about a cluster `NoCluster`, by both. Asked of the SURFACES
+    // on the wire, as the cordon case above asks them, so a row moved on either side is red here.
     MergedResponder node { SurfaceComponents {} };
     auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
     REQUIRE(std::ranges::contains(verbs, Wire::Op::Lease, &Wire::OpDescriptor::code));
@@ -519,9 +519,9 @@ TEST_CASE("The daemon and a node running no consensus refuse each scheduling ver
         REQUIRE(nodeCode.has_value());
 
         // NODE-ANNOUNCE included: the daemon has no `RelocatedVerbs` row for it, and reaches the SAME code
-        // through `RefusalFor`'s fallback (`DispatchNotPermitted`, with no sentence). The ruling that put it
-        // with the capacity verbs on the node expected the two to differ; they do not, in code. What
-        // differs is the words, which this case does not compare.
+        // through `RefusalFor`'s fallback (`DispatchNotPermitted`, with no sentence). NODE-ANNOUNCE sits
+        // with the capacity verbs on the node because it registers presence with a scheduler, so the
+        // codes agree on it too. What differs is the words, which this case does not compare.
         CHECK(daemonCode == nodeCode);
     }
 }

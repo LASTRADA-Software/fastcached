@@ -288,8 +288,9 @@ TEST_CASE("KnownSchedulingLeader answers what was last published, and nothing be
 
 TEST_CASE("A leader silent past the bound it is judged by is named to nobody", "[node][scheduling-redirect]")
 {
-    // R1 of #1639, as amended: the redirect names a leader only while it is inside the bound it is
-    // handed. Asked at the bound's edges, on both sides, so an off-by-one in either direction is red.
+    // #1639: the redirect names a leader only while its silence is inside the bound it is handed,
+    // the tier's Raft election timeout rather than the hour-long `consensus-leader-silent` bound.
+    // Asked at the bound's edges, on both sides, so an off-by-one in either direction is red.
     // The bound here is arbitrary on purpose: which bound production hands is the observer's case.
     using Duration = core::platform::SteadyTimePoint::duration;
     constexpr auto Bound = Duration { std::chrono::milliseconds { 300 } };

@@ -2548,11 +2548,11 @@ TEST_CASE("A joined learner is replicated to over the session it dialled and is 
 TEST_CASE("A pass's observer empties a holder that named a leader once it is silent past the election timeout",
           "[node][consensus][scheduling-redirect]")
 {
-    // #1639's R1, at the wiring `StartConsensusOrExplain` hands every tier: each pass tells the
-    // roster AND the publisher, with the bound the tier hands it. Probed at exactly the bound, which
-    // keeps the endpoint, and just past it, which empties it -- with the bound named as the
-    // configuration consensus runs on names it, so a pass that stopped telling the publisher, or
-    // told it another bound, is red here.
+    // #1639: a learner stops naming a leader silent past the tier's own election timeout, at the
+    // wiring `StartConsensusOrExplain` hands every tier: each pass tells the roster AND the publisher,
+    // with the bound the tier hands it. Probed at exactly the bound, which keeps the endpoint, and
+    // just past it, which empties it -- with the bound named as the configuration consensus runs on
+    // names it, so a pass that stopped telling the publisher, or told it another bound, is red here.
     auto const roster = NodeRoster::Build(Testing::FirstStart(NodeConfig {}), RosterClock(), nullptr);
     REQUIRE(roster.has_value());
     KnownSchedulingLeader holder;
@@ -2694,11 +2694,11 @@ TEST_CASE("A learner started as main starts it names its leader's scheduling end
         [&knownLeader, &leaderEndpoint] { return knownLeader.LeaderSchedulingEndpoint() == leaderEndpoint; },
         describe));
 
-    // And the other half of R1, through the observer `StartConsensusOrExplain` itself wires: the leader
-    // goes silent, and the learner stops naming it once the tier's election timeout has passed. A
-    // learner has no election timer and keeps its known leader, so the silence path is the ONLY thing
-    // that can empty the holder here -- an observer that told the roster and not the publisher would
-    // name the stopped founder forever.
+    // And the other half of that decision (a silent leader is named by nobody), through the observer
+    // `StartConsensusOrExplain` itself wires: the leader goes silent, and the learner stops naming it
+    // once the tier's election timeout has passed. A learner has no election timer and keeps its known
+    // leader, so the silence path is the ONLY thing that can empty the holder here -- an observer that
+    // told the roster and not the publisher would name the stopped founder forever.
     REQUIRE(StopTierWithin(std::move(fleet.founderTier), nullptr));
     CHECK(Testing::WaitUntil(
         "the learner to stop naming a leader silent past its election timeout",

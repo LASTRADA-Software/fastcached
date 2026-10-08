@@ -330,7 +330,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   `NotLeader` never consults it, a verb falls back only where nothing was SENT. Assert WHICH endpoint.
 - `NotLeader` is an instruction, not an answer: a client follows it (`RedirectTarget`), judged by
   PARSING (`ParseDialEndpoint`) and bounded, the RELEASE to whoever ISSUED. A LEARNER sends a member
-  to the leader's `0xFC` endpoint with it, and names NOBODY once silent past `electionTimeoutMax`.
+  to the leader's `0xFC` endpoint, and names NOBODY once the LEADER is silent past `electionTimeoutMax`.
 - A COMPILE reply is tied to its request or REFUSED (`Mismatched`), the digest taken in
   `CompileJobRunner::Run` from what is about to be spawned and never folded in `WorkerProtocol`.
   It has no counter and can have none, so the alarm is an UNCONDITIONAL stderr line and the
