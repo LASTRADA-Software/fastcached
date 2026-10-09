@@ -6773,13 +6773,16 @@ struct NodeRuntimeFields
     /// the node: beside role `Leader`, that THIS node is the leader, since a leader names
     /// no other; beside `Undecided`, an election in progress; on a learner, that it has
     /// heard from no leader yet, or that its leader has been silent past the election
-    /// timeout (#1641). Which kind of node sent it is said beside it, not here:
-    /// the `Consensus` component bit or a scheduler role (the client's
-    /// `Cli::ReportsConsensus` asks exactly that), and a learner reports this field with
-    /// no role at all, since it runs no scheduler. On a node running no consensus the
-    /// field is empty and means nothing. The wire has no absent form for it: the encoder
-    /// always writes it and the decoder reads a missing one as empty, so the reading is
-    /// told from the meaningless empty by the node's kind, never by the field.
+    /// timeout (#1641); and beside `Follower`, or on a learner that knows its leader, that
+    /// the leader's member record names no scheduling endpoint -- a bootstrap peer that has
+    /// not announced one yet, or a record re-proposed with none (#1340). Which kind of
+    /// node sent it is said beside it, not here: the `Consensus` component bit or a
+    /// scheduler role (the client's `Cli::ReportsConsensus` asks exactly that), and a
+    /// learner reports this field with no role at all, since it runs no scheduler. On a
+    /// node running no consensus the field is empty and means nothing. The wire has no
+    /// absent form for it: the encoder always writes it and the decoder reads a missing
+    /// one as empty, so the reading is told from the meaningless empty by the node's kind,
+    /// never by the field.
     std::string leaderEndpoint {};
 
     /// How many of this node's registrations a scheduler has accepted.

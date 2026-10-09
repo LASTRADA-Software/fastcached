@@ -1169,8 +1169,10 @@ namespace
         // until a learner's tier attaches. Kept right after the role, so a scheduler's
         // record reads as it always has.
         //
-        // Empty is a READING here -- no leader is known -- so the field is present and
-        // ABSENT rather than missing, which would say this node could not tell.
+        // Empty is a READING here -- this node names no leader -- so the field is present
+        // and ABSENT rather than missing, which would say this node could not tell. Beside
+        // role `leader` that means it leads itself, which this row still draws as the absent
+        // cell where the `node` panel says *this node*: that mismatch is #1647.
         if (ReportsConsensus(&fields))
             record.push_back(
                 { .name = "leader",
