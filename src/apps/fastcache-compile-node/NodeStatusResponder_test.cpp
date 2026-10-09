@@ -774,8 +774,9 @@ TEST_CASE("A learner reports the leader its redirect names and no scheduler role
                                       Wire::Detail::EncodeRequest(Wire::CurrentVersion, Wire::Op::Lease, {}),
                                       PeerIdentity { .host = "127.0.0.1" });
         auto const shape = ShapeOf(reply);
+        // The code is pinned here, so it is passed as itself rather than unwrapped from the optional.
         REQUIRE(shape.code == std::optional { Wire::ErrorCode::NotLeader });
-        auto const target = LeaderRedirectTarget(Unwrap(shape.code), shape.detail);
+        auto const target = LeaderRedirectTarget(Wire::ErrorCode::NotLeader, shape.detail);
         return target.has_value() ? std::optional { std::string { Unwrap(target) } } : std::nullopt;
     };
 
