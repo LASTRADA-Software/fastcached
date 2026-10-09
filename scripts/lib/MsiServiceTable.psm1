@@ -134,9 +134,38 @@ $script:ServiceDisplayNames = [ordered]@{ FastCached = 'fastcached'; FastCacheCo
 # logging 7034 at its eighth to eleventh termination.
 $script:UnexpectedTerminationEvents = @(7031, 7034)
 
-# What a transaction is judged over: the terminations, and "entered the running
-# state" (7036) where the host writes it.
-$script:TransactionEvents = @(7031, 7034, 7036)
+# The service control manager's events a transaction's judgement reads, each with what it means. The
+# verdicts use three of them -- the terminations, and "entered the running state" (7036) where the
+# host writes it -- and every one is SHOWN on the way to a refusal, so the read a verdict was taken
+# from is the read the run keeps: a start the SCM refused (7000, 7009) or that ended with an error
+# (7023, 7024) leaves no 7036 "running" and no 7031, and without these a missing start explains
+# nothing. One row per id; the evidence and the reader's filter both walk this table. A hashtable, not
+# [ordered]: an [ordered] dictionary indexed by an int reads the POSITION, not the key.
+$script:ServiceControlEventMeanings = @{
+    7000 = 'the service failed to start (the error it names: the SCM could not run it, or it ended before connecting)'
+    7009 = 'the SCM timed out waiting for the service to connect'
+    7022 = 'the service hung on starting'
+    7023 = 'the service terminated with an error'
+    7024 = 'the service terminated with a service-specific error'
+    7026 = 'a boot-start or system-start driver failed to load'
+    7031 = 'the service terminated unexpectedly; the SCM takes a recovery action'
+    7034 = 'the service terminated unexpectedly; the SCM takes no recovery action'
+    7036 = 'the service entered the running or the stopped state'
+}
+
+# What a transaction is judged over: every id the table above names.
+$script:TransactionEvents = @($script:ServiceControlEventMeanings.Keys | Sort-Object)
+
+# The exit codes with which a transaction COMMITTED, each with its meaning; every other exit code is a
+# transaction that failed and ROLLED BACK. A rollback restarts what it stopped with Windows Installer's
+# own unawaited StartServices, so a rolled-back transaction's node may not be RUNNING yet at msiexec's
+# exit, where a committed one's is: FastCacheNodeStartService waits for RUNNING and checks it. A
+# hashtable for the same reason as the table above.
+$script:MsiCommittedExitCodes = @{
+    0    = 'success'
+    1641 = 'success; a restart was initiated'
+    3010 = 'success; a restart is required'
+}
 
 # The last transaction Invoke-Msiexec ran: what each service ran as when it began,
 # when it began, what it was expected to leave, and every process the watch saw a
@@ -176,11 +205,15 @@ $script:RestartManagerDisabledLine = 'RESTART MANAGER: Disabled by MSIRESTARTMAN
 #
 # @param Name The service name.
 # @return $null when no such service is registered, else an object carrying
-#         StartMode, State and ProcessId (0 when no process runs it).
+#         StartMode, State, ProcessId (0 when no process runs it), and the ExitCode and
+#         ServiceSpecificExitCode the SCM recorded for its last stop.
 function Get-ServiceObservation([string] $Name) {
     $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'"
     if (-not $svc) { return $null }
-    return [pscustomobject]@{ StartMode = $svc.StartMode; State = $svc.State; ProcessId = [int]$svc.ProcessId }
+    return [pscustomobject]@{
+        StartMode = $svc.StartMode; State = $svc.State; ProcessId = [int]$svc.ProcessId
+        ExitCode = [long]$svc.ExitCode; ServiceSpecificExitCode = [long]$svc.ServiceSpecificExitCode
+    }
 }
 
 # The decision, apart from the acquisition: whether an observation satisfies an
@@ -294,6 +327,13 @@ function Assert-ServiceState {
 # @param StableSeconds How long a matched registration must stay unchanged.
 # @param Observe As Assert-ServiceState's; the self-test's seam.
 # @param ReadEvents As Invoke-TransactionJudgement's; the self-test's seam.
+# @param Diagnose Takes a service name and shows what Show-ServiceDiagnosis would; the self-test's
+#                 seam, since the real one runs a registered command line in the foreground.
+#
+# A row that is not reached while the last transaction's exit judgement DEFERRED its node outcome
+# (a rollback's unawaited restart, see Invoke-TransactionJudgement) is refused NAMING that outcome:
+# the row's own wait is then the settled judgement of the node, and "Stopped, expected Running" alone
+# would not say that the rollback's restart is what never arrived.
 function Assert-ServiceTable {
     param(
         [Parameter(Mandatory)] [string] $Row,
@@ -301,22 +341,41 @@ function Assert-ServiceTable {
         [int] $TimeoutSeconds = 30,
         [int] $StableSeconds = 5,
         [scriptblock] $Observe = { param($name) Get-ServiceObservation $name },
-        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since }
+        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since },
+        [scriptblock] $Diagnose = { param($name) Show-ServiceDiagnosis $name }
     )
     if (-not $script:ServiceTable.Contains($Row)) {
         throw "no service table row '$Row'; the rows are: $($script:ServiceTable.Keys -join ', ')"
     }
     Write-Host "service table: $Row"
+    $transaction = $script:LastMsiTransaction
     try {
         Assert-ServiceState -Expect $script:ServiceTable[$Row] -TimeoutSeconds $TimeoutSeconds -StableSeconds $StableSeconds -Observe $Observe
         # The transaction that left this row, judged again now that the window reaches past the
         # stability interval: a service restarted by its recovery policy after msiexec returned
         # terminates inside it. Once per transaction.
-        Assert-TransactionSettled -ReadEvents $ReadEvents
+        Assert-TransactionSettled -ReadEvents $ReadEvents -Observe $Observe
     } catch {
-        if ($Log) { Show-MsiLog $Log }
+        $failure = $_
+        # A judgement's refusal has shown its evidence already; a row's own refusal has not.
+        $judged = $null -ne $transaction -and $transaction.Extended
+        if ($null -ne $transaction -and -not $judged) {
+            Show-TransactionEvidence -Transaction $transaction -ReadEvents $ReadEvents -Observe $Observe
+        }
+        if ($Log -and ($null -eq $transaction -or $judged -or [IO.Path]::GetFullPath($Log, (Get-Location).Path) -ne $transaction.Log)) { Show-MsiLog $Log }
         foreach ($name in $script:ServiceTable[$Row].Keys) {
-            if ($null -ne $script:ServiceTable[$Row][$name]) { Show-ServiceDiagnosis $name }
+            if ($null -ne $script:ServiceTable[$Row][$name]) { & $Diagnose $name }
+        }
+        if ($null -ne $transaction -and -not $judged -and $transaction.Deferred) {
+            # Running, not running, absent and unobservable are four answers, and only the first clears it.
+            $node = $null
+            $now = try {
+                $node = & $Observe 'FastCacheCompileNode'
+                if ($null -eq $node) { 'not registered' } else { "$($node.State), process $($node.ProcessId)" }
+            } catch { "unobservable ($($_.Exception.Message))" }
+            if ($null -eq $node -or $node.State -ne 'Running') {
+                throw "$($failure.Exception.Message)`n$($transaction.Deferred); the row was waited for and the node is $now`: the rollback's restart never brought it to RUNNING"
+            }
         }
         throw
     }
@@ -350,7 +409,7 @@ function Show-ServiceDiagnosis([string] $Name) {
         $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'"
         if (-not $svc) { Write-Host 'not registered'; return }
         Write-Host "registered: $($svc.PathName)"
-        Write-Host "account $($svc.StartName); $($svc.StartMode), $($svc.State); exit code $($svc.ExitCode), service-specific $($svc.ServiceSpecificExitCode)"
+        Write-Host "account $($svc.StartName); $($svc.StartMode), $($svc.State), process $($svc.ProcessId); exit code $($svc.ExitCode), service-specific $($svc.ServiceSpecificExitCode)"
 
         Write-Host "--- Application events from $Name (last 10 min) ---"
         Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = $Name; StartTime = (Get-Date).AddMinutes(-10) } `
@@ -1103,9 +1162,14 @@ function Invoke-Msiexec {
         What = $What; Log = $logPath; StartedUtc = $startedUtc; Baseline = $baseline; Expectation = $expectation
         Polls = $watch.Polls; FailedPolls = $watch.FailedPolls; FirstFailure = $watch.FirstFailure; Observed = $watch.Observed
         EndedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp(); Extended = $false
+        # What msiexec returned: whether the transaction COMMITTED ($script:MsiCommittedExitCodes) decides
+        # whether the node's restart was awaited before the exit (Invoke-TransactionJudgement).
+        ExitCode = $p.ExitCode
+        # The outcome the exit judgement left to the settled one, '' for none (Invoke-TransactionJudgement).
+        Deferred = ''
     }
     if ($p.ExitCode -notin $Accept) {
-        Show-MsiLog $logPath
+        Show-TransactionEvidence -Transaction $script:LastMsiTransaction
         # A checked service action that failed rolled the transaction back, and the service's
         # own events are where its refusal was written: they outlive the rollback.
         foreach ($name in 'FastCacheCompileNode', 'FastCached') { Show-ServiceDiagnosis $name }
@@ -1162,10 +1226,12 @@ function Get-RestartManagerLogVerdict([string] $What, [AllowNull()] [object] $Di
 #
 # @param SettleSeconds The least time past the exit the window reaches; the remainder is waited.
 # @param ReadEvents As Invoke-TransactionJudgement's; the self-test's seam.
+# @param Observe As Invoke-TransactionJudgement's; the self-test's seam.
 function Assert-TransactionSettled {
     param(
         [int] $SettleSeconds = $script:TransactionSettleSeconds,
-        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since }
+        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since },
+        [scriptblock] $Observe = { param($name) Get-ServiceObservation $name }
     )
     $transaction = $script:LastMsiTransaction
     if ($null -eq $transaction -or $transaction.Extended) { return }
@@ -1173,7 +1239,7 @@ function Assert-TransactionSettled {
     if ($elapsed -lt $SettleSeconds) { Start-Sleep -Milliseconds ([int][Math]::Ceiling(($SettleSeconds - $elapsed) * 1000)) }
     $elapsed = ([Diagnostics.Stopwatch]::GetTimestamp() - $transaction.EndedTimestamp) / [Diagnostics.Stopwatch]::Frequency
     $transaction.Extended = $true
-    Write-Host (Invoke-TransactionJudgement -Transaction $transaction -ReadEvents $ReadEvents -When ('{0:0.0} s after msiexec exited' -f $elapsed))
+    Write-Host (Invoke-TransactionJudgement -Transaction $transaction -ReadEvents $ReadEvents -Observe $Observe -When ('{0:0.0} s after msiexec exited' -f $elapsed))
 }
 
 # Asserts which lines a verbose log carries and which it must not.
@@ -1517,78 +1583,191 @@ function Get-TransactionServiceVerdict {
     }
 }
 
+# Everything a refusal of @p Transaction is judged from, SHOWN before it is thrown, because nothing on
+# the runner survives the job: the transaction's verbose log (Show-MsiLog: what failed, the package
+# actions and the tail), what the SCM reports for each service of this package now -- state, process,
+# and the exit codes of its last stop -- and every event of $script:ServiceControlEventMeanings since
+# the transaction began, each with what it means. A refusal that kept none of this cost a CI run that
+# could not tell a start that never came from one that came late (the refused-pin repair, PR 1645).
+# Never throws: it runs on the way to a throw that matters more. Every line goes to the HOST, as
+# Show-MsiLog's do, because Invoke-Msiexec captures the judgement's output stream.
+#
+# @param Transaction The record Invoke-Msiexec keeps.
+# @param Events The events the judgement read, so the evidence is the read the verdict was taken from;
+#               read through @p ReadEvents when not given.
+# @param ReadEvents As Invoke-TransactionJudgement's.
+# @param Observe Takes a service name and returns what Get-ServiceObservation would.
+# @param Cap The most events listed; the earliest past it are counted, not listed.
+function Show-TransactionEvidence {
+    param(
+        [Parameter(Mandatory)] $Transaction,
+        [object[]] $Events = $null,
+        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since },
+        [scriptblock] $Observe = { param($name) Get-ServiceObservation $name },
+        [int] $Cap = 80
+    )
+    if ($Transaction.Log) { Show-MsiLog $Transaction.Log }
+    Write-Host '===== the services now, as the service control manager reports them ====='
+    foreach ($name in $script:ServiceDisplayNames.Keys) {
+        try {
+            $seen = & $Observe $name
+            if ($null -eq $seen) { Write-Host "${name}: not registered"; continue }
+            Write-Host "${name}: $($seen.StartMode), $($seen.State), process $($seen.ProcessId); exit code $($seen.ExitCode), service-specific $($seen.ServiceSpecificExitCode)"
+        } catch {
+            Write-Host "${name}: the observation itself failed: $($_.Exception.Message)"
+        }
+    }
+    $since = $Transaction.StartedUtc.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
+    Write-Host "===== System events $($script:TransactionEvents -join ', ') since '$($Transaction.What)' began ($since) ====="
+    try {
+        $read = if ($null -ne $Events) { @($Events) } else { @(& $ReadEvents $Transaction.StartedUtc) }
+        $listed = @($read | Where-Object { $_.Time -ge $Transaction.StartedUtc -and $script:ServiceControlEventMeanings.ContainsKey([int] $_.Id) } | Sort-Object Time)
+        if ($listed.Count -eq 0) { Write-Host 'none was read' }
+        if ($listed.Count -gt $Cap) { Write-Host "TRUNCATED: the earliest $($listed.Count - $Cap) event(s)" }
+        foreach ($record in @($listed | Select-Object -Last $Cap)) {
+            $time = $record.Time.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
+            $state = if ($record.State) { " $($record.State)" } else { '' }
+            Write-Host "$time $($record.Id) $($record.Service)$state -- $($script:ServiceControlEventMeanings[[int] $record.Id]): $($record.Message)"
+        }
+    } catch {
+        Write-Host "the event read itself failed: $($_.Exception.Message)"
+    }
+}
+
 # Whether the 7036 witness is LIVE in a transaction, from its one positive control: the node's own
 # start. A host that writes 7036 logs it whenever the node starts, and every transaction whose
 # expectation leaves the node running starts (or restarts) it.
 #
+# The node's own 7036s answer for the NODE, and only OTHER services' answer for the HOST: a node
+# 'stopped' is never read as "the host writes them, so the reader failed on the node's", because the
+# reader that read it demonstrably reads the node's. It did, at the exit of PR 1645's refused-pin
+# repair, whose rollback restarts the node unawaited, and the judgement called the witness dead.
+#
 # @param Events ConvertTo-ServiceControlEvent records.
 # @param StartedUtc When the transaction began.
 # @param NodeStarts Whether the transaction starts the node.
-# @return 'live' (the node's start was logged); 'unmatched' (the node started, no 7036 of the node's
-#         running was READ, and 7036s of other services were: the host writes them, so the reader or
-#         the matcher failed on the node's); 'not seen' (the node started and no 7036 at all was read:
+# @return 'live' (the node's start was logged); 'node stopped' (the node's own stop was read and no
+#         running of it: the reader reads the node's, and the node has not re-entered RUNNING, or did
+#         and its 'running' was missed -- Invoke-TransactionJudgement tells those apart); 'unmatched'
+#         (no 7036 of the node running or stopped was read, and 7036s were: other services', so the
+#         host writes them and the reader or the matcher failed on the node's, or the node's own with
+#         a state the parse could not read); 'not seen' (the node started and no 7036 at all was read:
 #         a host that writes none, or a reader that fails on all of them -- Invoke-TransactionJudgement
 #         refuses it once an earlier transaction of the process read 'live'); or 'no control' (the
 #         transaction starts no node, so nothing here can tell).
 function Get-Witness7036State([object[]] $Events = @(), [datetime] $StartedUtc, [bool] $NodeStarts) {
     if (-not $NodeStarts) { return 'no control' }
     $logged = @($Events | Where-Object { $_.Id -eq 7036 -and $_.Time -ge $StartedUtc })
-    if (@($logged | Where-Object { $_.Service -eq 'FastCacheCompileNode' -and $_.State -eq 'Running' }).Count -gt 0) { return 'live' }
+    $node = @($logged | Where-Object { $_.Service -eq 'FastCacheCompileNode' })
+    if (@($node | Where-Object { $_.State -eq 'Running' }).Count -gt 0) { return 'live' }
+    if (@($node | Where-Object { $_.State -eq 'Stopped' }).Count -gt 0) { return 'node stopped' }
     if ($logged.Count -gt 0) { return 'unmatched' }
     return 'not seen'
 }
 
 # Judges @p Transaction against its expectation, over every event since it began: refuses with each
-# finding, or returns the line that says what was judged, including which witnesses were live.
+# finding, or returns the line that says what was judged, including which witnesses were live. Every
+# refusal SHOWS its evidence first (Show-TransactionEvidence).
 #
-# @param Transaction The record Invoke-Msiexec keeps.
+# 'node stopped' (Get-Witness7036State) is judged by whether the node's restart was AWAITED:
+#   * at the exit of a transaction that COMMITTED ($script:MsiCommittedExitCodes), it was:
+#     FastCacheNodeStartService waits for RUNNING and checks it (Return="check"), so the node ran, and
+#     a 'running' missed while its 'stopped' was read is the witness failing on the STATE: refused;
+#   * at the exit of one that ROLLED BACK, it was not: the rollback restarts the node with Windows
+#     Installer's own StartServices, and msiexec can exit before RUNNING. DEFERRED, never passed: the
+#     transaction's Deferred says so, and the settled judgement (Assert-TransactionSettled, after
+#     Assert-ServiceTable's wait for the row) decides;
+#   * settled, it is refused either way, by what the node is NOW: running, it is the witness failing
+#     on the state; not running, absent or unobservable, the restart it was owed never arrived.
+#
+# @param Transaction The record Invoke-Msiexec keeps; Extended marks the settled judgement.
 # @param ReadEvents Takes the transaction's start in UTC and returns ConvertTo-ServiceControlEvent
 #                   records; the seam through which the self-test supplies them.
+# @param Observe Takes a service name and returns what Get-ServiceObservation would; the seam through
+#                which the self-test states what the node is when the judgement must ask.
+# @param When When it is judged, for the messages.
 # @return The pass line.
 function Invoke-TransactionJudgement {
     param(
         [Parameter(Mandatory)] $Transaction,
         [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since },
+        [scriptblock] $Observe = { param($name) Get-ServiceObservation $name },
         [string] $When = 'at msiexec''s exit'
     )
     $expectation = $Transaction.Expectation
+    $what = $Transaction.What
     # A watch that never looked reports no start, which is not the same as none happening.
     if ($Transaction.Polls -lt 1) {
-        throw "the services were never observed while '$($Transaction.What)' ran ($($Transaction.FailedPolls) observation round(s) failed, first: $($Transaction.FirstFailure)), so 'nothing was started' would describe nothing"
+        Show-TransactionEvidence -Transaction $Transaction -ReadEvents $ReadEvents -Observe $Observe
+        throw "the services were never observed while '$what' ran ($($Transaction.FailedPolls) observation round(s) failed, first: $($Transaction.FirstFailure)), so 'nothing was started' would describe nothing"
     }
     $events = @(& $ReadEvents $Transaction.StartedUtc)
-    $findings = @(Get-TransactionServiceVerdict -What $Transaction.What -StartedUtc $Transaction.StartedUtc -Events $events `
+    $evidence = { Show-TransactionEvidence -Transaction $Transaction -Events $events -Observe $Observe }
+    $findings = @(Get-TransactionServiceVerdict -What $what -StartedUtc $Transaction.StartedUtc -Events $events `
             -Observed $Transaction.Observed -Baseline $Transaction.Baseline -NotRunning $expectation.NotRunning -MayTerminate $expectation.MayTerminate)
     if ($findings.Count -gt 0) {
-        if ($Transaction.Log) {
-            Show-MsiLog $Transaction.Log
-            Show-MsiLogAroundFindings -Path $Transaction.Log -Findings $findings
-        }
+        & $evidence
+        if ($Transaction.Log) { Show-MsiLogAroundFindings -Path $Transaction.Log -Findings $findings }
         Show-PortHolders 6674
         $kinds = @($findings | ForEach-Object Kind | Sort-Object -Unique)
         $hints = @(
             if ('Termination' -in $kinds) { 'a TERMINATION is the service failing: read its time against the verbose log and the service''s own Application events (Show-ServiceDiagnosis), a refused start and a bad restore look like this' }
             if ('Start' -in $kinds) { 'a START of a service the expectation leaves not running has had one cause so far, Windows Installer''s Restart Manager (PR 1634): the package disables it (MSIRESTARTMANAGERCONTROL), an OLD package''s removal inside an upgrade does not, and Windows Installer restarts what that removal shut down after the transaction ends, which is why fastcached beside the node is disabled; read the verbose log''s RESTART MANAGER lines and the actions running at that time' }
         )
-        throw "'$($Transaction.What)' disturbed a service the table owns ($($expectation.Name)):`n  $(@($findings | ForEach-Object Text) -join "`n  ")`n$($hints -join "`n")"
+        throw "'$what' disturbed a service the table owns ($($expectation.Name)):`n  $(@($findings | ForEach-Object Text) -join "`n  ")`n$($hints -join "`n")"
     }
     $state = Get-Witness7036State -Events $events -StartedUtc $Transaction.StartedUtc -NodeStarts $expectation.NodeStarts
+    $read7036 = "read: $(@($events | Where-Object Id -eq 7036 | ForEach-Object { "$($_.Service) $($_.State)" }) -join '; ')"
     if ($state -eq 'unmatched') {
-        throw "'$($Transaction.What)' started the node, and of the 7036 events read since it began none is the node entering the running state while others are: this host writes them, so the event reader or its service matcher failed on the node's, and the 7036 witness is dead (read: $(@($events | Where-Object Id -eq 7036 | ForEach-Object { "$($_.Service) $($_.State)" }) -join '; '))"
+        & $evidence
+        throw "'$what' started the node, and of the 7036 events read since it began none is the node entering the running state while others are: this host writes them, so the event reader or its service matcher failed on the node's, and the 7036 witness is dead ($read7036)"
     }
-    if ($state -eq 'live' -and -not $script:Witness7036LiveSince) { $script:Witness7036LiveSince = $Transaction.What }
+    $witness = ''
+    if ($state -eq 'node stopped') {
+        $stop = @($events | Where-Object { $_.Id -eq 7036 -and $_.Service -eq 'FastCacheCompileNode' -and $_.State -eq 'Stopped' -and $_.Time -ge $Transaction.StartedUtc } | Sort-Object Time)[-1]
+        $stopAt = $stop.Time.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
+        $missedRunning = "the reader reads the node's, so the node's 'running' was missed: the 7036 witness failed on the STATE, not on the service ($read7036)"
+        if (-not $Transaction.Extended) {
+            if ($null -eq $Transaction.ExitCode) {
+                throw "'$what' records no exit code, so whether the node's restart was awaited cannot be told: the transaction record is broken, not the installation"
+            }
+            $code = [int] $Transaction.ExitCode
+            if ($script:MsiCommittedExitCodes.ContainsKey($code)) {
+                & $evidence
+                throw "'$what' returned $code ($($script:MsiCommittedExitCodes[$code])), so it committed past FastCacheNodeStartService, which waits for the node to be RUNNING and checks it, and of the node's 7036s since it began only its stop (at $stopAt) was read: $missedRunning"
+            }
+            $Transaction.Deferred = "'$what' exited $code, a transaction that ROLLED BACK, and at msiexec's exit the node's own stop (7036 stopped at $stopAt) was read with no 'running' after it ('node stopped'): the rollback restarts the node with Windows Installer's own StartServices, which nothing awaits, so whether the node re-enters RUNNING was DEFERRED to the settled judgement"
+            $witness = "7036 DEFERRED ('node stopped'): the node's own stop at $stopAt was read and it has not re-entered RUNNING; the transaction exited $code and rolled back, and its restart is not awaited, so the settled judgement decides"
+        } else {
+            $deferred = if ($Transaction.Deferred) { " -- the exit judgement deferred exactly this: $($Transaction.Deferred)" } else { '' }
+            $node = $null
+            $now = try {
+                $node = & $Observe 'FastCacheCompileNode'
+                if ($null -eq $node) { 'not registered' } else { "$($node.State), process $($node.ProcessId), exit code $($node.ExitCode), service-specific $($node.ServiceSpecificExitCode)" }
+            } catch { "unobservable ($($_.Exception.Message))" }
+            & $evidence
+            if ($null -ne $node -and $node.State -eq 'Running') {
+                throw "'$what': $When the node runs ($now), and of its 7036s since the transaction began only its stop (at $stopAt) was read: $missedRunning"
+            }
+            throw "'$what': $When the node has not re-entered RUNNING ('node stopped'): its own stop (7036 stopped at $stopAt) was read with no 'running' after it, and it is $now, so the restart the transaction owed it never arrived$deferred"
+        }
+    }
+    if ($state -eq 'live' -and -not $script:Witness7036LiveSince) { $script:Witness7036LiveSince = $what }
     if ($state -eq 'not seen' -and $script:Witness7036LiveSince) {
-        throw "'$($Transaction.What)' started the node and no 7036 was read, while '$script:Witness7036LiveSince' read the node's: this host writes them, so the reader failed, and the 7036 witness is dead"
+        & $evidence
+        throw "'$what' started the node and no 7036 was read, while '$script:Witness7036LiveSince' read the node's: this host writes them, so the reader failed, and the 7036 witness is dead"
     }
-    $witness = switch ($state) {
-        'live' { '7036 live (the node''s own start is logged)' }
-        'not seen' { '7036 NOT SEEN: the node started and no 7036 was read, so either this host writes none or the reader fails on all of them; the watch is the only start witness' }
-        default { '7036 unchecked: the transaction starts no node to be its control' }
+    if (-not $witness) {
+        $witness = switch ($state) {
+            'live' { '7036 live (the node''s own start is logged)' }
+            'not seen' { '7036 NOT SEEN: the node started and no 7036 was read, so either this host writes none or the reader fails on all of them; the watch is the only start witness' }
+            default { '7036 unchecked: the transaction starts no node to be its control' }
+        }
     }
     $watched = if ($expectation.NotRunning.Count) { "no start of $($expectation.NotRunning -join ', ')" } else { 'no start judged' }
     $gaps = if ($Transaction.FailedPolls -gt 0) { "; $($Transaction.FailedPolls) observation round(s) FAILED, first: $($Transaction.FirstFailure)" } else { '' }
     $why = if ($expectation.Reason) { " -- $($expectation.Reason)" } else { '' }
-    return "  '$($Transaction.What)' judged $When against $($expectation.Name)$why`: no unexpected termination, $watched; $witness; $($Transaction.Polls) observation round(s)$gaps"
+    return "  '$what' judged $When against $($expectation.Name)$why`: no unexpected termination, $watched; $witness; $($Transaction.Polls) observation round(s)$gaps"
 }
 
 # ---------------------------------------------------------------------------
@@ -2501,6 +2680,12 @@ function Invoke-MsiServiceTableSelfTest {
             @{ Case = 'the node started and no 7036 at all was read'; Events = @(); NodeStarts = $true; Want = 'not seen' }
             @{ Case = 'the node started and only another service''s 7036 was read'; Events = @(& $entered 30 'FastCached' 'Running'); NodeStarts = $true; Want = 'unmatched' }
             @{ Case = 'a node start BEFORE the transaction is not its control'; Events = @(& $entered -3 'FastCacheCompileNode' 'Running'); NodeStarts = $true; Want = 'not seen' }
+            # The node's OWN 7036s answer for the node, never for the host (PR 1645's refused-pin repair):
+            # its stop alone proves the reader reads the node's, so it is not 'unmatched'.
+            @{ Case = 'the node''s own stop alone is the node''s outcome, not a dead reader'; Events = @(& $entered 2 'FastCacheCompileNode' 'Stopped'); NodeStarts = $true; Want = 'node stopped' }
+            @{ Case = 'the node''s own stop beside another service''s 7036 is still the node''s outcome'; Events = @((& $entered 2 'FastCacheCompileNode' 'Stopped'), (& $entered 3 'msiserver' 'Running')); NodeStarts = $true; Want = 'node stopped' }
+            @{ Case = 'a node 7036 whose state the parse could not read is the matcher failing'; Events = @(& $entered 2 'FastCacheCompileNode' ''); NodeStarts = $true; Want = 'unmatched' }
+            @{ Case = 'the node''s stop and then its start is live'; Events = @((& $entered 2 'FastCacheCompileNode' 'Stopped'), (& $entered 9 'FastCacheCompileNode' 'Running')); NodeStarts = $true; Want = 'live' }
             @{ Case = 'no node start in the transaction'; Events = @(& $entered 30 'FastCacheCompileNode' 'Running'); NodeStarts = $false; Want = 'no control' })) {
         $state = Get-Witness7036State -Events $row.Events -StartedUtc $t0 -NodeStarts $row.NodeStarts
         if ($state -cne $row.Want) { throw "7036 control: $($row.Case) read '$state', expected '$($row.Want)'" }
@@ -2561,11 +2746,12 @@ function Invoke-MsiServiceTableSelfTest {
 
     # The judgement WIRED: the recorded transaction, its expectation, the event seam, and the message
     # per finding KIND.
-    $record = { param([string] $leaves, [string] $expect, [int] $polls, [int] $failed, $observed)
+    $record = { param([string] $leaves, [string] $expect, [int] $polls, [int] $failed, $observed, [int] $exitCode = 0)
         [pscustomobject]@{ What = 'the upgrade from v0.3.0'; Log = ''; StartedUtc = $t0; Baseline = $upgradeFrom030.Baseline
             Expectation = (Get-TransactionExpectation -Leaves $leaves -Expect $expect); Polls = $polls; FailedPolls = $failed
             FirstFailure = $(if ($failed) { 'FastCached: Invalid class' } else { '' }); Observed = $observed
-            EndedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp() - 60 * [Diagnostics.Stopwatch]::Frequency; Extended = $false } }
+            EndedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp() - 60 * [Diagnostics.Stopwatch]::Frequency; Extended = $false
+            ExitCode = $exitCode; Deferred = '' } }
     $savedLatch = $script:Witness7036LiveSince
     ExpectThrow 'judgement: a watch that never looked is refused, naming its failed rounds' {
         Invoke-TransactionJudgement -Transaction (& $record 'NodeSelected' '' 0 3 @()) -ReadEvents { @() }
@@ -2668,12 +2854,91 @@ function Invoke-MsiServiceTableSelfTest {
         $script:LastMsiTransaction = $saved
     }
 
+    # PR 1645's refused-pin repair: the transaction fails on purpose (1603) and rolls back, its row leaves
+    # the node running, and the rollback restarts the node with Windows Installer's own StartServices,
+    # which nothing awaits. At msiexec's exit the only 7036 read was the node's own STOP, and the
+    # judgement called the witness dead. The node's own stop is the node's outcome ('node stopped'),
+    # deferred at the exit of a ROLLED-BACK transaction and refused at the exit of a COMMITTED one (its
+    # FastCacheNodeStartService awaited RUNNING, so a missed 'running' is the witness failing on the
+    # state); settled, a node that never came back is refused naming the outcome, through the
+    # settled judgement alone and through the row's own wait.
+    $nodeStoppedAt2 = @(& $entered 2 'FastCacheCompileNode' 'Stopped')
+    $nodeIs = { param([string] $state, [int] $processId, [int] $exitCode)
+        { param($name) if ($name -eq 'FastCacheCompileNode') { [pscustomobject]@{ StartMode = 'Auto'; State = $state; ProcessId = $processId; ExitCode = $exitCode; ServiceSpecificExitCode = 0 } }
+          else { [pscustomobject]@{ StartMode = 'Disabled'; State = 'Stopped'; ProcessId = 0; ExitCode = 1077; ServiceSpecificExitCode = 0 } } }.GetNewClosure() }
+    $saved = $script:LastMsiTransaction
+    $savedLatch = $script:Witness7036LiveSince
+    try {
+        $script:Witness7036LiveSince = 'an earlier transaction'
+        $rolledBack = & $record 'NodeSelected' '' 5 0 @() 1603
+        $line = Invoke-TransactionJudgement -Transaction $rolledBack -ReadEvents { $nodeStoppedAt2 } -Observe (& $nodeIs 'Stopped' 0 0) 6>$null
+        if ($line -notmatch "judged at msiexec's exit against row NodeSelected: .*7036 DEFERRED \('node stopped'\): the node's own stop at 2026-10-06T12:12:16\.000Z was read .*exited 1603 and rolled back" -or
+            $rolledBack.Deferred -notmatch "exited 1603, a transaction that ROLLED BACK, .*\('node stopped'\).*DEFERRED to the settled judgement") {
+            throw "node stopped: a rolled-back transaction's exit judgement read '$line', deferred '$($rolledBack.Deferred)'"
+        }
+        Pass 'node stopped: at the exit of a ROLLED-BACK transaction the node''s own stop alone is deferred, not a dead witness'
+        $committed = & $record 'NodeSelected' '' 5 0 @() 0
+        ExpectThrow 'node stopped: at the exit of a COMMITTED transaction it is refused as the witness failing on the state' {
+            Invoke-TransactionJudgement -Transaction $committed -ReadEvents { $nodeStoppedAt2 } -Observe (& $nodeIs 'Running' 40 0) 6>$null
+        } "returned 0 \(success\), so it committed past FastCacheNodeStartService, .*only its stop \(at 2026-10-06T12:12:16\.000Z\) was read: the reader reads the node's, so the node's 'running' was missed: the 7036 witness failed on the STATE"
+        if ($committed.Deferred) { throw "node stopped: a committed transaction was deferred: '$($committed.Deferred)'" }
+        $restart = & $record 'NodeSelected' '' 5 0 @() 3010
+        ExpectThrow 'node stopped: a success that needs a restart is a committed transaction too' {
+            Invoke-TransactionJudgement -Transaction $restart -ReadEvents { $nodeStoppedAt2 } -Observe (& $nodeIs 'Running' 40 0) 6>$null
+        } 'returned 3010 \(success; a restart is required\), so it committed'
+
+        # The evidence a refusal shows, from the same read the verdict was taken from: each event with
+        # its meaning, and each service's state, process and exit codes.
+        $refusedWith = @($nodeStoppedAt2) + @([pscustomobject]@{ Id = 7000; Time = $t0.AddSeconds(3); Service = 'FastCacheCompileNode'; State = ''; Message = 'The fastcache-compile-node service failed to start.' })
+        $shown = @(& { try { $null = Invoke-TransactionJudgement -Transaction (& $record 'NodeSelected' '' 5 0 @() 0) -ReadEvents { $refusedWith } -Observe (& $nodeIs 'Stopped' 0 1067) } catch { 'refused' } } 6>&1 | ForEach-Object { "$_" })
+        $text = $shown -join "`n"
+        foreach ($want in @('^refused$', '^FastCacheCompileNode: Auto, Stopped, process 0; exit code 1067, service-specific 0$', '^FastCached: Disabled, Stopped, process 0; exit code 1077, service-specific 0$',
+                '^===== System events 7000, 7009, 7022, 7023, 7024, 7026, 7031, 7034, 7036 since ''the upgrade from v0\.3\.0'' began \(2026-10-06T12:12:14\.000Z\) =====$',
+                '^2026-10-06T12:12:16\.000Z 7036 FastCacheCompileNode Stopped -- the service entered the running or the stopped state: ',
+                '^2026-10-06T12:12:17\.000Z 7000 FastCacheCompileNode -- the service failed to start \(the error it names')) {
+            if (@($shown | Where-Object { $_ -match $want }).Count -ne 1) { throw "evidence: no single line matches '$want' in:`n$text" }
+        }
+        if ($text.IndexOf('7036 FastCacheCompileNode Stopped') -gt $text.IndexOf('7000 FastCacheCompileNode')) { throw "evidence: the events are not in time order:`n$text" }
+        Pass 'evidence: a refusal shows each event with its meaning, in time order, and each service''s state, process and exit codes'
+
+        # Settled: the deferred outcome is DECIDED. A node that came back passes, live; one that never did
+        # is refused naming the outcome; one that runs while its 'running' was never read is the witness.
+        $rolledBack.EndedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
+        $script:LastMsiTransaction = $rolledBack
+        $cameBack = @($nodeStoppedAt2) + @(& $entered 9 'FastCacheCompileNode' 'Running')
+        Assert-TransactionSettled -SettleSeconds 0 -ReadEvents { $cameBack } -Observe (& $nodeIs 'Running' 40 0) 6>$null
+        Pass 'node stopped: settled, the rollback''s restart logged as running passes'
+        foreach ($row in @(
+                @{ Case = 'settled, a node that never came back is refused naming the outcome and the deferral'; Node = (& $nodeIs 'Stopped' 0 1067)
+                   Want = "the node has not re-entered RUNNING \('node stopped'\): its own stop \(7036 stopped at 2026-10-06T12:12:16\.000Z\) was read with no 'running' after it, and it is Stopped, process 0, exit code 1067, .*never arrived -- the exit judgement deferred exactly this: .*exited 1603, a transaction that ROLLED BACK" }
+                @{ Case = 'settled, a node that runs while only its stop was read is the witness failing on the state'; Node = (& $nodeIs 'Running' 40 0)
+                   Want = "the node runs \(Running, process 40, .*only its stop \(at 2026-10-06T12:12:16\.000Z\) was read: the reader reads the node's, so the node's 'running' was missed" })) {
+            $rolledBack.Extended = $false
+            $script:LastMsiTransaction = $rolledBack
+            $observe = $row.Node
+            ExpectThrow "node stopped: $($row.Case)" { Assert-TransactionSettled -SettleSeconds 0 -ReadEvents { $nodeStoppedAt2 } -Observe $observe 6>$null } $row.Want
+        }
+        # Through the ROW: Assert-ServiceTable waits for the node first, so a node that never comes back
+        # is refused by that wait, and the refusal names the deferred outcome rather than only the state.
+        $rolledBack.Extended = $false
+        $script:LastMsiTransaction = $rolledBack
+        $diagnosed = [System.Collections.Generic.List[string]]::new()
+        ExpectThrow 'node stopped: a row whose node never comes back is refused naming the deferred outcome' {
+            Assert-ServiceTable -Row NodeSelected -StableSeconds 0 -TimeoutSeconds 1 -Observe (& $nodeIs 'Stopped' 0 1067) -ReadEvents { $nodeStoppedAt2 } `
+                -Diagnose { param($name) $diagnosed.Add($name) } 6>$null
+        } "^FastCacheCompileNode is Stopped, expected Running \(waited .*\n'the upgrade from v0\.3\.0' exited 1603, a transaction that ROLLED BACK, .*; the row was waited for and the node is Stopped, process 0: the rollback's restart never brought it to RUNNING$"
+        if (($diagnosed -join ',') -cne 'FastCacheCompileNode,FastCached') { throw "node stopped: the row diagnosed [$($diagnosed -join ',')]" }
+    } finally {
+        $script:LastMsiTransaction = $saved
+        $script:Witness7036LiveSince = $savedLatch
+    }
+
     # The second judgement for a transaction no row assertion follows (I-A): a failed upgrade's rollback
     # restarts fastcached with an unwaited `sc.exe start`, and a restore that cannot serve crashes after
     # msiexec exits. Judged at the exit it passes; settled, its late 7031 is refused.
     $saved = $script:LastMsiTransaction
     try {
-        $failed = & $record '' 'RollsBack' 5 0 @()
+        $failed = & $record '' 'RollsBack' 5 0 @() 1603
         $failed.EndedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
         $script:LastMsiTransaction = $failed
         $late = @(& $termination 7031 60 'FastCached')
@@ -2756,7 +3021,7 @@ function Invoke-MsiServiceTableSelfTest {
     }
     Pass "watch: a failed observation is counted ($($watched.FailedPolls) round(s)) and the watch goes on to the process's exit"
 
-    $expectedCases = 171
+    $expectedCases = 183
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -2774,5 +3039,5 @@ Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert
     Assert-FirewallGroupEmpty, Format-FirewallRuleLine, Get-FirewallGroupSnapshot, Get-FirewallGroupUnchangedVerdict,
     Assert-FirewallGroupUnchanged, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Get-InstallationSnapshot, Compare-InstallationSnapshot, New-MsiControlCopy,
     Watch-ServiceProcesses, ConvertTo-ServiceControlEvent, Get-ServiceControlEvents, Get-TransactionExpectation,
-    Get-TransactionServiceVerdict, Get-Witness7036State, Assert-TransactionSettled, Get-RestartManagerLogVerdict,
+    Get-TransactionServiceVerdict, Get-Witness7036State, Show-TransactionEvidence, Assert-TransactionSettled, Get-RestartManagerLogVerdict,
     Invoke-MsiServiceTableSelfTest

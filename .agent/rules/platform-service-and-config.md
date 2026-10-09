@@ -889,6 +889,17 @@ readable and silently ignored. Every rule below has already been one of them.
     The witness cannot die behind a green line: a node start whose 7036 is missing while other
     services' 7036s were read is REFUSED (the reader or its matcher failed), and so is a `NOT SEEN`
     once an earlier transaction of the same process read `live`.
+  - **The node's OWN 7036s never count as "other services'"** (PR 1645): its own `stopped` with no
+    `running` proves the reader reads the node's, so it is `node stopped`, the node's outcome, never
+    a dead witness. Whether the restart was AWAITED decides it: a transaction that COMMITTED
+    (`$script:MsiCommittedExitCodes`) passed `FastCacheNodeStartService`, which waits for RUNNING, so
+    a missed `running` is the witness failing on the STATE and is refused at the exit; one that ROLLED
+    BACK restarts the node with Windows Installer's own unawaited StartServices, so the exit DEFERS it
+    (`7036 DEFERRED`, the transaction's `Deferred`), and the settled judgement refuses a node that
+    never came back -- `Assert-ServiceTable`'s own wait names the deferred outcome. Every refusal
+    SHOWS its evidence first (`Show-TransactionEvidence`): the verbose log, each service's state,
+    process and exit codes, and the SCM events of `$script:ServiceControlEventMeanings` since the
+    transaction began, from the read the verdict was taken from.
   - **An OLD package's removal keeps its own Restart Manager, and Windows Installer restarts what it
     shut down AFTER the whole transaction**, so fastcached beside the node is `disabled`, never
     `manual`. MEASURED in PR 1634's CI, the upgrade from 0.3.0 (whose package sets no such property):
