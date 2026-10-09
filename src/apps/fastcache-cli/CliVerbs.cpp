@@ -1172,7 +1172,8 @@ namespace
         // Empty is a READING here -- this node names no leader -- so the field is present
         // and ABSENT rather than missing, which would say this node could not tell. On the
         // leader itself empty means it leads, and the row says `this node`, read through
-        // `NamedLeader` -- the panel's leader line, so the two spell it alike (#1647).
+        // `NamedLeader`, which the panel's leader line reads too, so the two spell it alike
+        // (#1647).
         if (ReportsConsensus(&fields))
         {
             auto leader = NamedLeader(fields);

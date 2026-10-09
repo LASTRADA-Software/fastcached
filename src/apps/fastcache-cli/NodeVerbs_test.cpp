@@ -463,6 +463,13 @@ TEST_CASE("`node` names the leader itself as this node in every format", "[cli][
     CHECK(
         RenderValue(follower.value, RenderOptions { .format = OutputFormat::Json }).contains(R"("leader":"10.0.0.9:6676")"));
 
+    // `Leader` WITH an endpoint is a torn read during a Leader-to-Follower change: `Describe` reads the
+    // role and then the endpoint, while `SetRole` stores the endpoint first, so the endpoint already
+    // names the NEW leader. It wins, and `this node` would name the machine that just stopped leading.
+    ScriptedNodeExchange torn { { statusOf(CacheWire::WireSchedulerRole::Leader, "10.0.0.9:6676") } };
+    auto const tornRead = RunNodeVerb("node", torn);
+    CHECK(RequiredCell(tornRead, "leader").lexical == "10.0.0.9:6676");
+
     // Empty beside any other role names nobody: absent, and `null` in JSON -- never `this node`.
     for (auto const role: { CacheWire::WireSchedulerRole::Follower, CacheWire::WireSchedulerRole::Undecided })
     {

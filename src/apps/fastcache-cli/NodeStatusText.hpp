@@ -53,8 +53,8 @@ inline constexpr std::string_view SelfLeader = "this node";
 /// **Decides only the reading**: whether a leader is reported at all is `ReportsConsensus`'s
 /// question, asked first by every caller. An empty endpoint is a reading, and which one depends on
 /// the role beside it: beside `Leader` this node leads, so it is `SelfLeader`; anywhere else (an
-/// election, a learner that has heard from no leader, a leader whose record names no scheduling
-/// endpoint) nothing is named, which a caller renders as its absent marker.
+/// election, a learner that has heard from no leader, a known leader whose member record names no
+/// scheduling endpoint) nothing is named, which a caller renders as its absent marker.
 /// @param status The node's status.
 /// @return The leader's endpoint, `SelfLeader` on the leader itself, or nullopt when no leader is
 ///         named. Owned, so it outlives @p status.
