@@ -1170,13 +1170,15 @@ namespace
         // record reads as it always has.
         //
         // Empty is a READING here -- this node names no leader -- so the field is present
-        // and ABSENT rather than missing, which would say this node could not tell. Beside
-        // role `leader` that means it leads itself, which this row still draws as the absent
-        // cell where the `node` panel says *this node*: that mismatch is #1647.
+        // and ABSENT rather than missing, which would say this node could not tell. On the
+        // leader itself empty means it leads, and the row says `this node`, read through
+        // `NamedLeader` -- the panel's leader line, so the two spell it alike (#1647).
         if (ReportsConsensus(&fields))
+        {
+            auto leader = NamedLeader(fields);
             record.push_back(
-                { .name = "leader",
-                  .value = fields.runtime.leaderEndpoint.empty() ? AbsentCell() : TextCell(fields.runtime.leaderEndpoint) });
+                { .name = "leader", .value = leader.has_value() ? TextCell(std::move(*leader)) : AbsentCell() });
+        }
 
         // **The window an operator needs to know they left open.** The node encodes
         // these two and the wire carries them; until now nothing rendered either, so

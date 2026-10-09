@@ -16,7 +16,8 @@ namespace FastCache::Cli
 /// What a node's status is called when a person reads it: the one spelling `node-status` reports
 /// and the `node` panel draws, so the two cannot name one component or one role differently.
 /// It also holds `ReportsConsensus`, the one predicate the `node` record and the `node` panel
-/// share for whether a node has a leader to report, so the two cannot disagree about that either.
+/// share for whether a node has a leader to report, and `NamedLeader`, the one reading of WHICH
+/// leader, so the two cannot disagree about either.
 
 /// The components @p mask names, as a comma-separated list.
 ///
@@ -40,6 +41,24 @@ namespace FastCache::Cli
 /// @param status The status, or nullptr when none was read.
 /// @return False for nullptr.
 [[nodiscard]] bool ReportsConsensus(CompileCacheWire::NodeStatusFields const* status) noexcept;
+
+/// What a leading node's leader reads: it names no endpoint because it IS the leader (#1647).
+///
+/// The one spelling the `node` record's `leader` row and the `node` panel's leader line both draw,
+/// so the two cannot say it differently.
+inline constexpr std::string_view SelfLeader = "this node";
+
+/// The leader @p status names, as a person reads it (#1647).
+///
+/// **Decides only the reading**: whether a leader is reported at all is `ReportsConsensus`'s
+/// question, asked first by every caller. An empty endpoint is a reading, and which one depends on
+/// the role beside it: beside `Leader` this node leads, so it is `SelfLeader`; anywhere else (an
+/// election, a learner that has heard from no leader, a leader whose record names no scheduling
+/// endpoint) nothing is named, which a caller renders as its absent marker.
+/// @param status The node's status.
+/// @return The leader's endpoint, `SelfLeader` on the leader itself, or nullopt when no leader is
+///         named. Owned, so it outlives @p status.
+[[nodiscard]] std::optional<std::string> NamedLeader(CompileCacheWire::NodeStatusFields const& status);
 
 /// What to call one toolchain-survey state.
 /// @param state The wire tag.

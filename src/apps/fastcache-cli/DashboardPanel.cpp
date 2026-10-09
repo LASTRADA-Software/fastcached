@@ -1501,9 +1501,6 @@ namespace
         return fact;
     }
 
-    /// What a leading node's `leader` reads: it names no endpoint because it is the leader.
-    constexpr std::string_view SelfLeader = "this node";
-
     /// What renders one status fact.
     struct StatusFactSpec
     {
@@ -1584,12 +1581,8 @@ namespace
               auto const* status = StatusOf(in);
               if (status == nullptr)
                   return Said(std::string { in.absent });
-              auto const& runtime = status->runtime;
-              if (!runtime.leaderEndpoint.empty())
-                  return Said(runtime.leaderEndpoint);
-              if (runtime.schedulerRole == CompileCacheWire::WireSchedulerRole::Leader)
-                  return Said(std::string { SelfLeader });
-              return Said(std::string { in.absent });
+              auto leader = NamedLeader(*status);
+              return Said(leader.has_value() ? std::move(*leader) : std::string { in.absent });
           } },
         { .fact = StatusFact::DialledAt,
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {

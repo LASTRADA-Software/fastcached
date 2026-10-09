@@ -2,6 +2,7 @@
 #include "CliFormat.hpp"
 #include "CliVerbs.hpp"
 #include "FleetReach.hpp"
+#include "NodeStatusText.hpp"
 #include "ScriptedExchange.hpp"
 #include "StatsGatherer.hpp"
 
@@ -429,6 +430,50 @@ TEST_CASE("`node` names a learner's leader before its consensus standing is know
     auto const withoutLeader = RunNodeVerb("node", unnamed);
     CHECK(withoutLeader.outcome == Outcome::Affirmative);
     CHECK(RequiredCell(withoutLeader, "leader").kind == CellKind::Absent);
+}
+
+TEST_CASE("`node` names the leader itself as this node in every format", "[cli][node][verbs][leader]")
+{
+    // #1647. A leader sends an empty endpoint because it names no OTHER leader, and the panel draws
+    // that as `this node`; the record drew it as the absent cell, which reads as *no leader named*
+    // on the one machine every other follows. The spelling is the shared constant, and pinned as text
+    // too, so the record and the panel cannot drift apart.
+    STATIC_REQUIRE(SelfLeader == std::string_view { "this node" });
+    auto const statusOf = [](std::optional<CacheWire::WireSchedulerRole> role, std::string leader) {
+        return StatusReply({ .version = "1.2.3",
+                             .nodeId = "node-a",
+                             .uptimeSeconds = 5,
+                             .surfaces = {},
+                             .components = CacheWire::NodeComponentBit::Scheduler | CacheWire::NodeComponentBit::Consensus,
+                             .runtime = { .schedulerRole = role, .leaderEndpoint = std::move(leader) } });
+    };
+
+    ScriptedNodeExchange leading { { statusOf(CacheWire::WireSchedulerRole::Leader, {}) } };
+    auto const leader = RunNodeVerb("node", leading);
+    CHECK(leader.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(leader, "leader").kind == CellKind::Text);
+    CHECK(RequiredCell(leader, "leader").lexical == SelfLeader);
+    CHECK(RenderValue(leader.value, RenderOptions { .format = OutputFormat::Human }).contains("this node"));
+    CHECK(RenderValue(leader.value, RenderOptions { .format = OutputFormat::Json }).contains(R"("leader":"this node")"));
+
+    // A follower names where the leader answers; the endpoint wins over any role.
+    ScriptedNodeExchange following { { statusOf(CacheWire::WireSchedulerRole::Follower, "10.0.0.9:6676") } };
+    auto const follower = RunNodeVerb("node", following);
+    CHECK(RequiredCell(follower, "leader").lexical == "10.0.0.9:6676");
+    CHECK(
+        RenderValue(follower.value, RenderOptions { .format = OutputFormat::Json }).contains(R"("leader":"10.0.0.9:6676")"));
+
+    // Empty beside any other role names nobody: absent, and `null` in JSON -- never `this node`.
+    for (auto const role: { CacheWire::WireSchedulerRole::Follower, CacheWire::WireSchedulerRole::Undecided })
+    {
+        INFO("role " << static_cast<unsigned>(role));
+        ScriptedNodeExchange unnamed { { statusOf(role, {}) } };
+        auto const answer = RunNodeVerb("node", unnamed);
+        CHECK(RequiredCell(answer, "leader").kind == CellKind::Absent);
+        auto const json = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json });
+        CHECK(json.contains(R"("leader":null)"));
+        CHECK_FALSE(json.contains("this node"));
+    }
 }
 
 TEST_CASE("`node` renders the enrollment window, and says nothing where there is none", "[cli][node][verbs]")
