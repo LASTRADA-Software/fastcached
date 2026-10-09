@@ -419,7 +419,11 @@ Beside them, what that worker is offering and whether anyone knows about it:
   empty and reads exactly like an idle fleet. `undecided` means an election is in
   progress, so a node running **no** scheduler reports no role at all rather than
   claiming to be in one; an `undecided` node reports the `leader` cell as absent,
-  because no leader is known yet. A node that runs consensus and no scheduler — a
+  because no leader is known yet. The leader itself names no other leader, and reports
+  `leader` as `this node`, the spelling the `node` panel draws
+  ([#1647](https://github.com/LASTRADA-Software/fastcached/issues/1647)). So in JSON
+  `leader` is a `host:port` endpoint, the string `"this node"`, or `null` when no leader
+  is named. A node that runs consensus and no scheduler — a
   learner — reports no role but still reports `leader`: the leader's scheduling endpoint
   it redirects launchers to, read from the same place the redirect is
   ([#1641](https://github.com/LASTRADA-Software/fastcached/issues/1641)), and absent while
