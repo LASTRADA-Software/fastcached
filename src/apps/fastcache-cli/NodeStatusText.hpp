@@ -25,6 +25,20 @@ namespace FastCache::Cli
 /// @return The list.
 [[nodiscard]] std::string DescribeComponents(std::uint32_t mask);
 
+/// Whether @p status is of a node running consensus: its `Consensus` component bit, or a scheduler
+/// role, which only a consensus node reports.
+///
+/// **The one answer** to *does this node have a leader to report* that both the `node` record's
+/// `leader` row and the `node` panel's consensus lines key on, so the two cannot disagree (#1641).
+/// The component bit rather than the consensus standing: a learner's standing is absent until its
+/// tier attaches, while the bit says from the first reply that it runs consensus.
+///
+/// Named `ReportsConsensus` rather than `RunsConsensus` so it is not misread as the node's own
+/// `Node::RunsConsensus`, which decides from the CONFIGURATION; this reads what a reply SAID.
+/// @param status The status, or nullptr when none was read.
+/// @return False for nullptr.
+[[nodiscard]] bool ReportsConsensus(CompileCacheWire::NodeStatusFields const* status) noexcept;
+
 /// What to call one toolchain-survey state.
 /// @param state The wire tag.
 /// @return A stable lower-case name.

@@ -404,6 +404,33 @@ TEST_CASE("`node` names a learner's leader although it reports no scheduler role
     CHECK(CellOf(withoutLeader, "scheduler-role") == nullptr);
 }
 
+TEST_CASE("`node` names a learner's leader before its consensus standing is known", "[cli][node][verbs][learner]")
+{
+    // The window #1641's guard has to cover: the tier has not attached yet, so the reply carries the
+    // Consensus component bit and NO standing. The bit is what says this node runs consensus, so the
+    // row is there -- keyed on the standing it would be missing for exactly that window.
+    auto const unattachedSaying = [](std::string leader) {
+        return StatusReply({ .version = "1.2.3",
+                             .nodeId = "node-b",
+                             .uptimeSeconds = 1,
+                             .surfaces = {},
+                             .components = CacheWire::NodeComponentBit::Worker | CacheWire::NodeComponentBit::Consensus,
+                             .runtime = { .leaderEndpoint = std::move(leader) } });
+    };
+
+    ScriptedNodeExchange named { { unattachedSaying("office-a.example.com:6674") } };
+    auto const withLeader = RunNodeVerb("node", named);
+    CHECK(withLeader.outcome == Outcome::Affirmative);
+    CHECK(CellOf(withLeader, "consensus-standing") == nullptr);
+    CHECK(CellOf(withLeader, "scheduler-role") == nullptr);
+    CHECK(RequiredCell(withLeader, "leader").lexical == "office-a.example.com:6674");
+
+    ScriptedNodeExchange unnamed { { unattachedSaying({}) } };
+    auto const withoutLeader = RunNodeVerb("node", unnamed);
+    CHECK(withoutLeader.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(withoutLeader, "leader").kind == CellKind::Absent);
+}
+
 TEST_CASE("`node` renders the enrollment window, and says nothing where there is none", "[cli][node][verbs]")
 {
     // **The field an operator is TOLD to read to find a window they left open.** The

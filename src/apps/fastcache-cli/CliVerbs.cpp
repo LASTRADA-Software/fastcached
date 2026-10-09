@@ -1163,14 +1163,15 @@ namespace
 
         // The leader is reported by every node running consensus, not only one running a
         // scheduler: a learner schedules nothing and redirects every scheduling verb to the
-        // leader, and names that leader here from the same source (#1641). A role or a
-        // consensus standing is what says this node runs consensus, the question the
-        // dashboard's leader line asks too. Kept right after the role, so a scheduler's
+        // leader, and names that leader here from the same source (#1641). Asked of
+        // `ReportsConsensus`, the predicate the `node` panel's leader line asks, so the two
+        // cannot disagree -- and the component bit rather than the standing, which is absent
+        // until a learner's tier attaches. Kept right after the role, so a scheduler's
         // record reads as it always has.
         //
         // Empty is a READING here -- no leader is known -- so the field is present and
         // ABSENT rather than missing, which would say this node could not tell.
-        if (fields.runtime.schedulerRole.has_value() || fields.runtime.consensusStanding.has_value())
+        if (ReportsConsensus(&fields))
             record.push_back(
                 { .name = "leader",
                   .value = fields.runtime.leaderEndpoint.empty() ? AbsentCell() : TextCell(fields.runtime.leaderEndpoint) });

@@ -2937,7 +2937,7 @@ TEST_CASE("a node that runs no consensus draws no dial address even when its sta
           "[cli][dashboard][panel][node]")
 {
     // The gate is what the node last said it RUNS, not whether the field is engaged: the endpoint is set here, so a row
-    // keyed on the field alone draws it and fails. Running no consensus is BOTH halves `RunsConsensus` reads: no
+    // keyed on the field alone draws it and fails. Running no consensus is BOTH halves `ReportsConsensus` reads: no
     // component, and no scheduler role.
     namespace Bits = CompileCacheWire::NodeComponentBit;
     auto status = MockupNodeStatus();

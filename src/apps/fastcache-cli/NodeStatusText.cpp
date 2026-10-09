@@ -180,4 +180,11 @@ std::optional<std::string> DescribeConditions(
     return std::format("raised: {}", raised);
 }
 
+bool ReportsConsensus(CompileCacheWire::NodeStatusFields const* status) noexcept
+{
+    return status != nullptr
+           && ((status->components & CompileCacheWire::NodeComponentBit::Consensus) != 0
+               || status->runtime.schedulerRole.has_value());
+}
+
 } // namespace FastCache::Cli
