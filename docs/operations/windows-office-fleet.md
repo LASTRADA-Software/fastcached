@@ -151,7 +151,9 @@ fastcache-compile-node --enroll-approve=<node-id>@<key>
 ```
 
 The machine becomes a learner of the fleet at its next poll; `fastcache-cli node` on it then
-reads `consensus-standing` `learner`. `--enroll-reject=<node-id>` refuses a row: that machine is
+reads `consensus-standing` `learner`, and `leader` names the leader's scheduling endpoint -- the
+one the PC's launcher is sent to -- or `-` while it has heard from no leader within the election
+timeout. `--enroll-reject=<node-id>` refuses a row: that machine is
 told so and leaves the fleet alone for an hour before it asks again. Rejecting a machine that was already approved does not remove it:
 `--cluster-forget` does (step 6). `--enroll-clear` drops every undecided row, for a list
 somebody filled. One address may hold at most four undecided rows at a time, and a machine that

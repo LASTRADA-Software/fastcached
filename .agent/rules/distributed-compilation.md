@@ -2127,7 +2127,10 @@ symptom was that they were slow.
     the redirected request, so the learner is not a second, stricter door.
   - **The endpoint is the leader's `0xFC` one, from the applied member record**
     (`ClusterState::SchedulerEndpointOf`), never its Raft endpoint, read through
-    `ISchedulingLeaderSource` rather than a reach into the consensus tier.
+    `ISchedulingLeaderSource` rather than a reach into the consensus tier. NODE-STATUS reads its
+    `leader` from that SAME object (`NodeRuntimeSources::schedulingLeader`,
+    [#1641](https://github.com/LASTRADA-Software/fastcached/issues/1641)), so `fastcache-cli node`
+    and the redirect cannot disagree; the role stays ABSENT, since the node runs no scheduler.
   - **A silent leader is named by NOBODY once its silence passes the tier's own Raft
     `electionTimeoutMax`** — 300 ms today, judged once per 1 s reconcile pass, so the effective
     bound is up to one pass longer. That is the moment a follower VOTER would stop naming it,
@@ -4005,9 +4008,3 @@ half from passing. The in-process fleet asserts it from addresses nobody listed
   it can be spawned and once for its banner, and the first is in a serial loop in
   front of the pool built to hide exactly that. `CompilerBanner` knows both facts
   and reports neither, so two callers reconstruct what it discarded.
-- **[#1641](https://github.com/LASTRADA-Software/fastcached/issues/1641)** — a learner's
-  NODE-STATUS (`fastcache-cli node`) reports no leader endpoint, although the learner knows
-  it: the redirect above names it to every admitted launcher through `ISchedulingLeaderSource`,
-  while NODE-STATUS reads the leader only from `NodeRuntimeSources::scheduler`, which
-  is null on a node that runs no scheduler. So the one surface an operator asks *where is my
-  leader* answers less than the launcher beside it is told.

@@ -419,7 +419,12 @@ Beside them, what that worker is offering and whether anyone knows about it:
   empty and reads exactly like an idle fleet. `undecided` means an election is in
   progress, so a node running **no** scheduler reports no role at all rather than
   claiming to be in one; an `undecided` node reports the `leader` cell as absent,
-  because no leader is known yet.
+  because no leader is known yet. A node that runs consensus and no scheduler — a
+  learner — reports no role but still reports `leader`: the leader's scheduling endpoint
+  it redirects launchers to, read from the same place the redirect is
+  ([#1641](https://github.com/LASTRADA-Software/fastcached/issues/1641)), and absent while
+  it has heard from no leader within the election timeout. A node running no consensus
+  reports neither field.
 - **`consensus-endpoint`** — the `host:port` this node's consensus peers DIAL it at,
   which is the half of `--cluster-admit`'s receipt to compare against. Not `raft-port`,
   which is the port the node BOUND, on an address that is routinely the wildcard. It is

@@ -1158,15 +1158,22 @@ namespace
         // idle fleet. A node running no scheduler reports no role at all, which is what
         // keeps `undecided` meaning *an election is in progress*.
         if (fields.runtime.schedulerRole.has_value())
-        {
             record.push_back({ .name = "scheduler-role",
                                .value = TextCell(std::string { NameOfSchedulerRole(*fields.runtime.schedulerRole) }) });
-            // Empty is a READING here -- no leader is known -- so the field is present
-            // and ABSENT rather than missing, which would say this node could not tell.
+
+        // The leader is reported by every node running consensus, not only one running a
+        // scheduler: a learner schedules nothing and redirects every scheduling verb to the
+        // leader, and names that leader here from the same source (#1641). A role or a
+        // consensus standing is what says this node runs consensus, the question the
+        // dashboard's leader line asks too. Kept right after the role, so a scheduler's
+        // record reads as it always has.
+        //
+        // Empty is a READING here -- no leader is known -- so the field is present and
+        // ABSENT rather than missing, which would say this node could not tell.
+        if (fields.runtime.schedulerRole.has_value() || fields.runtime.consensusStanding.has_value())
             record.push_back(
                 { .name = "leader",
                   .value = fields.runtime.leaderEndpoint.empty() ? AbsentCell() : TextCell(fields.runtime.leaderEndpoint) });
-        }
 
         // **The window an operator needs to know they left open.** The node encodes
         // these two and the wire carries them; until now nothing rendered either, so

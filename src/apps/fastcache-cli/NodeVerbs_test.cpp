@@ -374,6 +374,36 @@ TEST_CASE("`node` omits the scheduler fields entirely on a node that runs none",
     CHECK(CellOf(answer, "leader") == nullptr);
 }
 
+TEST_CASE("`node` names a learner's leader although it reports no scheduler role", "[cli][node][verbs][learner]")
+{
+    // #1641. A learner runs consensus and no scheduler: no role, a standing, and the leader its
+    // redirect sends launchers to. The leader row is keyed on running consensus, so it is there
+    // with the endpoint, or there and ABSENT at the cell while no leader is named -- never missing,
+    // which would say this node could not tell.
+    auto const learnerSaying = [](std::string leader) {
+        return StatusReply({ .version = "1.2.3",
+                             .nodeId = "node-b",
+                             .uptimeSeconds = 5,
+                             .surfaces = {},
+                             .components = CacheWire::NodeComponentBit::Worker | CacheWire::NodeComponentBit::Consensus,
+                             .runtime = { .leaderEndpoint = std::move(leader),
+                                          .consensusStanding = CacheWire::WireConsensusStanding::Learner } });
+    };
+
+    ScriptedNodeExchange named { { learnerSaying("office-a.example.com:6674") } };
+    auto const withLeader = RunNodeVerb("node", named);
+    CHECK(withLeader.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(withLeader, "leader").lexical == "office-a.example.com:6674");
+    CHECK(CellOf(withLeader, "scheduler-role") == nullptr);
+    CHECK(RequiredCell(withLeader, "consensus-standing").lexical == "learner");
+
+    ScriptedNodeExchange unnamed { { learnerSaying({}) } };
+    auto const withoutLeader = RunNodeVerb("node", unnamed);
+    CHECK(withoutLeader.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(withoutLeader, "leader").kind == CellKind::Absent);
+    CHECK(CellOf(withoutLeader, "scheduler-role") == nullptr);
+}
+
 TEST_CASE("`node` renders the enrollment window, and says nothing where there is none", "[cli][node][verbs]")
 {
     // **The field an operator is TOLD to read to find a window they left open.** The
