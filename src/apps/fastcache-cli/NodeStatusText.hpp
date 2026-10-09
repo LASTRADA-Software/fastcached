@@ -15,6 +15,8 @@ namespace FastCache::Cli
 /// @file NodeStatusText.hpp
 /// What a node's status is called when a person reads it: the one spelling `node-status` reports
 /// and the `node` panel draws, so the two cannot name one component or one role differently.
+/// It also holds `ReportsConsensus`, the one predicate the `node` record and the `node` panel
+/// share for whether a node has a leader to report, so the two cannot disagree about that either.
 
 /// The components @p mask names, as a comma-separated list.
 ///

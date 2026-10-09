@@ -4003,6 +4003,13 @@ half from passing. The in-process fleet asserts it from addresses nobody listed
   as the tree's answer about itself. `ToolchainFingerprint_test.cpp`'s *One MSVC
   toolset's target variants are two toolchains* pins it now, over a deliberately
   byte-identical include tree, so it cannot go stale a second time in silence.
+- **[#1646](https://github.com/LASTRADA-Software/fastcached/issues/1646)** — `NodeRuntimeSources`
+  is composed in `main`, which no test reaches, so which sources a node is handed is asserted
+  by nothing: the learner's `.schedulingLeader` wiring
+  ([#1641](https://github.com/LASTRADA-Software/fastcached/issues/1641)) is a pointer `main`
+  sets on `RedirectsScheduling`, as every other field of that record is set there, and a
+  wiring that dropped it would leave every case green while `fastcache-cli node` on a
+  learner named no leader again.
 - **[#148](https://github.com/LASTRADA-Software/fastcached/issues/148)** — every
   discovered compiler is spawned twice at startup with the same argv, once to learn
   it can be spawned and once for its banner, and the first is in a serial loop in

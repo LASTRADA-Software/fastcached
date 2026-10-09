@@ -797,8 +797,8 @@ TEST_CASE("A learner reports the leader its redirect names and no scheduler role
 
 TEST_CASE("A node that neither schedules nor redirects reports no leader and no role", "[node][node-status][scheduler-role]")
 {
-    // The control for the case above: the leader it reports comes from the source it was handed,
-    // not from anything every node carries.
+    // The control for the case above: the responder invents no leader without a source. Which
+    // sources a node is handed is decided in `main`, which no test reaches (#1646).
     core::platform::ManualClock clock;
     Fixture const worker { {}, clock, { .worker = true } };
     auto const fields = worker.status.Describe();

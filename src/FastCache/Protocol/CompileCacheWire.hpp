@@ -6769,10 +6769,15 @@ struct NodeRuntimeFields
 
     /// Where the leader answers, or empty when no leader is known.
     ///
-    /// Empty is a READING rather than an absence here -- it is what `Undecided` looks
-    /// like from outside, and the role beside it is what says whether this node is in a
-    /// position to know. A node running no scheduler reports no role, which is what
-    /// makes this field's emptiness unambiguous.
+    /// Empty is a READING only on a node that runs consensus, where it means an election
+    /// in progress (`Undecided`) or a learner whose leader has been silent past the
+    /// election timeout (#1641). Which kind of node sent it is said beside it, not here:
+    /// the `Consensus` component bit or a scheduler role (the client's
+    /// `Cli::ReportsConsensus` asks exactly that), and a learner reports this field with
+    /// no role at all, since it runs no scheduler. On a node running no consensus the
+    /// field is empty and means nothing. The wire has no absent form for it: the encoder
+    /// always writes it and the decoder reads a missing one as empty, so the reading is
+    /// told from the meaningless empty by the node's kind, never by the field.
     std::string leaderEndpoint {};
 
     /// How many of this node's registrations a scheduler has accepted.
