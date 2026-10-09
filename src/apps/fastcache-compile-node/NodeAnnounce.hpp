@@ -41,12 +41,13 @@
 namespace FastCache::Node
 {
 
-/// The endpoint this worker is announcing, now.
+/// An endpoint this node states, now, held so every reader sees one value change at one point.
 ///
-/// The production `Cc::IAdvertisedEndpointSource`, and the one object the registration
-/// and the lease check both read -- which is what makes *the endpoint the scheduler
-/// signs and the endpoint this worker verifies are one fact* a property of the type
-/// system rather than a sentence in `main`.
+/// The production `Cc::IAdvertisedEndpointSource`. A process holds two kinds:
+///   - the PUBLISHED endpoint (`main`'s, one per process), written by `EndpointResolver` alone and
+///     read by the worker's heartbeat and the presence loop, which file this machine under it;
+///   - the REGISTERED endpoint (`WorkerTier::Advertised`), written by the heartbeat alone as it
+///     rebuilds the registrars, and the one the lease check verifies a grant against.
 ///
 /// ## Why this is not `ConfiguredCredential`'s shape
 ///
@@ -56,20 +57,23 @@ namespace FastCache::Node
 ///
 /// An endpoint is not like that, because a second party holds a copy. The scheduler
 /// files this worker under `(fingerprint, endpoint)` and signs that endpoint into every
-/// grant, so a value that changed the moment a snapshot was published would leave this
-/// worker refusing authentic grants for the address the fleet still has -- and it would
-/// do so for however long the heartbeat interval is, with `LeaseEndpointMismatch`
-/// rising and no configuration anywhere being wrong. Reading the snapshot per call is
-/// the shape that looks most correct and is the one that breaks.
+/// grant, so a lease check that moved the moment a snapshot -- or a route -- changed would
+/// leave this worker refusing authentic grants for the address the fleet still has, for
+/// however long the heartbeat interval is, with `LeaseEndpointMismatch` rising and no
+/// configuration anywhere being wrong.
 ///
-/// So the value changes at ONE point: the heartbeat thread publishes it as part of
-/// re-announcing, after the old registration has been queued for withdrawal and the new
-/// registrars built. `WorkerTier::AnnounceAs` is that point, and it is the only caller
-/// of `Publish`.
+/// ## What holds
+///
+/// **A grant for the endpoint this worker is registered under is honoured until the heartbeat
+/// re-registers.** The resolver publishes a move on its own thread, but the lease check reads the
+/// REGISTERED endpoint, which moves only in the step that queues the old registrations for
+/// withdrawal and builds the new ones. And that step is not left for the next interval: a published
+/// `0xFC` move wakes the heartbeat at once (`IEndpointMoveSink`), so the scheduler is told within a
+/// round trip.
 ///
 /// ## The window this still has, stated rather than hidden
 ///
-/// A grant signed for the old endpoint and presented after the change is refused, since
+/// A grant signed for the old endpoint and presented after the re-registration is refused, since
 /// one endpoint is expected at a time. That is bounded by the grant's own lifetime,
 /// counted (`LeaseEndpointMismatch`), and costs the client a local compile -- against
 /// which the alternative, accepting any recently advertised address, widens the window
@@ -95,16 +99,16 @@ class AnnouncedEndpoint final: public Cc::IAdvertisedEndpointSource
 
     /// Make @p endpoint what this worker advertises from now on.
     ///
-    /// Called by the heartbeat thread alone, and only alongside the re-registration
-    /// that tells the scheduler -- see the class comment for why this is not a setter
-    /// anybody may reach for.
+    /// Called by this instance's one writer -- `EndpointResolver` for the published endpoint, the
+    /// worker's heartbeat for the registered one -- see the class comment for why this is not a
+    /// setter anybody may reach for.
     /// @param endpoint The new endpoint; must be non-empty, since nothing can be
     ///        registered under an empty one.
     void Publish(std::string endpoint)
     {
         // A precondition rather than a refusal, because an empty endpoint here is a
-        // programmer error and not a configuration: `AdvertisedEndpointChange` is what
-        // decides, and it answers nullopt for an empty candidate. Publishing one would
+        // programmer error and not a configuration: `EndpointResolver` is what decides,
+        // and it never publishes an empty derivation. Publishing one would
         // withdraw every registration and re-register under no address at all -- a node
         // that disappears from the fleet with every counter reading normal.
         assert(!endpoint.empty());
@@ -149,44 +153,18 @@ class AnnouncedEndpoint final: public Cc::IAdvertisedEndpointSource
 /// @return The wire record NODE-ANNOUNCE sends, version included.
 [[nodiscard]] CompileCacheWire::CapacityFields AnnouncedCapacity(Distributed::NodeCapacity const& capacity);
 
-/// A move of the endpoint this worker advertises: the new value, and what to say.
+/// The line a worker logs when the endpoint it is registered under moves, naming both
+/// addresses -- an operator reading only the new one cannot tell a change from a restart.
 ///
-/// Two strings, named, rather than a pair: both halves are text and a `.first` deciding
-/// what gets REGISTERED while `.second` only gets logged is a positional contract with
-/// no compiler behind it.
-struct EndpointChange
-{
-    /// What to advertise from now on. Never empty.
-    std::string endpoint;
-
-    /// The line to log, naming both addresses -- an operator reading only the new one
-    /// cannot tell a change from a restart.
-    std::string announcement;
-};
-
-/// Whether the endpoint this worker advertises has moved, and what to say about it.
-///
-/// A pure function over the two facts for `RecheckDepthFor`'s reason: the heartbeat
-/// loop is reached by no test, so a rule left as an expression there can only be
-/// checked by reading it -- and this one is wrong silently in both directions. Missed,
-/// the fleet keeps leasing an address nobody answers; fired spuriously, every worker in
-/// a fleet re-registers because somebody saved a file.
-///
-/// **Compares the DERIVED endpoint, never the `--advertise` field.**
-/// `AdvertisedEndpoint` folds the flag with the `Node` surface's resolved address, and
-/// what the scheduler keys on is the result -- so a save that clears a flag whose value
-/// equalled the fallback has changed nothing to announce, and the row-level comparison
-/// the reload machinery uses (`AddressReloadableFlags`) would call it a change. The
-/// classification list is what forces the decision at the table; this is what decides
-/// whether anything happens.
-///
-/// @param inForce The endpoint being advertised now.
-/// @param live The configuration in force this beat, or null when this worker has no
-///        configuration file and therefore no second moment at which anything could
-///        change.
-/// @return The new endpoint and the line to log, or nullopt when nothing moved.
-[[nodiscard]] std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
-                                                                     std::shared_ptr<NodeConfig const> const& live);
+/// A pure function for `RecheckDepthFor`'s reason: the heartbeat loop is reached by no unit
+/// test of its wording. WHETHER the endpoint moved is no longer decided here: the published
+/// endpoint is `EndpointResolver`'s, which derives it from the configuration in force (never
+/// the `--advertise` field alone), and the worker re-registers whenever what is published
+/// differs from what it registered under.
+/// @param from The endpoint the registrations were filed under.
+/// @param to The endpoint now published.
+/// @return The announcement.
+[[nodiscard]] std::string DescribeEndpointMove(std::string_view from, std::string_view to);
 
 // Out of `main.cpp` since #404, so a test can drive the round against a scripted socket and
 // read the bytes that went out.

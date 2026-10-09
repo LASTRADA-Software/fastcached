@@ -916,10 +916,11 @@ class FormationHarness
             harness { owner },
             host { std::move(ownHost) },
             advertised { std::format("{}:6674", host) },
+            raftAdvertised { std::format("{}:6680", host) },
             self { .nodeId = nodeId,
                    .publicKey = TestKeyPair(nodeId).PublicKey(),
                    .advertised = advertised,
-                   .raftEndpoint = std::format("{}:6680", host),
+                   .raftAdvertised = raftAdvertised,
                    // Its `--fleet-id` is the configuration's, stated per body (`PinnedAs`).
                    .pin = {} },
             random { seed },
@@ -952,14 +953,15 @@ class FormationHarness
         /// Where its `0xFC` port answers: what every summary, `Enroll` and announcement states.
         /// `SetAdvertised` moves it, as an accepted reload of `--advertise` does.
         Node::AnnouncedEndpoint advertised;
-        Node::SelfFacts self;                                     ///< Who it says it is.
-        bool onLan { true };                                      ///< Whether its beacons cross the segment.
-        bool routable { true };                                   ///< Whether a dialled exchange reaches it.
-        CountingSecureRandom random;                              ///< Its own draws.
-        std::unique_ptr<core::net::IDatagramSocket> socket;       ///< Its beacon socket.
-        InMemoryFormationStore store;                             ///< Its record: the one thing a restart keeps.
-        RecordingArchiver archiver;                               ///< Where a left cluster's store goes.
-        ScratchDirectory scratch { "formation-harness" };         ///< Where its fleet endpoints are remembered.
+        Node::AnnouncedEndpoint raftAdvertised;             ///< Where its Raft port answers: what every summary states.
+        Node::SelfFacts self;                               ///< Who it says it is.
+        bool onLan { true };                                ///< Whether its beacons cross the segment.
+        bool routable { true };                             ///< Whether a dialled exchange reaches it.
+        CountingSecureRandom random;                        ///< Its own draws.
+        std::unique_ptr<core::net::IDatagramSocket> socket; ///< Its beacon socket.
+        InMemoryFormationStore store;                       ///< Its record: the one thing a restart keeps.
+        RecordingArchiver archiver;                         ///< Where a left cluster's store goes.
+        ScratchDirectory scratch { "formation-harness" };   ///< Where its fleet endpoints are remembered.
         Cluster::FleetEndpointsFile endpoints { scratch.Path() }; ///< The remembered endpoints.
         ScriptedAnnouncedMemos announced;                         ///< What its members announced: nothing, in this harness.
         Ed25519KeyPair identity;                                  ///< What its responders and its `Enroll` sign with.
@@ -1100,7 +1102,7 @@ class FormationHarness
                                     .leaderNodeEndpoint = machine.advertised.Current() };
             run.state.members.push_back(
                 Cluster::ClusterMember { .id = machine.self.nodeId,
-                                         .raftEndpoint = machine.self.raftEndpoint,
+                                         .raftEndpoint = machine.raftAdvertised.Current(),
                                          .schedulerEndpoint = machine.advertised.Current(),
                                          .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
                                          .seat = Cluster::MemberSeat::Voter,

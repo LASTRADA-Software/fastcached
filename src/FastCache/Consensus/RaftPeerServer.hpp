@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <core/async/Task.hpp>
@@ -66,12 +67,21 @@ struct PeerServerOptions
 /// closing one is always closing a socket that is still there.
 struct OpenConnections
 {
-    /// Guards `sockets`. The accept loop and each ending connection touch it from
-    /// the reactor's thread while `Shutdown` touches it from whoever is tearing
-    /// the node down.
+    /// Guards `sockets` and `oneWay`. The accept loop and each ending connection touch
+    /// them from the reactor's thread while `Shutdown` touches `sockets` from whoever is
+    /// tearing the node down.
     std::mutex mutex;
 
     std::vector<core::net::ISocket*> sockets; ///< One per connection currently being served.
+
+    /// The newest ONE-WAY session each proven dialler holds, by the id it proved.
+    ///
+    /// A one-way session is never read to an EOF from a path that vanished and has no idle bound,
+    /// so a voter that moved and redialled would otherwise leave its old session holding one of
+    /// `maxConnections`' slots for as long as this process runs -- one more per move. The newest
+    /// proof of an id closes the session it supersedes, and an entry is erased only by the
+    /// session it names. Two-way sessions are not here: the transport's links supersede those.
+    std::unordered_map<NodeId, core::net::ISocket*> oneWay;
 };
 
 /// Accepts peer connections, has each one prove which member it is, and turns their
@@ -234,6 +244,14 @@ class RaftPeerServer
         return _delivered.load(std::memory_order_relaxed);
     }
 
+    /// How many accepted connections are being served right now: what `maxConnections` is
+    /// judged against.
+    /// @return The connections accepted and not yet ended.
+    [[nodiscard]] std::size_t ActiveConnections() const noexcept
+    {
+        return _active.load(std::memory_order_acquire);
+    }
+
   private:
     friend struct PeerServerAccess;
 
@@ -270,6 +288,18 @@ class RaftPeerServer
     /// @param peer The address the connection came from.
     /// @param dialler The member the connection proved.
     void NoteSessionEnd(SessionEnding const& ending, std::string_view peer, NodeId const& dialler);
+
+    /// Count and log that a member's newer one-way session superseded its older one, which is
+    /// closed.
+    ///
+    /// Counted on `RaftInboundSessionsSuperseded`, the transport's row for a two-way session
+    /// superseded the same way, because the one reading that row exists for is the same in both
+    /// directions: one per reconnect is a member whose address moved, and a steady rate is two
+    /// machines holding one identity key taking the session from each other. Logged at Info, the
+    /// two-way row's level: one counter, one level, so a cloned pair shows in default logs.
+    /// @param peer The address the NEWER connection came from.
+    /// @param dialler The member both sessions proved.
+    void NoteSuperseded(std::string_view peer, NodeId const& dialler);
 
     /// Say that a connection was closed unchallenged because no nonce could be drawn, at most
     /// once per `PreAuthReportInterval`.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeActivation.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeDefaults.hpp"
@@ -12,6 +13,7 @@
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <expected>
 #include <functional>
@@ -55,6 +57,17 @@ struct ReloadBasis
     NodeHostNames hostNames;                                ///< This machine's names, as the start asked them.
     KeptFormationReader formation; ///< The formation the running body adopted; a reload never mints one.
     NodeIdentity identity;         ///< The id and key the start resolved.
+    /// The address the RUNNING node routes from now (`RouteHostCell`), asked at every reload: a
+    /// candidate shaped without it derives an `auto` endpoint the running node does not advertise,
+    /// so the startup table would judge -- and refuse -- an address nobody uses. Empty or unset for
+    /// none, which leaves the candidate on the name chain the start would have used offline.
+    std::function<std::string()> routeHost {};
+    /// Where the socket a supervisor handed this process over is bound (`AdoptActivatedBind`), or
+    /// nothing when this node binds its own. Read off the socket once, at the start: the handoff
+    /// happens once per process. A candidate shaped without it reads `--listen-node`'s default
+    /// again -- an unreloadable field that has CHANGED, so every reload would be refused by name,
+    /// and an endpoint derived from it would be one the socket does not serve.
+    std::optional<BoundEndpoint> activatedBind {};
 };
 
 /// How the node's reloader reads its file: a FRESH configuration, the file applied through the

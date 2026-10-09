@@ -22,11 +22,11 @@
     new value, so a repair or upgrade that leaves them out re-registers what was
     installed rather than widening the firewall to any address.
 
-    There is no advertised-endpoint property. The node advertises this
-    machine's fully qualified name on its port, resolved at every start, so a
-    machine that is renamed or moves network re-advertises without a reinstall;
-    an IP literal remembered across upgrades vetoed the dial hint for good on a
-    roaming laptop. An endpoint that must be typed goes in the node's
+    There is no advertised-endpoint property. The node advertises the address
+    this machine routes from on its port, re-derived when the network changes,
+    so a machine that is renamed or moves network re-advertises without a
+    reinstall or a restart; an IP literal remembered across upgrades pinned it
+    and vetoed the dial hint for good on a roaming laptop. An endpoint that must be typed goes in the node's
     configuration file. Earlier packages of this table remembered one, and
     every transaction now forgets it (FastCacheForgetNodeAdvertise).
 
@@ -198,8 +198,8 @@
     <!-- What the node registration is told. There is no scheduler to name: a
          node that serves registers where its formation record says, and is
          refused a typed one, so the node registers with no property at all.
-         Nor an advertised endpoint (see the header): the node advertises this
-         machine's fully qualified name, resolved at every start. The optional
+         Nor an advertised endpoint (see the header): the node advertises the
+         address this machine routes from, re-derived when the network changes. The optional
          properties below are Secure="yes" so a value survives the elevation to
          the deferred actions' own session. -->
 

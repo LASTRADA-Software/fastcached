@@ -889,6 +889,17 @@ readable and silently ignored. Every rule below has already been one of them.
     The witness cannot die behind a green line: a node start whose 7036 is missing while other
     services' 7036s were read is REFUSED (the reader or its matcher failed), and so is a `NOT SEEN`
     once an earlier transaction of the same process read `live`.
+  - **The node's OWN 7036s never count as "other services'"** (PR 1645): its own `stopped` with no
+    `running` proves the reader reads the node's, so it is `node stopped`, the node's outcome, never
+    a dead witness. Whether the restart was AWAITED decides it: a transaction that COMMITTED
+    (`$script:MsiCommittedExitCodes`) passed `FastCacheNodeStartService`, which waits for RUNNING, so
+    a missed `running` is the witness failing on the STATE and is refused at the exit; one that ROLLED
+    BACK restarts the node with Windows Installer's own unawaited StartServices, so the exit DEFERS it
+    (`7036 DEFERRED`, the transaction's `Deferred`), and the settled judgement refuses a node that
+    never came back -- `Assert-ServiceTable`'s own wait names the deferred outcome. Every refusal
+    SHOWS its evidence first (`Show-TransactionEvidence`): the verbose log, each service's state,
+    process and exit codes, and the SCM events of `$script:ServiceControlEventMeanings` since the
+    transaction began, from the read the verdict was taken from.
   - **An OLD package's removal keeps its own Restart Manager, and Windows Installer restarts what it
     shut down AFTER the whole transaction**, so fastcached beside the node is `disabled`, never
     `manual`. MEASURED in PR 1634's CI, the upgrade from 0.3.0 (whose package sets no such property):
@@ -961,8 +972,11 @@ readable and silently ignored. Every rule below has already been one of them.
     every local port (`LocalPorts = "*"`, set explicitly, which is also what a new UDP rule reads
     back), named `... discovery-reply udp/any`, scoped to the program AND the service and to
     `--firewall-allow` like every other rule. What it exposes is only the UDP sockets this
-    program opens, which is discovery alone -- and `ctest -R udp-opener` is what keeps that true:
-    it refuses a second first-party UDP opener outside `DiscoveryTier.cpp`. A pinned port gets exactly that port and no
+    program opens: discovery's, which are the only ones that RECEIVE, and the route probe's
+    (`Platform/RouteProbe.cpp`), which only `connect()`s to read the kernel's source-address
+    choice, sends and receives nothing and is closed at once -- and `ctest -R udp-opener` is what
+    keeps that true: it refuses a first-party UDP opener outside its permitted rows, and a new
+    row is a decision about this rule. A pinned port gets exactly that port and no
     any-port rule. The uninstall removes it with the GROUP, never by re-deriving the rules.
     **The MSI pins it and the node does not**: `FASTCACHE_DISCOVERY_REPLY_PORT` (default `6682`,
     empty for the kernel's) reaches `--discovery-reply-port`, and the rule DERIVES from the

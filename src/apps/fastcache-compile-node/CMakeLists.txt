@@ -50,6 +50,7 @@ add_executable(fastcache-compile-node
     CordonCli.cpp
     DiscoveryTier.cpp
     EndpointDialer.cpp
+    EndpointResolver.cpp
     FleetProbe.cpp
     FleetSummaryResponder.cpp
     ForeignFleetWatch.cpp
@@ -72,6 +73,7 @@ add_executable(fastcache-compile-node
     ScratchClaim.cpp
     LocalCache.cpp
     HostEventInbox.cpp
+    NodeActivation.cpp
     NodeAnnounce.cpp
     NodePresenceTier.cpp
     NodeRoster.cpp
@@ -147,6 +149,8 @@ if(FASTCACHED_BUILD_TESTS)
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
         EndpointDialer.cpp
+        EndpointResolver.cpp
+        EndpointResolver_test.cpp
         FleetProbe.cpp
         FleetProbe_test.cpp
         FleetSummaryResponder.cpp
@@ -200,6 +204,8 @@ if(FASTCACHED_BUILD_TESTS)
         RemoteUpstream_test.cpp
         OperatorCredentials.cpp
         OperatorCredentials_test.cpp
+        NodeActivation.cpp
+        NodeActivation_test.cpp
         NodeAnnounce.cpp
         NodePresenceTier.cpp
         NodeRoster.cpp
@@ -225,6 +231,7 @@ if(FASTCACHED_BUILD_TESTS)
         FleetLeaseRouting_test.cpp
         FleetExclusion_test.cpp
         FleetDialHint_test.cpp
+        FleetVoterMove_test.cpp
         NodeConfig_test.cpp
         NodeDefaults.cpp
         NodeDefaults_test.cpp

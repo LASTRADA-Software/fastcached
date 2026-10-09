@@ -639,6 +639,11 @@ TEST_CASE("The 0xFC row's note says what socket activation does to it", "[node][
     // And the STATE, which is what the vocabulary cannot carry.
     CHECK(note.contains("is served on this surface"));
     CHECK_FALSE(note.contains("NOT yet served"));
+
+    // Including what the advertised endpoint is under activation: read off the socket, since
+    // `Node::AdoptActivatedBind` -- `--advertise` is no longer required there.
+    CHECK(note.contains("reads the address and port off the socket"));
+    CHECK_FALSE(note.contains("required under activation"));
 }
 
 TEST_CASE("Every surface states what a bind failure does, and why", "[node][surfaces][bind]")
@@ -930,6 +935,10 @@ TEST_CASE("A consensus node that names itself neither way prints NOT STATED and 
     REQUIRE(pending.has_value());
     CHECK(Unwrap(pending).contains("AT STARTUP"));
     CHECK_FALSE(Unwrap(pending).contains("NOT STATED"));
+    // Under `auto` the start derives the ROUTED address, the name only standing in until a route is
+    // known -- so the worksheet names both, the route first, rather than promising the name.
+    CHECK(Unwrap(pending).contains("the address this machine routes from"));
+    CHECK(Unwrap(pending).contains("its fully qualified name until a route is known"));
 }
 
 TEST_CASE("the metrics surfaces a node serves follow the components it was told to run", "[node][surfaces][metrics]")

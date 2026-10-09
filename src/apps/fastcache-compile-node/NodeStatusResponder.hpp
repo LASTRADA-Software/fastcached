@@ -25,6 +25,7 @@
 #include <string_view>
 #include <vector>
 
+#include <WorkerProtocol.hpp>
 #include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
@@ -531,6 +532,16 @@ struct NodeRuntimeSources
     /// Every node has one, so on a running node this is never null: a node with no shared cache
     /// says `none` through it rather than nothing (`SharedCacheStatusOf`).
     ISharedCacheStatusSource const* sharedCache { nullptr };
+
+    /// Where this node's consensus port is dialled NOW -- the Raft endpoint `EndpointResolver`
+    /// publishes, which follows the address this machine routes from and a reloaded `--raft-self`.
+    /// Null reports what the configuration this status was built over derives (`ConsensusDialAddressOf`).
+    ///
+    /// Read live because an operator types this value into `--cluster-admit`: a status frozen at the
+    /// start of the body would re-record a roamed member at an address that is gone. Consulted only
+    /// where that configuration names one at all, so a node running no consensus, or one that dials
+    /// in, still reports the field ABSENT.
+    Cc::IAdvertisedEndpointSource const* raftEndpoint { nullptr };
 };
 
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.

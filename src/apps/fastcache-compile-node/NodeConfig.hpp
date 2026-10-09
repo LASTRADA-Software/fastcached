@@ -178,7 +178,7 @@ struct NodeConfig
     /// of them is followed to the endpoint it names without consulting this list. Empty
     /// means this machine's own node (`AdminTargetsOf`).
     std::vector<std::string> schedulers;
-    std::string advertise; ///< host:port clients should reach this worker on.
+    std::string advertise; ///< host:port clients should reach this worker on; empty, `auto` or `auto:<port>` derive it.
 
     /// fingerprint=compilerPath, repeatable. An OVERRIDE: naming any pins this
     /// worker to exactly that set, and naming none means "serve what this machine
@@ -475,6 +475,9 @@ struct NodeConfig
     /// A HOST and never an endpoint: the port is not the operator's to repeat, and a
     /// value carrying one would produce `host:port:port`. No grammar row for the same
     /// reason `--bind` has none -- a host is only checkable by binding it.
+    ///
+    /// Empty and `auto` both derive it (`AdvertiseModeOf`): the probed route host, else the
+    /// fully qualified name, for a wildcard bind.
     std::string raftSelf;
 
     /// This node's state directory as the operator named it, empty for the platform's default.
@@ -506,6 +509,14 @@ struct NodeConfig
     /// *supplied at startup* rather than as a name that is missing. What `--advertise` and
     /// `--raft-self` fall back to.
     std::optional<NodeHostNames> hostNames;
+
+    /// The local address this machine routes from, as the route probe last answered it.
+    ///
+    /// **Not a flag.** A runtime fact like `hostNames`, written only by `ApplyRouteHost`, and
+    /// what an `auto` `--advertise` / `--raft-self` (the default) prefers over the fully
+    /// qualified name for a wildcard bind. Disengaged means *not probed, or no route*: the
+    /// derivations then fall back to the name exactly as they did before the probe existed.
+    std::optional<std::string> routeHost;
 
     /// What the formation record says, as this configuration reads it, or disengaged when no
     /// record shaped it.
@@ -1131,7 +1142,7 @@ inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--
 ///
 /// **A list a `static_assert` reads rather than one any function walks, and that is the
 /// whole of its job today.** The DECISION to re-announce is made by comparing the
-/// DERIVED endpoint (`AdvertisedEndpointChange`), not by comparing this row: a save that
+/// DERIVED endpoint (`EndpointResolver` publishes it), not by comparing this row: a save that
 /// clears `--advertise` where its value equalled the `Node` surface's resolved address
 /// moves this row and changes nothing the scheduler keys on, and re-registering a fleet
 /// for that is the spurious direction. So the list forces the classification at the
@@ -1141,7 +1152,10 @@ inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--
 /// Stated because the alternative reads as an omission: an entry here is not a promise
 /// that something walks it, and the guard below is what keeps it honest by requiring the
 /// row it names to be real, comparable and `Reloadable::Yes`.
-inline constexpr std::array<std::string_view, 1> AddressReloadableFlags { "--advertise" };
+///
+/// `--raft-self` is the same kind: it moves the address peers dial for consensus and
+/// changes nothing about what is served.
+inline constexpr std::array<std::string_view, 2> AddressReloadableFlags { "--advertise", "--raft-self" };
 
 /// The reloadable flags that are local wiring and reach no other machine.
 ///
@@ -1364,11 +1378,41 @@ inline constexpr std::string_view NodeSurfaceDefaultHost = "0.0.0.0";
 /// Judged on the endpoint the node WOULD advertise rather than on whether the flag was
 /// typed, so an operator who spells the default out is answered identically.
 ///
-/// `--advertise` when given; otherwise the node surface, with a WILDCARD host replaced by
-/// this machine's fully qualified name once the start has resolved it (`hostNames`).
+/// `--advertise` when it pins a value (`AdvertiseModeOf`); otherwise (`auto`, `auto:<port>` or
+/// unset) the node surface -- its port unless `auto:<port>` overrides it -- with a WILDCARD host
+/// replaced by the probed route host (`routeHost`) when there is one, and else by this
+/// machine's fully qualified name once the start has resolved it (`hostNames`).
 /// @param cfg What the operator asked for.
 /// @return The advertised `host:port`.
 [[nodiscard]] std::string AdvertisedEndpoint(NodeConfig const& cfg);
+
+/// How an advertised address is chosen.
+enum class AdvertiseMode : std::uint8_t
+{
+    Auto,          ///< Derived: the bind when it names an address, else the probed route, else the name.
+    PinnedName,    ///< A DNS name the operator typed; kept verbatim.
+    PinnedLiteral, ///< An IP literal the operator typed; kept verbatim, roaming off.
+    Last,          ///< Sentinel: the number of modes.
+};
+
+/// One row per mode: what the mode promises.
+struct AdvertiseModeRow
+{
+    AdvertiseMode mode;        ///< The mode this row describes.
+    bool followsRoute;         ///< Re-derived from the route probe on every change.
+    std::string_view describe; ///< One sentence for logs and docs.
+};
+
+/// The row describing @p mode.
+/// @param mode A mode other than `AdvertiseMode::Last`.
+/// @return Its row.
+[[nodiscard]] AdvertiseModeRow const& AdvertiseModeRowFor(AdvertiseMode mode) noexcept;
+
+/// The mode a `--advertise` / `--raft-self` value selects: "" or "auto" or "auto:<port>" ->
+/// Auto, an IP literal host -> PinnedLiteral, anything else -> PinnedName.
+/// @param value The flag's value, `host`, `host:port` or `[v6]:port`.
+/// @return The mode it selects.
+[[nodiscard]] AdvertiseMode AdvertiseModeOf(std::string_view value) noexcept;
 
 /// Whether the advertised endpoint is still waiting for this machine's name.
 ///

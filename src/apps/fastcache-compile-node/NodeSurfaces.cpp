@@ -154,8 +154,8 @@ namespace
             .resolve = ResolveFromSpec,
             .closedBecause = nullptr,
             .note = "a systemd .socket unit is served on this surface: the unit owns the address, so this "
-                    "flag configures nothing there and --advertise is what names where clients go -- it is "
-                    "required under activation and refused at startup when absent. one 0xFC port for the cache "
+                    "flag configures nothing there -- the node reads the address and port off the socket it is "
+                    "handed and advertises those, unless --advertise pins a value. one 0xFC port for the cache "
                     "verbs, this node's own compile verbs, and -- where "
                     "its mode serves them -- the scheduler verbs. A bare "
                     "port binds the wildcard on every node, because every node is a fleet participant -- and "
@@ -534,8 +534,8 @@ namespace
           .trailer = "-- this node runs consensus and names no address peers dial it at; give --raft-self" },
         { .gap = ConsensusDialGap::AwaitingHostName,
           .address = "AT STARTUP",
-          .trailer = "-- this machine's fully qualified name on the raft port, resolved when the node starts; give "
-                     "--raft-self to state it now" },
+          .trailer = "-- the address this machine routes from on the raft port, or its fully qualified name until a "
+                     "route is known; derived when the node starts; give --raft-self to state it now" },
         { .gap = ConsensusDialGap::DialsIn,
           .address = "-",
           .trailer = "(absent: this node dials its fleet's voters, and nobody dials it)" },

@@ -269,6 +269,22 @@ std::string DescribeConsensusEndpoint(std::string_view raftEndpoint)
     return raftEndpoint.empty() ? std::string { "with no consensus endpoint" } : std::format("at {}", raftEndpoint);
 }
 
+std::string OwnRaftEndpoint(Cluster::MemberSeat seat, std::string_view raftAdvertised)
+{
+    return Cluster::SeatNeedsEndpoint(seat) ? PeerDialableOrNone(raftAdvertised) : std::string {};
+}
+
+Cluster::DesiredMember SelfDesire(Cluster::DesiredMember held,
+                                  Cluster::MemberSeat seat,
+                                  std::string_view advertised,
+                                  std::string_view raftAdvertised)
+{
+    held.schedulerEndpoint = PeerDialableOrNone(advertised);
+    if (auto raft = OwnRaftEndpoint(seat, raftAdvertised); !raft.empty())
+        held.raftEndpoint = std::move(raft);
+    return held;
+}
+
 std::vector<Consensus::NodeId> DialInPeers(Cluster::ClusterState const& state, Consensus::Configuration const& configuration)
 {
     auto peers = std::vector<Consensus::NodeId> {};
@@ -306,6 +322,7 @@ Distributed::LeaderReading LeaderReadingOf(Consensus::RaftDriver::Progress const
 
 ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              Cc::IAdvertisedEndpointSource const& advertised,
+                             Cc::IAdvertisedEndpointSource const& raftAdvertised,
                              Consensus::FileRaftStorage storage,
                              Ed25519KeyPair identityKey,
                              std::span<Cluster::MemberSpec const> knownMembers,
@@ -333,6 +350,7 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     _boundEndpoint { std::move(boundEndpoint) },
     _self { std::move(self) },
     _advertised { advertised },
+    _raftAdvertised { raftAdvertised },
     _onMembers { std::move(onMembers) },
     _onLeaderContact { std::move(onLeaderContact) },
     _conditions { conditions },
@@ -363,6 +381,7 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
 std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     NodeConfig const& cfg,
     Cc::IAdvertisedEndpointSource const& advertised,
+    Cc::IAdvertisedEndpointSource const& raftAdvertised,
     std::optional<Ed25519KeyPair> const& identityKey,
     RoleObserver onRole,
     MembersObserver onMembers,
@@ -495,6 +514,7 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier {
         std::move(announced),
         advertised,
+        raftAdvertised,
         *std::move(storage),
         *identityKey,
         members,
@@ -1016,11 +1036,27 @@ void ConsensusTier::Reconcile()
         announced = _announced;
     }
 
-    // This node's own `0xFC` endpoint, read NOW: an accepted reload of `--advertise` reaches the
-    // record at the next pass this node leads. Its own word, so it is an assertion even empty --
-    // and empty when only this machine could dial it, by the rule every route into the record asks.
+    // This node's own endpoints, read NOW: an accepted reload of `--advertise`, or a roam the
+    // resolver re-derived, reaches the record at the next pass this node leads (`SelfDesire`). Its
+    // own `0xFC` word is an assertion even empty -- and empty when only this machine could dial it,
+    // by the rule every route into the record asks; its Raft one only while its seat is dialled.
+    auto const advertisedRaft = _raftAdvertised.Current();
     if (auto const self = std::ranges::find(desired, _self.id, &Cluster::DesiredMember::id); self != desired.end())
-        self->schedulerEndpoint = PeerDialableOrNone(_advertised.Current());
+        *self = SelfDesire(std::move(*self), _self.seat, _advertised.Current(), advertisedRaft);
+
+    // Every node, leader or not: THIS node moved, so every session it dialled or holds runs over a
+    // path the network may no longer route. Closed, so each sender redials at its next message rather
+    // than writing into a dead path until a timeout notices. A moved leader needs no step of its own:
+    // its followers' replies ride sessions to the old address, so CheckQuorum deposes it.
+    if (auto ownRaft = OwnRaftEndpoint(_self.seat, advertisedRaft); !ownRaft.empty() && ownRaft != _lastOwnRaft)
+    {
+        if (!_lastOwnRaft.empty())
+        {
+            _logger.Logf(LogLevel::Info, "raft: this node moved to {}; reconnecting to every peer", ownRaft);
+            _transport->ResetSessions();
+        }
+        _lastOwnRaft = std::move(ownRaft);
+    }
 
     LearnMembers(state, desired);
 
@@ -1056,8 +1092,12 @@ void ConsensusTier::Reconcile()
     auto inFlight = Cluster::MembersInFlight {};
     for (auto const& [id, proposal]: _endpointsInFlight)
         inFlight.insert(id);
+    // Discovery's word about a COUPLED member's Raft host first yields to the record: under the
+    // host-coupling rule its proven announcement owns that host, and a beacon still authenticated from
+    // before a move would otherwise re-propose the old address over the committed one.
     auto const announcements = Cluster::AnnouncedEndpointDesires(state, announced, inFlight);
-    desired = Cluster::WithAnnouncedEndpoints(std::move(desired), announcements);
+    desired =
+        Cluster::WithAnnouncedEndpoints(Cluster::WithCoupledRaftEndpointsKept(state, std::move(desired)), announcements);
 
     // Outside the lock, both the decision and the proposals: a proposal is a
     // durability write and a broadcast, and holding a lock across one would stall
@@ -1581,6 +1621,7 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
     Cc::IAdvertisedEndpointSource const& advertised,
+    Cc::IAdvertisedEndpointSource const& raftAdvertised,
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     NodeRoster& roster,
@@ -1604,6 +1645,7 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
     auto tier = ConsensusTier::Start(
         cfg,
         advertised,
+        raftAdvertised,
         identityKey,
         [&schedulerTier,
          &schedulingLeader](Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term) {

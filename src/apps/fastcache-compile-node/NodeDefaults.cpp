@@ -250,6 +250,14 @@ void ApplyHostNames(NodeConfig& cfg, NodeHostNames names)
     cfg.hostNames = std::move(names);
 }
 
+void ApplyRouteHost(NodeConfig& cfg, std::string host)
+{
+    if (host.empty())
+        cfg.routeHost.reset();
+    else
+        cfg.routeHost = std::move(host);
+}
+
 void ApplyHostNaming(NodeConfig& cfg, IHostNaming const& naming)
 {
     ApplyHostNames(
@@ -348,9 +356,9 @@ std::optional<std::string> UnqualifiedHostNameInUse(NodeConfig const& cfg)
     // Asked of the two endpoints a peer is told to dial, through the derivations that tell
     // them, rather than re-deciding here when each falls back to the name.
     std::vector<std::string_view> through;
-    if (cfg.advertise.empty() && HostOfEndpoint(AdvertisedEndpoint(cfg)) == name)
+    if (AdvertiseModeOf(cfg.advertise) == AdvertiseMode::Auto && HostOfEndpoint(AdvertisedEndpoint(cfg)) == name)
         through.emplace_back("--advertise");
-    if (cfg.raftSelf.empty())
+    if (AdvertiseModeOf(cfg.raftSelf) == AdvertiseMode::Auto)
         if (auto const dial = ConsensusDialAddressOf(cfg); dial.has_value() && HostOfEndpoint(*dial) == name)
             through.emplace_back("--raft-self");
     if (through.empty())

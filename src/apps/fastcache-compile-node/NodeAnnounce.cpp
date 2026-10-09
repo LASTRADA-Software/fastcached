@@ -91,38 +91,14 @@ Wire::CapacityFields AnnouncedCapacity(Distributed::NodeCapacity const& capacity
     return fields;
 }
 
-std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
-                                                       std::shared_ptr<NodeConfig const> const& live)
+std::string DescribeEndpointMove(std::string_view from, std::string_view to)
 {
-    // No configuration file means no second moment at which anything could change,
-    // which is `ConfiguredCredential`'s null-reloader arm too. Asked here
-    // rather than at the call site so the rule is in the tested function rather than in
-    // the heartbeat loop no test reaches.
-    if (live == nullptr)
-        return std::nullopt;
-
-    auto candidate = AdvertisedEndpoint(*live);
-
-    // An empty candidate is not a change, it is an answer nothing can be registered
-    // under -- so the previous value stays in force and the worker goes on being
-    // reachable. It arises only where a name that reaches only this machine is withheld
-    // (`AdvertisedNameWithheld`), and the startup table refuses that for a worker -- at a
-    // reload too, which is judged by the same table -- so a worker never reaches it; kept
-    // because the alternative is a withdrawal followed by a registration under no address
-    // at all, which is a node that disappears from the fleet with every counter reading
-    // normal.
-    if (candidate.empty() || candidate == inForce)
-        return std::nullopt;
-
-    // Formatted before the move, because a designated initializer's arguments are
-    // evaluated in whatever order the compiler likes and `endpoint` is declared first.
-    auto said = std::format("now advertising {} instead of {}: clients will be told the new address, and this worker's "
-                            "registration under the old one is being retired rather than left to expire. A lease "
-                            "already granted for {} is refused, which costs that client a local compile",
-                            candidate,
-                            inForce,
-                            inForce);
-    return EndpointChange { .endpoint = std::move(candidate), .announcement = std::move(said) };
+    return std::format("now advertising {} instead of {}: clients will be told the new address, and this worker's "
+                       "registration under the old one is being retired rather than left to expire. A lease "
+                       "already granted for {} is refused, which costs that client a local compile",
+                       to,
+                       from,
+                       from);
 }
 
 Wire::LoadFields SampleMachineLoad(IHostLoadSampler& loadSampler,

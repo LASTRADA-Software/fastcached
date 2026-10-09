@@ -241,8 +241,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Duplicate suppression is asked **before** capacity; an all-EXCLUDED lease is `NoWorker`, counted apart.
 - A lease has three transitions and expiry is the third: the **client** resolves it, on every
   path out of the compile, over a fresh connection.
-- A listen flag answers "does this port face the network" only when this process bound the port;
-  under socket activation it describes nothing, so both guards stay.
+- Under socket activation a START adopts the socket's bind; an install never sees one, so both guards stay.
 - Whether a worker **checks** a lease is a startup decision, never a per-request fallback — the
   question is whether a machine that is not this one can reach the compile surface. A validator
   returns a REASON rather than a `bool`, and never answers `UnknownLease`.
@@ -284,9 +283,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - An OUTBOUND credential is read where it is PRESENTED, through one seam
   (`Node::ICredentialSource`), never captured at construction — which is what lets `--requirepass`
   be `Reloadable::Yes`; a site that never reaches for the seam is a SCAN.
-- So is the advertised ENDPOINT (`Cc::IAdvertisedEndpointSource`), which lets `--advertise` be
-  `Reloadable::Yes`; the registration and the lease check read ONE value changed at ONE moment,
-  never a snapshot each, and a move WITHDRAWS the old entry.
+- So is the advertised ENDPOINT (`Cc::IAdvertisedEndpointSource`), ONE `EndpointResolver` re-deriving it
+  over the LIVE route host (`auto`); the registration and the lease check read ONE value changed at ONE
+  moment, never a snapshot each, and a move WITHDRAWS the old entry.
 - The worker's key files — every row of `NodeSecretFileTable()`, the identity key among them — are
   asked about at the START **and at every accepted reload**, from `main` and never from
   `WorkerBody`, of the FILESYSTEM rather than of the reloader's two snapshots.
@@ -324,9 +323,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A WORKER follows `NotLeader` too, or the client half arrives at an empty fleet: `Gate()` refuses
   `Register` as well, a leader is remembered only once a round was ACCEPTED there, and `NotLeader`
   must not clear the worker id where `UnknownLease` must.
-- `--scheduler` aims the ONE-SHOT verbs alone: a serving node is refused it by name and registers
-  where its formation record says (`SchedulersOf`; its OWN scheduler at the endpoint it SERVES,
-  `ActivatedNodeEndpoint`). A LIST, never a leader choice: each value dialled at most once a round,
+- `--scheduler` aims the ONE-SHOT verbs alone: a serving node is refused it by name and registers at
+  its OWN scheduler where it SERVES, THEN its applied state's other voters (`AppliedSchedulers`), or a
+  MOVED voter is heard by nobody. A LIST, never a leader choice: each value dialled at most once a round,
   `NotLeader` never consults it, a verb falls back only where nothing was SENT. Assert WHICH endpoint.
 - `NotLeader` is an instruction, not an answer: a client follows it (`RedirectTarget`), judged by
   PARSING (`ParseDialEndpoint`) and bounded, the RELEASE to whoever ISSUED. A LEARNER sends a member
@@ -453,6 +452,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Every session frame carries an HMAC under the HKDF session key (`Core/SessionSeal.hpp`) over an
   implicit sequence number, and a message naming another sender closes the connection: the ids
   are bound and the ENDPOINT deliberately is not.
+- A one-way Raft session is superseded by the same member's newest PROVEN session, never idle-bounded.
 - **An applied forget closes the sessions its revoked key proved, at their next frame OR the next
   reconcile pass once the configuration no longer counts the member** (#1555) — `StillProves`, per frame
   AND, for attached inbound sessions, per pass (`RecheckProofs`' unsealed WAKE), still PULLED. The roster
@@ -484,8 +484,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   **A FORGET is not absence**: it leaves the quorum whoever typed the member (#1555), THIS node
   once FORGOTTEN — record gone AND key revoked, never the record alone — proposes its own removal
   last and steps down (#1539), and forgetting the only voter is refused by name (`PrepareForget`).
-- A member record's `schedulerEndpoint` is its `0xFC` endpoint, learners included: set at join from
-  `Enroll`, moved only by a PROVEN NODE-ANNOUNCE (same seat and key), one change in flight per member.
+- A record's `schedulerEndpoint` is its `0xFC` endpoint (learners too): set by `Enroll`, moved only by a
+  PROVEN NODE-ANNOUNCE (seat, key kept; one in flight), which moves a COUPLED voter's Raft host; no beacon does.
 - **A forget outranks an observation (#1528)**: `MembershipProposals` refuses a forgotten desire
   BY NAME (`MembershipPlan::forgotten`), at the decision rather than by pruning it.
 - **`--cluster-forget=<id>` is ONE act (#1555)** — the record goes and its key is revoked in the

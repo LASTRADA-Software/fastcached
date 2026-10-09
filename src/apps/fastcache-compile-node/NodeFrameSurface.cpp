@@ -78,9 +78,9 @@ std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
     // the row's answer -- the wildcard, on every node -- so the address bound here, the
     // one an install-time refusal judges and the one `--print-surfaces` prints are one
     // computation rather than three that agree today. Under activation there is no such
-    // computation to do: the unit bound the port, and `--advertise` -- mandatory there,
-    // and refused at startup when absent -- is the only thing that can say where
-    // clients should go.
+    // computation to do: the unit bound the port, and the start read where off the socket
+    // and adopted it as this row's bind (`Node::AdoptActivatedBind`), which is what the
+    // advertised endpoint is derived from.
     auto started = inherited.has_value()
                        ? FrameEndpoint::StartAdopted(io,
                                                      NodeSurface::Node,

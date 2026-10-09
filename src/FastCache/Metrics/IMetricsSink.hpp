@@ -1358,8 +1358,9 @@ class IMetricsSink
         /// A Raft message dropped for a peer this node can place nowhere: it neither dials it nor
         /// was told it dials in.
         RaftSendsDroppedUnknownPeer,
-        /// A two-way Raft session closed because the same id proved a newer one: a learner that
-        /// reconnected, or -- at a steady rate -- two machines sharing one identity key.
+        /// A Raft session closed because the same id proved a newer one -- a two-way session by
+        /// the transport, a one-way session by the acceptor: a member that reconnected, or -- at a
+        /// steady rate -- two machines sharing one identity key.
         RaftInboundSessionsSuperseded,
 
         /// A grant refused because the state this worker applied records no voter's key yet. (#178)
@@ -1553,6 +1554,15 @@ class IMetricsSink
         /// so its key roster could lack a key its cluster holds. A few at every start are the boot
         /// order; a count that keeps rising is a node that cannot elect, or cannot hear its leader.
         NodeProofsRefusedRosterNotYetApplied,
+
+        /// Times this node's advertised `0xFC` endpoint moved: the address it routes from changed
+        /// (a DHCP renewal, Wi-Fi to wired, another network) or a reload re-pinned `--advertise`.
+        /// Written by `EndpointResolver` alone, the endpoint's sole publisher.
+        NodeEndpointChanges,
+        /// Times this node's advertised Raft endpoint moved, for the same two reasons; the Raft
+        /// half of `NodeEndpointChanges`, counted apart because only a voter's move re-addresses it
+        /// in the cluster's record.
+        NodeRaftEndpointChanges,
 
         Last,
     };

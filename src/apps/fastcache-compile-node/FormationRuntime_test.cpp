@@ -148,8 +148,9 @@ struct RuntimeRig
     ReformRequest reform;
     AtomicMetricsSink metrics;
     CapturingLogger logger;
-    AnnouncedEndpoint advertised { "127.0.0.1:6674" }; ///< Where its `0xFC` port answers.
-    std::optional<Ed25519KeyPair> identity;            ///< Its identity key: `TestKeyPair(nodeId)`.
+    AnnouncedEndpoint advertised { "127.0.0.1:6674" };     ///< Where its `0xFC` port answers.
+    AnnouncedEndpoint raftAdvertised { "127.0.0.1:6680" }; ///< Where its Raft port answers.
+    std::optional<Ed25519KeyPair> identity;                ///< Its identity key: `TestKeyPair(nodeId)`.
     NodeConfig cfg;
     FormationBody body;
 };
@@ -268,13 +269,13 @@ TEST_CASE("A body whose configuration runs no consensus builds no formation, and
     RuntimeRig rig { "n-office", Testing::Minted("c-office", 200) };
     auto const closed = NodeConfig {};
     REQUIRE_FALSE(RunsConsensus(closed));
-    auto const none =
-        MakeFormationRuntime(closed, rig.identity, rig.body, rig.advertised, nullptr, rig.metrics, rig.logger, nullptr);
+    auto const none = MakeFormationRuntime(
+        closed, rig.identity, rig.body, rig.advertised, rig.raftAdvertised, nullptr, rig.metrics, rig.logger, nullptr);
     REQUIRE(none.has_value());
     CHECK(*none == nullptr);
     REQUIRE(RunsConsensus(rig.cfg));
-    auto const built =
-        MakeFormationRuntime(rig.cfg, rig.identity, rig.body, rig.advertised, nullptr, rig.metrics, rig.logger, nullptr);
+    auto const built = MakeFormationRuntime(
+        rig.cfg, rig.identity, rig.body, rig.advertised, rig.raftAdvertised, nullptr, rig.metrics, rig.logger, nullptr);
     REQUIRE(built.has_value());
     CHECK(*built != nullptr);
 
@@ -297,8 +298,8 @@ TEST_CASE("A formation's beat proposes off the controller's lock, and once it st
     // controller's lock -- the tier's hooks call back INTO the controller -- and once the beat is
     // ended, which a body does before its consensus tier is destroyed, no proposal reaches that tier.
     RuntimeRig rig { "n-office", Testing::Minted("c-office", 200) };
-    auto made =
-        MakeFormationRuntime(rig.cfg, rig.identity, rig.body, rig.advertised, nullptr, rig.metrics, rig.logger, nullptr);
+    auto made = MakeFormationRuntime(
+        rig.cfg, rig.identity, rig.body, rig.advertised, rig.raftAdvertised, nullptr, rig.metrics, rig.logger, nullptr);
     REQUIRE(made.has_value());
     auto runtime = *std::move(made);
     REQUIRE(runtime != nullptr);
@@ -377,8 +378,8 @@ TEST_CASE("A loopback-named founder that gets a joiner is refused the move by it
 
     RuntimeRig rig { "n-solo", solitary };
     NodeConditions conditions;
-    auto made =
-        MakeFormationRuntime(cfg, rig.identity, rig.body, rig.advertised, nullptr, rig.metrics, rig.logger, &conditions);
+    auto made = MakeFormationRuntime(
+        cfg, rig.identity, rig.body, rig.advertised, rig.raftAdvertised, nullptr, rig.metrics, rig.logger, &conditions);
     REQUIRE(made.has_value());
     auto const& runtime = *made;
     REQUIRE(runtime != nullptr);
@@ -416,8 +417,8 @@ TEST_CASE("A formation's beat waits its interval on the injected clock, never th
     // The one interval the runtime keeps that is not a reading of `FormationRuntimeParts::clock`
     // would be the beat's own: waited on the wall, a case could only ever see its FIRST beat.
     RuntimeRig rig { "n-office", Testing::Minted("c-office", 200) };
-    auto made =
-        MakeFormationRuntime(rig.cfg, rig.identity, rig.body, rig.advertised, nullptr, rig.metrics, rig.logger, nullptr);
+    auto made = MakeFormationRuntime(
+        rig.cfg, rig.identity, rig.body, rig.advertised, rig.raftAdvertised, nullptr, rig.metrics, rig.logger, nullptr);
     REQUIRE(made.has_value());
     auto runtime = *std::move(made);
     REQUIRE(runtime != nullptr);
@@ -452,8 +453,8 @@ TEST_CASE("A formation is refused, by name, on a node that runs consensus and ho
     keyless.identityPublicKey.reset();
     REQUIRE(RunsConsensus(keyless));
     auto const noPair = std::optional<Ed25519KeyPair> {};
-    auto const refused =
-        MakeFormationRuntime(keyless, noPair, rig.body, rig.advertised, nullptr, rig.metrics, rig.logger, nullptr);
+    auto const refused = MakeFormationRuntime(
+        keyless, noPair, rig.body, rig.advertised, rig.raftAdvertised, nullptr, rig.metrics, rig.logger, nullptr);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error() == FormationNeedsIdentityKey);
 }

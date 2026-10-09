@@ -373,7 +373,7 @@ and the dashboard are off unless configured.
 |---|---|---|---|---|
 | `fastcache-cc` | a cache — `fastcached` or a node's `--listen-node` | `FASTCACHE_ADDR`, default `127.0.0.1:6674` | once per operation | `FETCH`, `STORE` |
 | `fastcache-cc` | the leader's scheduler, or this PC's own node, which redirects to it unless it leads | `FASTCACHE_SCHEDULER`, the leader's node port or this PC's own, `:6674` by default | on a cache miss, when dispatch is configured | `LEASE` |
-| `fastcache-cc` | the worker named in the grant | whatever that worker advertises, which defaults to its `--listen-node` surface | once per dispatched compile, held for its duration | `COMPILE` |
+| `fastcache-cc` | the worker named in the grant | whatever that worker advertises, which defaults to the address that machine routes from, on its `--listen-node` port | once per dispatched compile, held for its duration | `COMPILE` |
 | `fastcache-cc` | the scheduler that granted the lease | `:6674` | a **second** connection, on every path out of the compile | `RELEASE` |
 | a **node** | the leader's scheduler | where its formation record says the fleet's voters answer, `:6674` by default | `REGISTER` once per toolchain, then `HEARTBEAT` every **20 s** | capacity, load, and its closed history buckets — after a handshake proving the node's identity key, with every frame sealed |
 | a node | the shared cache | `--upstream`, `:6674` | once per operation, best-effort | `FETCH`, `STORE` — **the only leg that carries a credential** |
@@ -463,6 +463,15 @@ re-registers.
 A version is refreshed on re-registration, so **an upgrade looks like a restart**
 — that is how the dashboard's version column keeps up.
 
+**A worker whose address moves registers again at once.** By default a node advertises
+the address its machine routes from (`--advertise` unset, or `auto`), and re-derives it
+when an interface or address changes — a DHCP renewal, Wi-Fi to wired, another network —
+or at the latest every 30 seconds. When it moves, the worker withdraws every registration
+under the old endpoint and registers under the new one without waiting out its 20-second
+interval; a lease already granted for the old endpoint is honoured until then. A pinned
+`--advertise` never moves on its own: a name is resolved by each client when it dials, and
+an IP literal stays exactly where it was typed.
+
 !!! note "A single node dials itself"
 
     A first start leads a cluster of one, so its own worker registers with its own
@@ -491,7 +500,7 @@ fastcached_dispatch_worker_endpoint_mismatch_total
 
 alongside an **info** line naming both addresses and the toolchain, written for the
 first twenty mismatches and then left to the counter. Info rather than a warning
-deliberately: on a fleet that advertises DNS names this is every registration and
+deliberately: on a fleet that pins `--advertise` to DNS names this is every registration and
 nothing is wrong, and a signal that fires permanently on a correct deployment is one
 operators learn to filter.
 
@@ -501,7 +510,7 @@ exotic ones:
 
 | Shape | Why it mismatches |
 |---|---|
-| `--advertise` names a DNS host | The scheduler cannot resolve it — it is I/O-free, and a resolver is not something a security decision may depend on |
+| `--advertise` pins a DNS name | The scheduler cannot resolve it — it is I/O-free, and a resolver is not something a security decision may depend on. A name is opt-in: the default advertises the address the worker routes from, which on a flat network is the address its registration arrives from |
 | A single node dialling itself | It registers over loopback while advertising an address clients can route to — the setup on the getting-started page |
 | Multi-homed worker | It reaches the scheduler on one interface and serves clients on another |
 | NAT or a VPN | The scheduler sees the translated or overlay address |
@@ -542,6 +551,28 @@ That cadence is the reason the consensus port wants a network that is not
 congested. Nothing breaks if it is — an election settles again — but leadership
 that moves repeatedly costs a scheduling interval each time and leaves gaps in
 the dashboard's charts.
+
+**A voter whose address moves stays a member.** The address its peers dial for consensus
+is derived the way its advertised endpoint is — by default the address the machine routes
+from, on the `--listen-raft` port — and moves with it. The node closes its consensus
+connections so they redial from the new address, and announces the move; the leader then
+records the new host for the member's consensus endpoint as well as its `0xFC` one, whenever
+the two recorded endpoints share a host (they do unless `--raft-self` and `--advertise` were
+pinned apart). A beacon from before the move can never undo it. A learner dials every voter
+itself, so only its `0xFC` endpoint is moved. Two counters show it:
+`fastcache_node_endpoint_changes_total` and `fastcache_node_raft_endpoint_changes_total`
+([the node's metrics](../tools/fastcache-compile-node.md#when-this-nodes-address-moves)).
+
+**The move is recorded by a commit, so it heals only while the voters that did not move
+are a quorum** ([#1644](https://github.com/LASTRADA-Software/fastcached/issues/1644)). A moved voter whose own scheduler no longer hears a leader
+announces through the other voters it knows, and the leader re-records it; but nothing
+else re-addresses a recorded member. A two-voter fleet where either voter moves, or a
+majority of voters renumbered at once (a router replacement, a DHCP scope change), has no
+such quorum and stays apart. Run three or more voters and move them one at a time, or pin
+`--raft-self` and `--advertise` to DNS names on always-on voters. Once it has happened,
+give enough of the moved voters their old addresses back for a quorum to re-form, then
+move them one at a time; where a quorum survives and one record is stuck,
+`--cluster-admit=<id>=<new-host>:6680` on that side re-records it.
 
 **Discovery** runs beside it, and is how a machine with no configuration finds a fleet
 to join. A node broadcasts a beacon — its fleet summary, signed when challenged — every 15
@@ -736,8 +767,9 @@ notes:
     **startup policy rules**: one the node would refuse exits 2, naming the rule, after
     the map. So a transcript worth copying is a command the node would actually accept.
     The rules that apply to the flags above each refuse a configuration that would start
-    and silently not work: consensus needs an address its peers dial (`--raft-self`, or
-    this machine's resolved name), and membership needs an `--advertise` peers can dial.
+    and silently not work: consensus needs an address its peers dial (`--raft-self`, by
+    default the address this machine routes from), and membership needs an `--advertise`
+    peers can dial.
     (`--listen-raft` needed a `--cluster-key-file` as well, and
     `--discovery` a key rule of its own, until
     [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) moved every proof to
@@ -764,7 +796,9 @@ per surface the registered configuration binds beyond loopback — the rows
 its UDP port when `--discovery-reply-port` pins it, and otherwise — the default, a port
 the kernel chooses at bind — a rule admitting any local UDP port, named `… discovery-reply
 udp/any`. That rule is still scoped to the program and its service, so what it exposes is
-only the UDP sockets this program opens, which is discovery alone.
+only the UDP sockets this program opens: discovery's, the only ones that receive anything (the
+node also opens one briefly to ask the kernel which address it routes from, which sends and
+receives nothing).
 `--firewall-allow=<address[/prefix]>` narrows who may connect, on that rule as on the others. `fastcached`'s own `--install-service` does the same for its cache listeners
 and metrics endpoint. On macOS the install opens nothing and names the surfaces that
 need a rule of your own; the tables below are that worksheet, and the one for any

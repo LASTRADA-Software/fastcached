@@ -297,10 +297,11 @@ struct Machine
             Cluster::FleetPin pin = {}):
         typed { std::move(typedSeeds) },
         advertised { nodeEndpoint.value_or(nodeId.substr(2) + ":6674") },
+        raftAdvertised { nodeId.substr(2) + ":6680" },
         self { .nodeId = nodeId,
                .publicKey = Testing::TestKeyPair(nodeId).PublicKey(),
                .advertised = advertised,
-               .raftEndpoint = nodeId.substr(2) + ":6680",
+               .raftAdvertised = raftAdvertised,
                .reach = reach,
                .pin = std::move(pin) },
         controller { FormationParts { .store = store,
@@ -348,7 +349,8 @@ struct Machine
     Testing::ScriptedShapeJudge judge;
     NodeConditions conditions;
     std::vector<std::string> typed;
-    AnnouncedEndpoint advertised; ///< Where its `0xFC` port answers; `Publish` moves it, as a reload does.
+    AnnouncedEndpoint advertised;     ///< Where its `0xFC` port answers; `Publish` moves it, as a reload does.
+    AnnouncedEndpoint raftAdvertised; ///< Where its Raft port answers; `Publish` moves it, as a roam does.
     SelfFacts self;
     FormationController controller;
 };
@@ -1195,6 +1197,21 @@ TEST_CASE("A move whose shape the startup rules refuse is not taken, though it w
     office.controller.OnClusterState(state, "c-office", "n-office", "office:6674");
     CHECK(office.controller.Mode() == NodeMode::Voter);
     CHECK(office.conditions.StateOf(NodeCondition::FormationMoveRefused) == CompileCacheWire::ConditionState::Clear);
+}
+
+TEST_CASE("A summary states the Raft endpoint this node advertises now, and a learner states none",
+          "[node][formation][controller][endpoint]")
+{
+    // Read at every summary, never captured: a node that roamed is desired by its peers' discovery
+    // where its Raft port answers NOW, which is the beacon's half of a move.
+    Machine office { "n-office", Minted("c-office", OfficeCreatedAt) };
+    CHECK(office.controller.Current().raftEndpoint == "office:6680");
+    office.raftAdvertised.Publish("192.168.7.2:6680");
+    CHECK(office.controller.Current().raftEndpoint == "192.168.7.2:6680");
+
+    Machine laptop { "n-laptop", LearnerIn("c-laptop", "c-office") };
+    laptop.raftAdvertised.Publish("192.168.7.3:6680");
+    CHECK(laptop.controller.Current().raftEndpoint.empty()); // its row closes the Raft port
 }
 
 TEST_CASE("The founder becomes a voter when its cluster records another machine", "[node][formation][controller]")

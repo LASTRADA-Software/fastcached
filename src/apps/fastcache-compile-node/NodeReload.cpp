@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeActivation.hpp"
 #include "NodeDefaults.hpp"
 #include "NodeFormation.hpp"
 #include "NodeReload.hpp"
 
 #include <FastCache/Config/YamlReader.hpp>
 
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,6 +30,17 @@ NodeReloader::Reparse ReloadCandidateReader(std::span<char const* const> args, R
         // identity dials the names.
         candidate.stateDirectory = basis.stateDirectory;
         ApplyHostNames(candidate, basis.hostNames);
+        ApplyRouteHost(candidate, basis.routeHost ? basis.routeHost() : std::string {});
+
+        // The socket a supervisor handed over, as the start adopted it, over whatever the file says
+        // `listen_node:` is: the unit owns the port, so the file's value describes nothing.
+        if (basis.activatedBind.has_value())
+            if (auto adopted = AdoptActivatedBind(candidate, *basis.activatedBind); !adopted.has_value())
+                return std::unexpected(ConfigError { .code = ConfigErrorCode::ParseError,
+                                                     .source = "socket activation",
+                                                     .line = 0,
+                                                     .field = {},
+                                                     .context = std::move(adopted).error().reason });
 
         // The formation as it is kept NOW: a candidate shaped by no record would run no consensus the
         // running node does, and one shaped by the record the start kept would put a reformed node

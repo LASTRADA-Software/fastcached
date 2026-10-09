@@ -220,7 +220,9 @@ replicated state and runs consensus to keep it. No flag asks for either: its fir
 start mints a cluster of one into its state directory, which it leads, and whose mode
 serves the scheduler. Consensus is on by default (`--listen-raft` defaults to `6680`),
 and `--raft-self` states the host another member would dial it at (`127.0.0.1` when
-none ever will; this machine's name when it is not given). A node whose consensus is
+none ever will). Both names above are optional pins: left out, the node is dialled at the
+address this machine routes from and advertises that address on its `--listen-node` port,
+re-deriving both when the machine changes network. A node whose consensus is
 turned off with an empty `--listen-raft=` serves no scheduler and joins no fleet, so it
 may run only a cache tier (`--slots=0`): one running a worker is refused at startup,
 since its worker would have nowhere to register. Its identity
@@ -356,11 +358,13 @@ a lease; one reachable only from its own machine needs none.
 An address still admits a *client* -- a developer's `fastcache-cc` asking for a lease
 needs no identity -- but never a machine joining the fleet.
 
-**`--listen-node` is not optional on a worker that serves a fleet.** It defaults to
-**loopback**, which is right for the single-machine install and unreachable for
-everybody else — so a worker that leaves it alone advertises an address no client can
-dial. The node refuses to start rather than registering one, but the flag is the fix
-and it is easy to leave off.
+**`--listen-node` and `--advertise` may both be left alone on a worker that serves a
+fleet.** `--listen-node` binds every interface on port 6674 by default, and `--advertise`
+defaults to `auto`: the address this machine routes from, on that port, re-derived when an
+interface or address changes, so a laptop that moves between networks keeps taking work.
+Name `--advertise` only where clients have to dial something else — a DNS name, or an
+address in front of a NAT — and prefer a name to a literal address, which stops the node
+following the network.
 
 **`--fleet-seed` names a DNS name or a VIP, never a scheduler's literal address,** where
 it is needed at all: every worker carries that value for as long as it is installed, so

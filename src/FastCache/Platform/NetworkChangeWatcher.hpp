@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/HostEvents.hpp>
 
 #include <condition_variable>
+#include <cstddef>
 #include <expected>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -80,15 +83,56 @@ class NetworkChangeWatcher
 /// `NetworkChangeRelay` -- a VPN can hand out a new address without an interface event. The OS
 /// callback only notifies the relay, so the watcher is never cancelled from inside it.
 ///
+/// Linux: a `NETLINK_ROUTE` socket subscribed to the link, IPv4/IPv6 address and IPv4/IPv6 route
+/// groups. macOS: a `PF_ROUTE` socket. Either is read by a thread of the watcher's own, through
+/// `WatchNetworkChangeDescriptor`. **A thread does not survive `fork()`**, so a POSIX caller that
+/// daemonizes starts the watcher in the process that goes on to serve, after the fork. Other POSIX
+/// platforms offer nothing this project watches.
+///
 /// Three answers, and a caller tells them apart: a watcher; NO watcher, where this platform offers
 /// nothing this project watches, which is not an error; and a refusal, where the OS would not
 /// register one, which is.
 /// @param sink Where the event goes; must outlive the watcher.
 /// @param clock What the debouncer's instants are read from; must outlive the watcher.
 /// @param bound The debounce.
+/// @param logger Where a POSIX watcher says, once, that it stopped hearing changes before it was
+///        destroyed -- its socket ended or failed for good; must outlive the watcher.
 /// @return The running watcher, or null where the platform offers nothing; or which registration
 ///         the OS refused, and why.
 [[nodiscard]] std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> StartNetworkChangeWatcher(
-    IHostEventSink& sink, core::platform::IClock const& clock, NetworkDebounce bound);
+    IHostEventSink& sink, core::platform::IClock const& clock, NetworkDebounce bound, ILogger& logger);
+
+#if !defined(_WIN32)
+
+/// Which messages read from a change socket report a change: `NetlinkReportsChange` or
+/// `RouteSocketReportsChange` (`NetworkChangeMessages.hpp`).
+using NetworkChangeClassifier = bool (*)(std::span<std::byte const> buffer) noexcept;
+
+/// Watch an already-open change socket: a thread of the watcher's own polls it, reads what arrives
+/// and notifies one `NetworkChangeRelay` whenever @p classify says a read reports a change -- or
+/// when the kernel says notifications were dropped (`ENOBUFS`), since a lost change is still one.
+/// The thread stops at end of file or a read error -- and then says so ONCE, at Warn, because a
+/// watcher that stopped and one that hears nothing look alike from outside -- and always when the
+/// watcher is destroyed, which it does not report.
+///
+/// The seam `StartNetworkChangeWatcher` opens the OS socket in front of, so the read loop is driven
+/// by a test through a pipe rather than by changing this machine's addresses.
+/// @param descriptor The socket (or any readable descriptor). Owned from here on: closed by the
+///                   watcher, or before returning when no watcher is made.
+/// @param classify Reads one buffer.
+/// @param sink Where the event goes; must outlive the watcher.
+/// @param clock What the debouncer's instants are read from; must outlive the watcher.
+/// @param bound The debounce.
+/// @param logger Where the read loop ending on its own is said; must outlive the watcher.
+/// @return The running watcher; or why its stop pipe could not be made.
+[[nodiscard]] std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> WatchNetworkChangeDescriptor(
+    int descriptor,
+    NetworkChangeClassifier classify,
+    IHostEventSink& sink,
+    core::platform::IClock const& clock,
+    NetworkDebounce bound,
+    ILogger& logger);
+
+#endif
 
 } // namespace FastCache

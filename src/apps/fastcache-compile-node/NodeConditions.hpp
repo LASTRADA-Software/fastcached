@@ -201,8 +201,8 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .persistence = CompileCacheWire::ConditionPersistence::Live,
       .severity = CompileCacheWire::ConditionSeverity::Warning,
       .scope = ConditionScope::Process,
-      .remedy = "Set --advertise (advertise in the configuration file; a reload applies it) and --raft-self (raft_self; "
-                "a restart applies it) to a name every peer resolves, or to an address; or give this machine a DNS "
+      .remedy = "Set --advertise (advertise in the configuration file) and --raft-self (raft_self) -- a reload "
+                "applies both -- to a name every peer resolves, or to an address; or give this machine a DNS "
                 "domain and restart the node, since the name is read once at startup. Until then a peer whose DNS "
                 "search list does not complete the name cannot reach this node, which registers and answers nobody "
                 "there." },
@@ -212,9 +212,10 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .severity = CompileCacheWire::ConditionSeverity::Warning,
       .scope = ConditionScope::Process,
       .remedy = "Fix this machine's DNS so its name resolves for other machines, and restart (the name is read once "
-                "at startup); or set --raft-self (raft_self; a restart applies it) and --advertise (advertise; a "
-                "reload applies it) to an address or name they resolve. Until then this node is a fleet of its own on "
-                "loopback -- its own scheduler and worker, no discovery -- that can neither form nor join a fleet." },
+                "at startup); or set --raft-self (raft_self) and --advertise (advertise) to an address or name they "
+                "resolve: a reload applies both to what this node advertises, but the consensus port this confined to "
+                "loopback is bound again only by a restart. Until then this node is a fleet of its own on loopback -- "
+                "its own scheduler and worker, no discovery -- that can neither form nor join a fleet." },
     { .condition = NodeCondition::EnrollmentRequestsWaiting,
       .id = "enrollment-requests-waiting",
       .persistence = CompileCacheWire::ConditionPersistence::Live,

@@ -3,6 +3,7 @@
 
 #include "CacheTier.hpp"
 #include "EndpointDialer.hpp"
+#include "EndpointResolver.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
@@ -60,6 +61,9 @@ struct NodePresenceParts
     /// The fleets this machine once asked, read per round and handed to the leader; null where no
     /// formation record is kept.
     Cluster::IAskedJoinsSource const* askedJoins {};
+    /// Re-derives `announced` when due, asked at the top of every round so a network change this
+    /// loop was woken for is published before the round reads it; null where nothing publishes.
+    IEndpointRefresh* endpoints {};
 };
 
 /// Per-call send/recv ceiling on the presence loop's connection to a scheduler: the ceiling of
@@ -250,6 +254,7 @@ class NodePresence
     NodeProofClient const* _prover;
     SchedulerReachability& _reachability;
     Cluster::IAskedJoinsSource const* _askedJoins;
+    IEndpointRefresh* _endpoints; ///< Refreshed at the top of each round; null for none.
 
     /// This machine's capacity record, converted once: it is compiled-in and configured
     /// state, and nothing about it changes between rounds.

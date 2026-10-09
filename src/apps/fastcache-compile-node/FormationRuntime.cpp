@@ -62,15 +62,18 @@ namespace
     /// @param cfg The configuration its record shaped.
     /// @param identityKey This node's identity key.
     /// @param advertised Where its `0xFC` port answers, read at every use.
-    /// @return The facts; the Raft endpoint EMPTY for a mode nobody dials.
+    /// @param raftAdvertised Where its Raft port answers, read at every use; the summary states it
+    ///        only while the mode's row opens the Raft port.
+    /// @return The facts.
     [[nodiscard]] SelfFacts SelfFactsOf(NodeConfig const& cfg,
                                         Ed25519PublicKey const& identityKey,
-                                        Cc::IAdvertisedEndpointSource const& advertised)
+                                        Cc::IAdvertisedEndpointSource const& advertised,
+                                        Cc::IAdvertisedEndpointSource const& raftAdvertised)
     {
         return SelfFacts { .nodeId = cfg.nodeId,
                            .publicKey = identityKey,
                            .advertised = advertised,
-                           .raftEndpoint = ConsensusDialAddressOf(cfg).value_or(std::string {}),
+                           .raftAdvertised = raftAdvertised,
                            .reach = ConsensusConfinedToThisMachine(cfg) ? FleetReachability::ThisMachineAlone
                                                                         : FleetReachability::Open,
                            .pin = FleetPinOf(cfg) };
@@ -101,6 +104,7 @@ FormationRuntime::FormationRuntime(NodeConfig const& cfg,
                                    FormationDurables durables,
                                    NodeReloader const* reloader,
                                    Cc::IAdvertisedEndpointSource const& advertised,
+                                   Cc::IAdvertisedEndpointSource const& raftAdvertised,
                                    Cluster::IAnnouncedJoinMemos const* memos,
                                    IMetricsSink& metrics,
                                    ILogger& logger,
@@ -133,7 +137,7 @@ FormationRuntime::FormationRuntime(NodeConfig const& cfg,
                       .logger = logger,
                       .judge = _judge,
                       .conditions = conditions },
-                  SelfFactsOf(cfg, identityKey.PublicKey(), advertised),
+                  SelfFactsOf(cfg, identityKey.PublicKey(), advertised, raftAdvertised),
                   std::move(record) }
 {
 }
@@ -185,6 +189,7 @@ std::expected<std::unique_ptr<FormationRuntime>, std::string> MakeFormationRunti
     std::optional<Ed25519KeyPair> const& identityKey,
     FormationBody const& body,
     Cc::IAdvertisedEndpointSource const& advertised,
+    Cc::IAdvertisedEndpointSource const& raftAdvertised,
     SchedulerTier* scheduler,
     IMetricsSink& metrics,
     ILogger& logger,
@@ -196,8 +201,17 @@ std::expected<std::unique_ptr<FormationRuntime>, std::string> MakeFormationRunti
         return std::unexpected { std::string { FormationNeedsIdentityKey } };
     auto const* const memos =
         scheduler != nullptr ? static_cast<Cluster::IAnnouncedJoinMemos const*>(&scheduler->Service()) : nullptr;
-    return std::make_unique<FormationRuntime>(
-        cfg, *identityKey, body.record, body.durables, body.reloader, advertised, memos, metrics, logger, conditions);
+    return std::make_unique<FormationRuntime>(cfg,
+                                              *identityKey,
+                                              body.record,
+                                              body.durables,
+                                              body.reloader,
+                                              advertised,
+                                              raftAdvertised,
+                                              memos,
+                                              metrics,
+                                              logger,
+                                              conditions);
 }
 
 Cluster::IFleetSummarySource const& SummarySourceOf(FormationRuntime* runtime,

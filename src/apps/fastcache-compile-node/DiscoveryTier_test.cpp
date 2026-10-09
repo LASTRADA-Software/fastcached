@@ -66,6 +66,16 @@ namespace
     return advertised;
 }
 
+/// Where a tier under test says its Raft port answers: nowhere it would assert, so the record the
+/// tier started with stands and no pass reads a move. One object for the whole binary, so it
+/// outlives every tier a case starts.
+/// @return The source.
+[[nodiscard]] FastCache::Cc::IAdvertisedEndpointSource const& TestRaftAdvertised()
+{
+    static FastCache::Node::AnnouncedEndpoint const advertised { std::string {} };
+    return advertised;
+}
+
 /// Where one node beacons, and how often.
 /// @param beaconAddress Where this node announces itself.
 /// @return The configuration.
@@ -515,6 +525,7 @@ TEST_CASE("Discovery on a consensus port bound to loopback stands down when defa
     auto started = ConsensusTier::Start(
         cfg,
         TestAdvertised(),
+        TestRaftAdvertised(),
         TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},

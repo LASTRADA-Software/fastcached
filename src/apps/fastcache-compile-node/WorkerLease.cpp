@@ -29,10 +29,13 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
 {
     if (roster == nullptr)
     {
-        // The half `StartupPolicyRejection` cannot decide. It reads `--bind`, which
-        // describes nothing under socket activation -- so a node with no roster whose unit
-        // opened a network port reaches here having passed the table, and must not be
-        // allowed to build a validator that refuses nothing.
+        // The half `StartupPolicyRejection` cannot be relied on to decide. A START now judges the
+        // handed-over socket's adopted bind (`AdoptActivatedBind`), but the table is also asked of
+        // the TYPED `--listen-node` an `--install-service` registration replays, which under
+        // activation describes no socket at all -- and the rule this guard keeps is about a
+        // listener this process did not open. So a node with no roster whose unit opened a
+        // network port must not be allowed to build a validator that refuses nothing, whatever
+        // the table concluded.
         //
         // Only the activated case: an ordinary node's `--bind` was already judged, and
         // repeating that judgement here would refuse the loopback fleets this
@@ -46,7 +49,7 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
                 "a socket-activated worker that admits peers on other machines needs a roster to verify "
                 "leases against, and the only roster is the state consensus applies -- so run consensus "
                 "(--listen-raft) or admit only this machine: the socket unit chose the address this port answers "
-                "on, so --bind describes nothing and cannot show the port is local. Without one this node cannot "
+                "on, so no flag of this node can show the port is local. Without one this node cannot "
                 "check the lease a client presents, and would compile for anybody who can reach it" } };
 
         // Warn rather than Info, and said once at startup rather than per request:
@@ -71,7 +74,7 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
                 // What is advertised NOW, which at this moment is what the process
                 // started with -- the seam's value can move later, and this line is a
                 // statement about startup. The move itself is announced where it
-                // happens (`AdvertisedEndpointChange`), so no reader has to infer it
+                // happens (`EndpointResolver`), so no reader has to infer it
                 // from a startup line that was true when it was printed.
                 advertise.Current());
     inForce.Record(BuiltLeaseCheck::Signed);

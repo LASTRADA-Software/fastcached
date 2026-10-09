@@ -4,6 +4,7 @@
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
 #include "EndpointDialer.hpp"
+#include "EndpointResolver.hpp"
 #include "HostEventInbox.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
@@ -129,10 +130,16 @@ struct WorkerTierParts
     /// worker and the presence loop: the registration and the lease check would agree with
     /// each other and disagree with what the fleet page was told.
     ///
-    /// This tier remains its only PUBLISHER, which is what keeps that property cheap: an
-    /// address is learned by re-surveying, and only a worker re-surveys. The presence loop
-    /// reads it and never writes.
+    /// Its only PUBLISHER is `EndpointResolver` (`endpoints`), which derives it from the
+    /// configuration in force and the address this machine routes from. This tier and the
+    /// presence loop read it; the tier re-registers whenever it differs from the endpoint its
+    /// registrations were filed under. The lease check does NOT read it: it reads the endpoint the
+    /// tier is registered under (`WorkerTier::Advertised`), which follows at the re-registration.
     AnnouncedEndpoint& announced;
+    /// Re-derives `announced` when it is due, asked at the top of every heartbeat so a network
+    /// change the heartbeat was woken for is published before the round reads it; and watched, so
+    /// a move published on any other thread wakes the heartbeat to re-register at once.
+    IEndpointRefresh& endpoints;
     /// Where a supervisor handed the node surface over; disengaged when the node binds its own. One
     /// value for both questions it answers -- whether the socket was handed over, which the lease
     /// check asks, and where this node's own scheduler answers, which the registration asks -- so
@@ -315,7 +322,12 @@ class WorkerTier
         return _runtime;
     }
 
-    /// Where this worker is telling clients to reach it, now.
+    /// The endpoint this worker is REGISTERED under, now: the one the scheduler signs into its
+    /// grants and the one the lease check verifies them against.
+    ///
+    /// Not the published endpoint (`WorkerTierParts::announced`), which `EndpointResolver` moves on
+    /// its own thread: the scheduler goes on granting for the registered endpoint until the heartbeat
+    /// re-registers, and a grant for it is honoured until then. This moves at that one point.
     ///
     /// The seam itself rather than a string, so a caller cannot take a copy that then
     /// goes stale -- which is the whole defect #1279 records, and the reason this
@@ -323,7 +335,7 @@ class WorkerTier
     /// @return The source; it lives as long as this tier.
     [[nodiscard]] Cc::IAdvertisedEndpointSource const& Advertised() const noexcept
     {
-        return _announced;
+        return *_registeredAs;
     }
 
     /// @return The slots this worker offers and enforces.
@@ -361,7 +373,7 @@ class WorkerTier
     /// given -- so it is public rather than reached through a test-only seam: calling it
     /// does not register, heartbeat or withdraw anything, and a case can ask it directly
     /// for what a real round would build without spinning the heartbeat thread that is
-    /// `Serve`'s and `AnnounceAs`'s only production caller.
+    /// `Serve`'s and `FollowAnnouncedEndpoint`'s only production caller.
     /// @param served What this worker currently serves, fingerprint to toolchain.
     /// @return One registrar per entry of @p served.
     [[nodiscard]] std::vector<Cc::WorkerRegistrar> RegistrarsFor(std::map<std::string, ServedToolchain> const& served);
@@ -383,6 +395,7 @@ class WorkerTier
                DiscoveredToolchains discovered,
                std::unique_ptr<IScratchClaim> scratchClaim,
                std::unique_ptr<Distributed::WorkerLeaseState> leaseState,
+               std::unique_ptr<AnnouncedEndpoint> registeredAs,
                Cc::LeaseValidator validator,
                SchedulerLink link,
                std::uint32_t slots);
@@ -395,22 +408,34 @@ class WorkerTier
     /// Make @p served what the compile port and the registrations answer, in that order.
     void Serve(std::map<std::string, ServedToolchain> served);
 
-    /// Advertise @p endpoint from now on, retiring the registrations under the old one.
+    /// Re-file the registrations under the endpoint now published, when it is not the one they
+    /// were filed under (`_registeredAs`).
     ///
-    /// **The one caller of `AnnouncedEndpoint::Publish`, and the ordering is the whole
-    /// point.** Publishing before the registrars are rebuilt is what makes the new
-    /// address the one they carry; rebuilding through `AdoptRegistrars` is what queues
-    /// the old `(fingerprint, endpoint)` entries for withdrawal instead of destroying
-    /// the `WorkerId` they need to be retired with. Either half alone leaves the
-    /// scheduler leasing an address this worker does not answer on.
+    /// The endpoint is `EndpointResolver`'s to publish; this is the worker's half of a move.
+    /// Rebuilding through `AdoptRegistrars` is what queues the old `(fingerprint, endpoint)`
+    /// entries for withdrawal instead of destroying the `WorkerId` they need to be retired with,
+    /// and the round that follows withdraws them before it registers the new ones. Compared
+    /// against what was REGISTERED rather than against the previous publication, so a move and
+    /// its reversal between two beats re-register nothing, and three moves in three beats
+    /// withdraw each superseded endpoint exactly once.
     ///
-    /// The lease check moves with it, because the validator reads the same seam -- so
-    /// there is no moment at which this worker verifies against one address while the
-    /// fleet holds another. That is the property a second reader of the configuration
-    /// could not have.
-    /// @param endpoint The new endpoint; non-empty, per `AdvertisedEndpointChange`.
+    /// The lease check does NOT move when the endpoint is published: the validator reads the
+    /// endpoint this worker is REGISTERED under (`RegisterUnder`), which moves here, with the
+    /// registrars, as the old entries are queued for withdrawal -- so between the publication and
+    /// this call a grant the scheduler signed for the endpoint still registered stays valid.
     /// @param statusClock What `node-status` stamps against, for the registrations this retires.
-    void AnnounceAs(std::string endpoint, core::platform::IClock const& statusClock);
+    void FollowAnnouncedEndpoint(core::platform::IClock const& statusClock);
+
+    /// Make @p endpoint the one this worker is registered under and verifies grants against.
+    /// @param endpoint What the registrars in force were just built under.
+    void RegisterUnder(std::string endpoint);
+
+    /// One registrar per entry of @p served, every one filed under @p endpoint.
+    /// @param served What this worker serves, fingerprint to toolchain.
+    /// @param advertised The endpoint the whole set is registered under, read once by the caller.
+    /// @return The registrars.
+    [[nodiscard]] std::vector<Cc::WorkerRegistrar> RegistrarsAt(std::map<std::string, ServedToolchain> const& served,
+                                                                std::string const& advertised);
 
     /// Retire every registration and tell the scheduler, before the machine sleeps.
     /// @param round What to withdraw and where to log.
@@ -430,6 +455,13 @@ class WorkerTier
     /// check both read. Borrowed from `main`, which declares it above this tier and destroys
     /// it after -- `_prover`'s arrangement, for `_prover`'s reason.
     AnnouncedEndpoint& _announced;
+    /// Publishes `_announced` when due; refreshed at the top of every beat, and watched so a move
+    /// published on another thread wakes the heartbeat. Borrowed from `main`.
+    IEndpointRefresh& _endpoints;
+    /// The endpoint the registrars in force were built under, and what the lease check verifies
+    /// a grant against (`Advertised`). Published by the heartbeat thread alone, as it rebuilds the
+    /// registrars. A heap object, because the validator built before this tier borrows it.
+    std::unique_ptr<AnnouncedEndpoint> _registeredAs;
     /// What each heartbeat reports this machine answers on: the locality oracle's own set
     /// (`HeartbeatRound::locality`). Borrowed from `main`, which declares it above this tier.
     ILocalityOracle const& _locality;
@@ -461,6 +493,31 @@ class WorkerTier
     HostEventInbox _hostInbox;
     /// Listening, from construction to destruction. After `_hostInbox`, so it goes first.
     HostEventSubscription _hostSubscription;
+
+    /// Wakes the heartbeat when the published endpoint moves, so it re-registers at once.
+    class HeartbeatWakeOnMove final: public IEndpointMoveSink
+    {
+      public:
+        /// @param capacity Whose heartbeat wait is ended.
+        explicit HeartbeatWakeOnMove(CompileCapacity& capacity) noexcept:
+            _capacity { capacity }
+        {
+        }
+
+        /// Ends the heartbeat's wait, as a host event does.
+        void OnEndpointMoved() noexcept override
+        {
+            _capacity.WakeHeartbeat();
+        }
+
+      private:
+        CompileCapacity& _capacity;
+    };
+
+    /// After `_capacity`, whose wake it calls.
+    HeartbeatWakeOnMove _moveWake { _capacity };
+    /// Watching from construction to destruction. After `_moveWake`, so it goes first.
+    EndpointMoveWatch _moveWatch;
 };
 
 } // namespace FastCache::Node

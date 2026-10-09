@@ -34,15 +34,17 @@ set(ran 0)
 set(failures "")
 
 set(discoveryTier "src/apps/fastcache-compile-node/DiscoveryTier.cpp")
+set(routeProbe "src/FastCache/Platform/RouteProbe.cpp")
 set(otherFile "src/FastCache/Cluster/Other.cpp")
 
-# The baseline tree: discovery's opener, a file that opens nothing, and a vendored root.
+# The baseline tree: the two permitted openers (discovery's, and the route probe's connect-only one), a file that opens nothing, and a vendored root.
 function(fastcached_udp_tree name outVar)
     set(tree "${FASTCACHED_SCRATCH_DIR}/${name}")
     file(REMOVE_RECURSE "${tree}")
     file(WRITE "${tree}/scripts/lib/third-party-roots.txt" "vendor/elsewhere\n")
     file(WRITE "${tree}/${discoveryTier}"
         "#include \"DiscoveryTier.hpp\"\n    auto opened = core::net::openSharedPortUdpSocket(host, beacon, reply);\n")
+    file(WRITE "${tree}/${routeProbe}" "    auto fd = ::socket(family, SOCK_DGRAM, IPPROTO_UDP);\n")
     file(WRITE "${tree}/${otherFile}" "#include <FastCache/Cluster/Other.hpp>\n")
     file(WRITE "${tree}/vendor/elsewhere/socket.hpp" "int s = ::socket(AF_INET, SOCK_DGRAM, 0);\n")
     set(${outVar} "${tree}" PARENT_SCOPE)
@@ -87,8 +89,8 @@ function(fastcached_udp_judge name tree expect mustSay)
     set(failures "${failures}" PARENT_SCOPE)
 endfunction()
 
-set(accepted "the one UDP opener is ${discoveryTier}, and nothing else opens one")
-set(refused "${otherFile}:2: opens a UDP socket outside ${discoveryTier}")
+set(accepted "the UDP openers are ${discoveryTier} and ${routeProbe}, and nothing else opens one")
+set(refused "${otherFile}:2: opens a UDP socket outside the permitted files")
 
 fastcached_udp_tree(clean tree)
 fastcached_udp_judge(clean "${tree}" accept "${accepted}")

@@ -6907,3 +6907,126 @@ TEST_CASE("A registration carries the pin exactly when one was given, and comes 
     REQUIRE(reparsed->fleetPin.has_value());
     CHECK(Cluster::FormatPinnedFleet(Unwrap(reparsed->fleetPin)) == OfficePinText({ "n-office", "n-desk" }));
 }
+
+namespace
+{
+/// The probed route host the advertise-policy cases share.
+constexpr std::string_view ProbedRouteHost = "10.1.2.3";
+
+/// A node binding the wildcard on its Node and Raft ports, named `box.lan`, whose route probe
+/// answered `ProbedRouteHost`.
+/// @return The configuration.
+[[nodiscard]] NodeConfig RoutedWildcardNode()
+{
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    cfg.nodeListen = "0.0.0.0:6674";
+    ApplyHostNames(cfg, NodeHostNames { .fqdn = "box.lan", .dnsSuffix = "lan", .withheld = {} });
+    ApplyRouteHost(cfg, std::string { ProbedRouteHost });
+    return cfg;
+}
+} // namespace
+
+TEST_CASE("An unset advertise follows the probed route host on a wildcard bind", "[node][config][advertise]")
+{
+    auto const cfg = RoutedWildcardNode();
+    CHECK(AdvertiseModeOf(cfg.advertise) == AdvertiseMode::Auto);
+    CHECK(AdvertiseModeRowFor(AdvertiseMode::Auto).followsRoute);
+    CHECK(AdvertisedEndpoint(cfg) == "10.1.2.3:6674");
+}
+
+TEST_CASE("Advertise auto with a port keeps the probed host and overrides the port", "[node][config][advertise]")
+{
+    auto cfg = RoutedWildcardNode();
+    auto const parsed = ParseNodeArgv({ "--advertise=auto:7000" });
+    REQUIRE(parsed.has_value());
+    cfg.advertise = Unwrap(parsed).advertise;
+    CHECK(AdvertiseModeOf(cfg.advertise) == AdvertiseMode::Auto);
+    CHECK(AdvertisedEndpoint(cfg) == "10.1.2.3:7000");
+
+    // The bare word keeps the bound port.
+    cfg.advertise = "auto";
+    CHECK(AdvertisedEndpoint(cfg) == "10.1.2.3:6674");
+}
+
+TEST_CASE("Without a probed route the advertised endpoint falls back to the fully qualified name",
+          "[node][config][advertise]")
+{
+    auto cfg = RoutedWildcardNode();
+    ApplyRouteHost(cfg, {});
+    CHECK_FALSE(cfg.routeHost.has_value());
+    CHECK(AdvertisedEndpoint(cfg) == "box.lan:6674");
+    cfg.advertise = "auto:7000";
+    CHECK(AdvertisedEndpoint(cfg) == "box.lan:7000");
+}
+
+TEST_CASE("A literal advertise is pinned and ignores the probed route", "[node][config][advertise]")
+{
+    auto cfg = RoutedWildcardNode();
+    cfg.advertise = "192.168.1.9:6674";
+    CHECK(AdvertisedEndpoint(cfg) == "192.168.1.9:6674");
+    CHECK(AdvertiseModeOf(cfg.advertise) == AdvertiseMode::PinnedLiteral);
+    CHECK_FALSE(AdvertiseModeRowFor(AdvertiseModeOf(cfg.advertise)).followsRoute);
+    CHECK(AdvertiseModeOf("[fd00::9]:6674") == AdvertiseMode::PinnedLiteral);
+    CHECK(AdvertiseModeOf("10.0.0.7") == AdvertiseMode::PinnedLiteral);
+
+    // A specific bind is the same pin, reached by the bind rather than the flag.
+    auto bound = RoutedWildcardNode();
+    bound.nodeListen = "192.168.1.4:6676";
+    CHECK(AdvertisedEndpoint(bound) == "192.168.1.4:6676");
+}
+
+TEST_CASE("A named advertise is pinned", "[node][config][advertise]")
+{
+    auto cfg = RoutedWildcardNode();
+    cfg.advertise = "build.example:6674";
+    CHECK(AdvertiseModeOf(cfg.advertise) == AdvertiseMode::PinnedName);
+    CHECK_FALSE(AdvertiseModeRowFor(AdvertiseMode::PinnedName).followsRoute);
+    CHECK(AdvertisedEndpoint(cfg) == "build.example:6674");
+    CHECK_FALSE(AdvertiseModeRowFor(AdvertiseMode::PinnedName).describe.empty());
+}
+
+TEST_CASE("Raft self follows the probed route host unless pinned", "[node][config][advertise]")
+{
+    auto cfg = RoutedWildcardNode();
+    CHECK(RaftSelfEndpoint(cfg) == "10.1.2.3:6680");
+    cfg.raftSelf = "auto";
+    CHECK(RaftSelfEndpoint(cfg) == "10.1.2.3:6680");
+    cfg.raftSelf = "peer.lan";
+    CHECK(RaftSelfEndpoint(cfg) == "peer.lan:6680");
+
+    // Unprobed, the name stands in as before.
+    auto unprobed = RoutedWildcardNode();
+    ApplyRouteHost(unprobed, {});
+    CHECK(RaftSelfEndpoint(unprobed) == "box.lan:6680");
+}
+
+TEST_CASE("Advertise auto refuses a port out of range", "[node][config][advertise]")
+{
+    for (auto const* value: { "--advertise=auto:0", "--advertise=auto:70000", "--advertise=auto:x" })
+    {
+        INFO(value);
+        auto const parsed = ParseNodeArgv({ value });
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().context.contains("auto:"));
+    }
+    // And `--raft-self` takes no port at all: it comes from `--listen-raft`.
+    CHECK_FALSE(ParseNodeArgv({ "--raft-self=auto:6680" }).has_value());
+    CHECK(ParseNodeArgv({ "--raft-self=auto" }).has_value());
+}
+
+TEST_CASE("Raft self is reloadable", "[node][config][reload][advertise]")
+{
+    auto const rows = NodeOptions();
+    auto const row = std::ranges::find_if(rows, [](auto const& spec) { return spec.primary == "--raft-self"; });
+    REQUIRE(row != rows.end());
+    CHECK(row->reloadable == Reloadable::Yes);
+    CHECK(std::ranges::contains(AddressReloadableFlags, std::string_view { "--raft-self" }));
+
+    Testing::ScratchDirectory const scratch { "node-reload-raft-self" };
+    auto const path = WriteRunnableNodeConfigFile(scratch.Path(), "raft_self: \"peer.lan\"\n");
+    auto reloader = MakeNodeReloader(RunningNode(), path);
+    auto const outcome = reloader.Reload();
+    INFO("refusal: " << (outcome.has_value() ? std::string { "(none)" } : outcome.error().context));
+    CHECK(outcome.has_value());
+    CHECK(reloader.Current()->raftSelf == "peer.lan");
+}

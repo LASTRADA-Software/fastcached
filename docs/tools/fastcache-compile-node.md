@@ -65,7 +65,7 @@ discovery beacon  0.0.0.0:6681  UDP
 discovery reply   0.0.0.0:*     UDP, port chosen by the kernel at bind
 
 dialled at:
-  consensus endpoint  AT STARTUP  -- this machine's fully qualified name on the raft port, resolved when the node starts; give --raft-self to state it now
+  consensus endpoint  AT STARTUP  -- the address this machine routes from on the raft port, or its fully qualified name until a route is known; derived when the node starts; give --raft-self to state it now
 
 state directory:
   <state directory> (per-user: this process is not privileged, so it keeps its identity apart from the machine's service)
@@ -98,8 +98,10 @@ The `dialled at:` block is not a port to open. It is the address peers dial for
 consensus -- routinely not the `raft` row, because a bare `--listen-raft` binds the
 wildcard -- and it is the one to compare against `--cluster-admit`'s receipt (see
 [Membership at runtime](#membership-at-runtime)). This invocation names none, so the
-block says when it will be known: `AT STARTUP`, this machine's fully qualified name on the
-raft port. With `--raft-self 10.0.0.7` added it reads `10.0.0.7:6680`.
+block says when it will be known: `AT STARTUP`. A started node takes the address this machine
+routes from (`--raft-self` defaults to `auto`), and this machine's fully qualified name — the
+name the line prints — only until a route is known. With `--raft-self 10.0.0.7` added it reads
+`10.0.0.7:6680`.
 
 The `notes:` block is part of the output, not an afterthought: it carries the facts a
 column cannot, including the one that says this list can be **wrong** for the compile
@@ -161,11 +163,12 @@ Several things on that table are easy to get wrong and expensive to get wrong:
   credential rule turns on, so widening that address is what makes a token required.
 
 **One caveat `--print-surfaces` states and cannot compute.** Under systemd socket
-activation the `.socket` unit owns the port, and `--listen-node` is read
-by nothing, and this process is never told which port it got — so `--advertise`
-becomes required and is what names where clients actually go. The command is run by
-hand, never under the supervisor, so it cannot detect this; it prints the note
-instead of guessing.
+activation the `.socket` unit owns the address and port, and `--listen-node` is read
+by nothing: the node asks the socket it is handed where it is bound and advertises
+that — a wildcard `ListenStream=` as the address this machine routes from, on the
+socket's port, and one bound to an address as that address. `--advertise` still
+overrides both. The command is run by hand, never under the supervisor, so it cannot
+detect this; it prints the note instead of guessing.
 
 `--advertise` is deliberately **not** a surface. It is what this node tells other
 machines to dial, not a socket it opens.
@@ -197,7 +200,8 @@ scheduler. That is consensus even on one machine — a scheduler signs every lea
 own identity key, which its workers check against the voters their own consensus applied
 ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)) — so consensus is on
 by default (`--listen-raft` defaults to `6680`), and `--raft-self` says where another
-member would dial it; without one, it is dialled at this machine's fully qualified name.
+member would dial it; without one, it is dialled at the address this machine routes from,
+which follows the machine when its network changes.
 Its own worker registers with the scheduler it serves, on this machine. The same line with
 `--print-identity` added prints its identity:
 
@@ -239,11 +243,12 @@ makes `--fleet-open` over a bind that faces the network safe: the node compiles 
 client holding a lease its fleet's voters issued. See
 [A node proves which machine it is](#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 
-**`--listen-node` and `--advertise` are typed together or neither is worth
-anything.** A bare `--listen-node` binds **loopback** on a worker, so naming only
-`--advertise` tells peers to dial an address this node never accepts on; and naming
-only `--listen-node=0.0.0.0:6674` advertises the wildcard, which resolves to the
-*caller's* machine. Both are refused at startup by name; so, since
+**`--listen-node` and `--advertise` have to agree.** A dialable `--advertise` over a
+`--listen-node` bound to loopback tells peers to dial an address this node never accepts
+on, and an advertised wildcard resolves to the *caller's* machine — which is why `auto`
+replaces a wildcard bind with the address this machine routes from, or with its name until a
+route is known. Both are
+refused at startup by name; so, since
 [#463](https://github.com/LASTRADA-Software/fastcached/issues/463), is naming
 neither while the worker registers with a scheduler on another machine. Whichever you got wrong, the
 refusal names the flag and a working value.
@@ -278,8 +283,22 @@ The scheduler hands your string to clients **verbatim**. A worker that
 advertises `127.0.0.1` is leased and then never answers, and the symptom is a
 build that mysteriously falls back to local compiles on every machine but one.
 
-It defaults to `--listen-node`, which is correct only when that already names an
-address other machines can reach.
+It defaults to `auto`. While `--listen-node` binds the wildcard — the default — that is
+the address this machine routes from, on the `--listen-node` port, re-derived whenever an
+interface or address changes (and at the latest every 30 seconds), with this machine's fully
+qualified name standing in until a route is known. A `--listen-node` bound to one address is
+advertised as bound.
+
+| Value | Advertises | Follows the network | Dial hints |
+|---|---|---|---|
+| unset, or `auto` | the routed address, on the bound port | yes | not needed: the registration itself moves |
+| `auto:<port>` | the routed address, on that port (for a port mapped in front of this one) | yes | not needed |
+| `<name>:<port>` | that name; each client resolves it when it dials | no | yes: a client tries the address the scheduler last saw first |
+| `<ip>:<port>` | exactly that address | no — said once in the log | none |
+
+So a name is an opt-in pin, worth it where a DNS name is what clients should dial (a NAT, or
+an address the scheduler cannot see). An IP literal turns roaming off entirely: keep one only
+for an address that never changes.
 
 ### Why a fleet worker still has to widen `--listen-node` by hand
 
@@ -307,6 +326,13 @@ What the ticket *did* find is that a worker naming neither flag — and naming a
 membership flag, registering with a scheduler on another machine — was refused by nothing
 at a hand start, while `--install-service` refused the same command line. That is now a
 startup refusal as well.
+
+### When this node's address moves
+
+| Series | What a rise means |
+|---|---|
+| `fastcache_node_endpoint_changes_total` | The endpoint this node advertises moved: the address it routes from changed (a DHCP renewal, Wi-Fi to wired, another network), or a reload re-pinned `--advertise`. Each move is logged at Info with the old and the new endpoint; a worker's heartbeat is woken to re-register under the new one at once, and a lease granted for the old one is honoured until it has. Zero on a node whose `--advertise` stays pinned to one value; a reload that re-pins it to another counts one move. |
+| `fastcache_node_raft_endpoint_changes_total` | The Raft endpoint this node advertises moved, for the same two reasons. Read it beside the row above: the two move together unless `--raft-self` is pinned apart from `--advertise`. It stays at zero on a node that dials in (a learner) or runs no consensus: nobody dials such a node's Raft port, so none is derived. |
 
 ## Anything the fleet reads has to be text
 
@@ -1295,7 +1321,10 @@ by hand.
 
 **A minted identity is typed nowhere**, and a node must name the endpoint its peers
 dial — so `--raft-self=<host>` says it, and the port comes from `--listen-raft`. Without
-it the node is dialled at this machine's fully qualified name, resolved when it starts.
+it (`auto`, the default) the node is dialled at the address this machine routes from,
+re-derived when the network changes, and at this machine's fully qualified name until a route
+is known. `--raft-self` takes a HOST, `auto`, or nothing -- never `host:port`, and never
+`auto:<port>`: its port is always `--listen-raft`'s. Both are reloadable.
 
 ```sh
 # The whole of a first node
@@ -1493,7 +1522,7 @@ nobody reads:
 
 | What has to hold | Why |
 |---|---|
-| this node names where its peers dial it, by `--raft-self` or by this machine's resolved name | The address its peers dial is the half only it knows: a node that could name none could never win a vote and could never be voted for. A name that resolves to nothing is refused; one that reaches only this machine (`localhost`) confines consensus to loopback unless `--raft-self` names it: the node runs as a fleet of its own, with its own scheduler and worker, and can neither form nor join a fleet. |
+| this node names where its peers dial it, by `--raft-self` or — with `auto`, the default — by the address it routes from, or this machine's resolved name until a route is known | The address its peers dial is the half only it knows: a node that could name none could never win a vote and could never be voted for. A name that resolves to nothing is refused; one that reaches only this machine (`localhost`) confines consensus to loopback unless `--raft-self` names it: the node runs as a fleet of its own, with its own scheduler and worker, and can neither form nor join a fleet. |
 | `--listen-raft` names a usable port | That is where every peer dials it. A value that is not an address is refused with the text you typed. |
 
 The reverse holds too: `--raft-self` **without** consensus is refused rather than ignored,
@@ -1519,15 +1548,24 @@ it.
 **Every member's record carries its `0xFC` endpoint, learners included**, because
 anything resolving a machine reads it — the redirect reads the leader's, and a
 shared-cache resolver reads any member's. It is the member's own word, and only the
-node itself knows it: the endpoint it advertises (`--advertise`, or else its node
-port with a wildcard host replaced by this machine's name). It is recorded when the
+node itself knows it: the endpoint it advertises (`--advertise`, by default its node
+port with a wildcard host replaced by the address this machine routes from). It is recorded when the
 member's enrollment is approved, from the endpoint its join request stated, and moved
 afterwards only by that machine's own announcement on its presence loop, made under
 the identity key it proved on that connection: the leader re-proposes the member's
 record with the new endpoint, keeping its seat and its key. A leader also asserts its
-own on every reconcile pass. So an accepted reload of `--advertise` reaches the
-record within one announcement interval, and nothing a machine merely claims without
-proving it moves any record.
+own on every reconcile pass. So an accepted reload of `--advertise`, or a move of the
+address it routes from, reaches the record within one announcement interval, and nothing a
+machine merely claims without proving it moves any record.
+
+The announcement moves the **consensus** endpoint too, for a voter whose two recorded
+endpoints are on one host — every voter that leaves both flags at `auto`. The leader keeps
+the recorded consensus port and takes the announced host, so a voter that changed networks
+is dialled at its new address rather than lost. A voter that pins `--raft-self` to a host
+other than its `--advertise` one is never moved this way: it said where each answers, and its
+consensus endpoint moves only by its own word while it leads, or with its discovery beacon. A
+beacon sent before a move cannot move a coupled voter back, and host names are compared as
+spelled, so `Office.lan` and `office.lan` count as two hosts.
 
 A member that has announced none — a bootstrap peer typed with `--raft-peer`, before
 its first announcement — carries no scheduler endpoint, which is not a fault: a
@@ -2159,7 +2197,7 @@ fastcache-compile-node \
     --listen-node=6675 --fleet-open --toolchain=/usr/bin/g++
 ```
 
-Every node still names **itself** — `--raft-self`, or this machine's name — because that
+Every node still names **itself** — `--raft-self`, or the address it routes from — because that
 is the address its peers dial and only it knows it. What it never names is anybody else.
 
 **Discovery finds members; it no longer admits anybody**
@@ -2242,7 +2280,7 @@ one of them do nothing about it.
 
 **A node joining a discovered fleet still needs an operator to admit its key** —
 `--enroll-approve`, or `--cluster-admit ...@<key>`: discovery supplies the addresses,
-and never the admission. It still names itself — `--raft-self`, or this machine's name —
+and never the admission. It still names itself — `--raft-self`, or the address it routes from —
 as every node in a cluster must. One machine founds the fleet and the rest join it — and
 only one stays a founder, because two clusters cannot be merged: a joiner dissolves the
 cluster of one it started as. A membership
@@ -2553,6 +2591,14 @@ that leases this worker never races its startup, and an idle worker costs
 nothing — which suits a compile fleet, where misses on a warm shared cache are
 bursty and rare.
 
+The worker needs no `advertise:` for it. It asks the socket it is handed where it is
+bound: the shipped `ListenStream=6676` binds every interface, so it advertises the
+address this machine routes from on port 6676 and follows the network when that
+changes; a `ListenStream=10.0.0.5:6676` is advertised as exactly that. An `advertise:`
+in the configuration file still wins. **Coming from 0.4.0**, which refused to start
+under activation without one: if you added a literal address only to get past that
+refusal, remove it, or the node stays pinned to it and does not follow the network.
+
 The service runs as its own `fastcache-node` account, deliberately not
 `fastcached`'s: a worker runs a compiler on input that arrived over the network,
 while `fastcached` owns the cache storage, and sharing an account would let a
@@ -2694,8 +2740,8 @@ These are specific to registering:
 | `--toolchain` *(only with `--no-toolchain-discovery`)* | With both, the worker has nothing to serve: it would register and then refuse every job sent to it. Without the flag the machine answers at boot, so a registration needs no toolchain at all. |
 
 Neither `--advertise` nor `--cluster-dir` is required. A worker that names no `--advertise`
-advertises this machine's fully qualified name, which the service resolves at every start rather
-than baking it in here. And the state directory defaults to the platform's machine-wide one,
+advertises the address this machine routes from, which the service re-derives whenever the
+network changes rather than baking it in here. And the state directory defaults to the platform's machine-wide one,
 resolved by the service as the account it runs as, not relative to a working directory a service
 does not inherit.
 
@@ -2819,10 +2865,10 @@ package registered, which a node that serves now refuses, and the `--advertise` 
 package of this installer registered from the advertised-endpoint property it remembered.
 
 There is no such property any more. The registration carries no `--advertise`, and the node
-advertises this machine's fully qualified name on its `--listen-node` port, resolved at every
-start, so a renamed machine or a new VPN address needs no reinstall -- where a remembered IP
-literal on a roaming laptop vetoed every dial hint at every upgrade. An address that must be typed
-goes under `advertise:` in the configuration file. `FASTCACHE_FIREWALL_ALLOW`
+advertises the address this machine routes from on its `--listen-node` port, re-derived when
+the network changes, so a renamed machine or a new VPN address needs no reinstall or restart --
+where a remembered IP literal on a roaming laptop pinned it and vetoed every dial hint at every
+upgrade. An address that must be typed goes under `advertise:` in the configuration file. `FASTCACHE_FIREWALL_ALLOW`
 is optional: it is passed as `--firewall-allow` (one address with an optional
 `/prefix`) to this registration and to fastcached's, and left out the rules admit any
 address. `FASTCACHE_FLEET_SEED` is optional as well: one name or `name:port`, registered as
@@ -2878,11 +2924,12 @@ and goes when it exits; its rules are removed at once all the same. If Windows
 refuses the delete, the rules are left in place — the service is still registered
 and may be running — and the next uninstall that succeeds removes them.
 
-### When the machine sleeps
+### When the machine sleeps, wakes, or changes network
 
 A worker registered as a Windows service hears the machine's power events, and
-every node on Windows hears its network changes. It works without either: each
-only lets it act sooner.
+every node hears its network changes: on Windows from the system's interface and
+address notifications, on Linux from a netlink routing socket, on macOS from a routing
+socket. It works without either: each only lets it act sooner.
 
 - **Before the machine sleeps** the worker withdraws its registrations, so no
   client is leased a machine that is about to stop answering. It makes one
@@ -2894,9 +2941,33 @@ only lets it act sooner.
 - **When the machine wakes, or an interface or address changes** (reported once
   nothing new arrived for 2 s, or 10 s into a burst), the worker announces itself
   at once rather than at the end of its 20-second interval, and so does the node's
-  presence announcement. Each runs on its own thread, never on the one Windows
-  delivered the event on. A suspend cancels any such wake still pending from
+  presence announcement. Each runs on its own thread, never on the one that
+  delivered the event. A suspend cancels any such wake still pending from
   before it.
+- **When the address it routes from changes**, a node whose `--advertise` and
+  `--raft-self` are left at `auto` re-derives both: the worker withdraws its
+  registrations under the old endpoint and registers under the new one, the presence
+  announcement tells the leader, and a voter closes its consensus connections so they
+  redial from the new address, while the leader records the move (see [two ports, and
+  why a member records both](#two-ports-and-why-a-member-records-both)). A voter that no
+  longer hears its leader -- which is every voter whose old address is gone -- reaches it
+  through the other voters it knows, so its own scheduler not knowing who leads does not
+  strand it. Each move is an
+  Info line naming the old and the new endpoint, and counts on
+  [the two series above](#when-this-nodes-address-moves). Without any event the node
+  re-checks every 30 seconds, so a missed change costs half a minute at most. A pinned
+  `--advertise` or `--raft-self` is not re-derived.
+- **A move that leaves the voters that did not move without a quorum does not heal by
+  itself** ([#1644](https://github.com/LASTRADA-Software/fastcached/issues/1644)). The leader records a voter's new address by a commit, and that
+  needs a quorum of the voters that did NOT move: a two-voter fleet where either one moves,
+  or a majority of voters renumbered at once (a router replacement, a DHCP scope change),
+  has none, and nothing else re-addresses a recorded member. Run three or more voters and
+  let them move one at a time, or pin `--raft-self` and `--advertise` to DNS names on
+  always-on voters, which every peer re-resolves when it dials. Once it has happened, give
+  enough of the moved voters their old addresses back (a DHCP reservation, a static
+  address) for a quorum to re-form, then let them move one at a time; where a quorum
+  survives and one record is stuck, `fastcache-compile-node
+  --cluster-admit=<id>=<new-host>:6680` on that side re-records it.
 - **A machine that sleeps without saying so** — Modern Standby can sleep and wake
   without reporting either — recovers on its own schedule. The next ordinary
   round registers it again, at most one announcement interval (20 s) after it
@@ -2908,9 +2979,12 @@ only lets it act sooner.
   it again, which its first consensus session after waking brings, with no event
   needed. It raises `consensus-leader-silent` meanwhile.
 
-Only a service hears power events: a worker run in the foreground hears network
-changes alone, and on Linux and macOS the node hears neither and relies on its
-ordinary rounds.
+Only a Windows service hears power events: a node run in the foreground, and every
+node on Linux and macOS, hears network changes alone and relies on its ordinary rounds
+for a sleep. A node whose network watcher cannot start says so once in its log
+(`network changes will not be reported`), and one whose watcher stops later says so once
+too (`network changes will no longer be reported`); either keeps working on those rounds
+and the 30-second re-check.
 
 ## Reloading it
 
@@ -2932,13 +3006,19 @@ address — so a list is written as one key with every value under it.
 
 | Reloadable | Requires a restart |
 |---|---|
-| `log_level`, `allow_compile_arg`, `requirepass`, `fleet_open`, `toolchain`, `no_toolchain_discovery`, `advertise` | `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
+| `log_level`, `allow_compile_arg`, `requirepass`, `fleet_open`, `toolchain`, `no_toolchain_discovery`, `advertise`, `raft_self` | `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
 
 `log_level`, `allow_compile_arg`, `requirepass` and `fleet_open` take
 effect immediately and tell the fleet nothing; `toolchain` and `no_toolchain_discovery`
 re-register this worker, which is the section after next; `advertise` re-registers it
 too, at a new address, and retires the entry under the old one -- with the cost that
-section states.
+section states. `raft_self` moves the address this node's peers dial for consensus.
+
+Both default to `auto`: the address this machine routes from, on the bound port while the
+listener binds the wildcard, re-derived when the network changes (this machine's fully
+qualified name stands in until a route is known). `auto:<port>` derives the host and
+states the port. A literal IP pins the address and turns that roaming off; a name pins
+it too, and peers resolve it themselves.
 
 ### Revoking a machine
 
@@ -3027,12 +3107,17 @@ A node does not always know its own address when it starts: one behind a NAT or 
 balancer learns its external address later, and one waiting on an interface may have
 none worth advertising yet. So `advertise` is reloadable, and a reload does two things
 rather than one — the worker starts telling clients the new address, **and** it retires
-its registration under the old one instead of leaving the scheduler to expire it.
+its registration under the old one instead of leaving the scheduler to expire it. With
+`advertise` left at `auto` the node does the same by itself whenever the address it routes
+from changes, with no reload at all; a reload that changes nothing keeps the address it has
+moved to. `raft_self` is reloadable for the same reason, and moves the address peers dial
+for consensus.
 
 The cost is stated because it is real and it is bounded. `advertise` is inside the
 signature of every lease the scheduler has handed out naming this worker, so grants
-already in clients' hands name the address you have just left. Those are refused, each
-costing that client one local compile, until they expire. In the deployment this exists
+already in clients' hands name the address you have just left. They are honoured until the
+worker has registered under the new address — at once, not at its next interval — and
+refused after that, each costing that client one local compile, until they expire. In the deployment this exists
 for that loses nothing: the address changed because the old one stopped working, so
 those grants named something nobody could reach anyway. What it replaces is worse — a
 worker that can never advertise the reachable address without being restarted.
@@ -3287,8 +3372,8 @@ Every row says two things before anything else:
 | `enrollment-window-open` | live | alert | an `--enroll-auto-approve` window is armed, so any machine that asks is admitted under the key it asks with, with nobody comparing it; names the deadline and when it was armed. Not evaluated on a node that does not lead, naming the leader: the window and the list live in the leader's memory | `--enroll-list` to see who got in (each auto-approved row is marked), comparing each key with the one its machine printed; `--enroll-auto-approve=off` ends it, and so does a restart or a change of leader |
 | `enrollment-requests-waiting` | live | notice | machines have asked to join and nobody has decided about them; names them. Not evaluated on a node that does not lead, naming the leader: the list lives in the leader's memory | `--enroll-list`, comparing each key with the one its machine printed, then the `--enroll-approve=<id>@<key>` line it prints, or `--enroll-reject=<id>`; a machine that stops asking for ten minutes is forgotten |
 | `unreadable-leader-snapshot` | live | alert | this node's build cannot read the snapshot its leader offers, so it refuses it and stays behind — following no change the cluster makes, forgets included, until it can (#1552) | run the build the leader runs; the node catches up by itself once it reads the leader's snapshot, with nothing to move aside |
-| `unqualified-host-name` | live | warning | peers are told to dial this node at a host name with no domain, which a peer whose DNS search list does not complete it cannot reach | set `--advertise` (a reload applies it) and `--raft-self` (a restart applies it) to a name every peer resolves, or to an address; or give the machine a DNS domain and restart |
-| `host-name-reaches-only-this-machine` | live | warning | this machine's name reaches only itself (`localhost`, a name under `.localhost`, or a loopback address), so nothing offers it to a peer: the node runs as a fleet of its own on loopback (its own consensus, scheduler and worker, so local dispatch works), discovery stands down, it can neither form nor join a fleet, and the worker is announced to no scheduler elsewhere; the detail says what was confined | set `--raft-self` (a restart applies it) and, to be announced to a scheduler, `--advertise` (a reload applies it) to an address or name other machines resolve; or give the machine a real host name and restart |
+| `unqualified-host-name` | live | warning | peers are told to dial this node at a host name with no domain, which a peer whose DNS search list does not complete it cannot reach | set `--advertise` and `--raft-self` (a reload applies both) to a name every peer resolves, or to an address; or give the machine a DNS domain and restart |
+| `host-name-reaches-only-this-machine` | live | warning | this machine's name reaches only itself (`localhost`, a name under `.localhost`, or a loopback address), so nothing offers it to a peer: the node runs as a fleet of its own on loopback (its own consensus, scheduler and worker, so local dispatch works), discovery stands down, it can neither form nor join a fleet, and the worker is announced to no scheduler elsewhere; the detail says what was confined | set `--raft-self` and, to be announced to a scheduler, `--advertise` to an address or name other machines resolve (a reload applies both to what the node advertises; the consensus port confined to loopback is bound again only by a restart); or give the machine a real host name and restart |
 | `foreign-fleet-visible` | live | warning | this node's fleet is established and discovery proves another established fleet on the segment that neither yields to, because no key this fleet holds proves the two are one fleet split in two; or `--fleet-id` pins this node to another cluster and discovery proves a fleet it would otherwise have joined or healed into. The detail names both cluster ids, and for each other fleet either "no machine in common" -- among the machines it listed, with the cut named, when its summary carried fewer than it records -- the machine of this fleet it CLAIMS to record, unproven, or the pin that keeps this node out. Not evaluated until discovery has listened one beacon interval, nor while no discovery reply has been heard for five minutes: an empty segment and a firewalled one look alike | decide which fleet each machine belongs to and `--cluster-forget` it from the other; for a fleet the pin keeps this node out of, change `--fleet-id` if it names the wrong fleet, and otherwise the pin is doing its job. It clears a few minutes after the other fleet stops being heard |
 | `shared-cache-unavailable` | live | alert | the fleet's `shared-cache` setting names this machine and its shared tier will not open, so every other node's builds miss and compile locally; the detail says why | fix what the detail names — usually another process holding `<state-dir>/shared-cache`, or a full disk — and it opens at the next change the cluster applies or within 30 seconds; or name another machine with `--cluster-set shared-cache=<id>` |
 | `shared-cache-unproven` | live | warning | the fleet's `shared-cache` setting names another machine and this node's builds are not reaching it, so they compile locally; the detail says why — a machine at the announced address that proved another key (nothing was sent to it), the named machine refusing this node's key, one that did not answer, or a setting naming a machine this cluster cannot reach by key | check `--cluster-status` and the named machine's own `fastcache-cli node`; it clears by itself at the next operation that proves the named machine's key, and at the apply that stops the setting naming another machine; an apply that names a different machine, or resolves one this cluster could not reach by key, makes it `not-evaluated` (not tried) until an operation tries it, never `clear`; a setting naming a machine this cluster cannot reach by key raises it at the apply, before any build asks; an operation still running when an apply moved the setting says nothing about the machine it had dialled |
@@ -3667,7 +3752,7 @@ byte-budget refusal that fires in practice is a cache `STORE`.
 | `fastcache_raft_peer_dials_ended_silent_total` | Two-way Raft sessions this node dialled -- a learner's -- that carried nothing for their idle bound, a hundred of the leader's heartbeat intervals, so this node closed them and redials on the learner's backoff. A steady trickle is the sessions to voters that are not leading, which write a learner nothing; one after a sleep is a half-open session to the leader, which without the bound would never end, so the roster and every forget would stop arriving until a restart. |
 | `fastcache_raft_sends_dropped_no_session_total` | Raft messages dropped for a peer that dials in -- a learner, which nobody dials -- while no session of its is attached: the learner is offline, or has not dialled yet. Raft retransmits, so a drop costs the leader nothing else. |
 | `fastcache_raft_sends_dropped_unknown_peer_total` | Raft messages dropped for a peer this node can place nowhere: it neither dials it nor was told it dials in, so nothing here can reach it however long it waits -- a member whose recorded address this node cannot dial, or an id it was never given an address for. |
-| `fastcache_raft_inbound_sessions_superseded_total` | Two-way Raft sessions a peer's newer session superseded: the same id proved a second session while its first was still attached, and the first was closed. One per reconnect is a roaming learner whose old connection had not yet been seen to end; a steady rate from one peer names two machines holding one identity key -- a copied --cluster-dir -- taking the session from each other. |
+| `fastcache_raft_inbound_sessions_superseded_total` | Raft sessions a peer's newer session superseded: the same id proved a second session while its first was still open, and the first was closed -- a two-way session by the transport, a one-way session by the acceptor. One per reconnect is a roaming member whose old connection had not yet been seen to end; a steady rate from one peer names two machines holding one identity key -- a copied --cluster-dir -- taking the session from each other. |
 
 **A member admitted with a key the leader could not read.** `--cluster-admit` and
 `fastcache-cli cluster-admit` may name the member's identity key. The leader reads it

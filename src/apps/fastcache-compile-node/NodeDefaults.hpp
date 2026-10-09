@@ -149,6 +149,12 @@ struct NodeHostNames
 /// @param names This machine's names.
 void ApplyHostNames(NodeConfig& cfg, NodeHostNames names);
 
+/// Write the probed route host into @p cfg: the one writer of `NodeConfig::routeHost`, applied
+/// to every configuration a process builds, as `ApplyHostNames` is.
+/// @param cfg The configuration.
+/// @param host The local address this machine routes from; empty clears it (no route).
+void ApplyRouteHost(NodeConfig& cfg, std::string host);
+
 /// Write @p naming's names into @p cfg, through `ApplyHostNames`.
 /// @param cfg The configuration; its `hostNames` is engaged.
 /// @param naming This machine's names.

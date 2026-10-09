@@ -92,9 +92,9 @@ registers the services that follow from the choice:
 The node needs no property to be registered: it finds its scheduler from the fleet it forms or
 joins (the [fastcache-compile-node page](../tools/fastcache-compile-node.md#macos-and-windows)
 has the details). There is no property for the address clients reach the node at: the node
-advertises this machine's fully qualified name, resolved at every start, so a renamed machine or a
-new VPN address needs no reinstall; an address that must be typed goes under `advertise:` in the
-node's configuration file. `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8` is optional, and limits the
+advertises the address this machine routes from and re-derives it when the network changes, so a
+renamed machine or a new VPN address needs no reinstall and no restart; an address that must be
+typed goes under `advertise:` in the node's configuration file. `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8` is optional, and limits the
 firewall rules both registrations create to that remote range; left out, they admit any address. So is
 `FASTCACHE_FLEET_SEED=office-a.vpn.example`, one machine of the fleet for the node to ask when no
 discovery beacon reaches it, as across a VPN; it is registered as the node's `--fleet-seed`, and a
@@ -163,8 +163,8 @@ installer remembered there is forgotten by the next transaction, and that regist
 remembered one. An empty value counts as leaving the property out, so a remembered scope is kept;
 to drop it, uninstall (which forgets the values) and install again. An installer older than this
 remembering has nothing to read back, so the first upgrade from one registers what it states: with
-no property the node is still registered and started, advertising this machine's name with its
-firewall rules admitting any address, so pass `FASTCACHE_FIREWALL_ALLOW` (and any other property
+no property the node is still registered and started, advertising the address this machine routes
+from (re-derived when the network changes) with its firewall rules admitting any address, so pass `FASTCACHE_FIREWALL_ALLOW` (and any other property
 you installed with) on that upgrade to keep it.
 
 ```powershell

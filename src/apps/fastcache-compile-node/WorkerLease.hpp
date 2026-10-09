@@ -26,8 +26,10 @@ namespace FastCache::Node
 /// bare `true` at the call site says nothing about which way round it is.
 enum class SocketActivation : std::uint8_t
 {
-    No = 0, ///< This process bound its own port, so `--bind` describes it.
-    Yes,    ///< A socket unit owns the port, and `--bind` describes nothing.
+    No = 0, ///< This process bound its own port, so `--listen-node` describes it.
+    /// A socket unit owns the port: a start adopts the socket's bind, but the typed `--listen-node`
+    /// a registration replays describes no socket.
+    Yes,
 };
 
 /// Which lease check a worker built: none yet, one that verifies a grant's signature, or one that

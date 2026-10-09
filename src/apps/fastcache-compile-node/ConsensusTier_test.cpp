@@ -160,6 +160,16 @@ namespace
     return advertised;
 }
 
+/// Where a tier under test says its Raft port answers: nowhere it would assert, so the record the
+/// tier started with stands and no pass reads a move. One object for the whole binary, so it
+/// outlives every tier a case starts.
+/// @return The source.
+[[nodiscard]] FastCache::Cc::IAdvertisedEndpointSource const& TestRaftAdvertised()
+{
+    static FastCache::Node::AnnouncedEndpoint const advertised { std::string {} };
+    return advertised;
+}
+
 /// The steady clock a roster under test measures leader silence on. One object for the whole
 /// binary, so it outlives every roster a case builds; no case here waits out the bound.
 /// @return The clock.
@@ -400,6 +410,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
             cfg,
             noScheduler,
             TestAdvertised(),
+            TestRaftAdvertised(),
             std::nullopt,
             membership,
             *Unwrap(roster),
@@ -431,6 +442,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
             cfg,
             noScheduler,
             TestAdvertised(),
+            TestRaftAdvertised(),
             identity,
             membership,
             *Unwrap(roster),
@@ -460,6 +472,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
             cfg,
             noScheduler,
             TestAdvertised(),
+            TestRaftAdvertised(),
             identity,
             membership,
             *Unwrap(roster),
@@ -510,6 +523,7 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
         StartConsensusOrExplain(cfg,
                                 noScheduler,
                                 TestAdvertised(),
+                                TestRaftAdvertised(),
                                 std::nullopt,
                                 membership,
                                 *Unwrap(roster),
@@ -565,6 +579,7 @@ TEST_CASE("A listener handed to consensus is served only on the configured addre
         return ConsensusTier::Start(
             cfg,
             TestAdvertised(),
+            TestRaftAdvertised(),
             Testing::TestKeyPair("n1"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [](Cluster::ClusterState const&) {},
@@ -821,6 +836,7 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     auto started = ConsensusTier::Start(
         cfg,
         TestAdvertised(),
+        TestRaftAdvertised(),
         Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
@@ -876,6 +892,110 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     CHECK(records(tier->ClusterState(), self));
 }
 
+TEST_CASE("A node asserts its own Raft endpoint only while its seat is dialled and another machine could dial it",
+          "[node][consensus][endpoint]")
+{
+    auto const held = Cluster::DesiredMember {
+        .id = "n1", .raftEndpoint = "office:6680", .schedulerEndpoint = std::string {}, .publicKey = std::nullopt
+    };
+
+    auto const voter = SelfDesire(held, Cluster::MemberSeat::Voter, "10.9.0.7:6674", "10.9.0.7:6680");
+    CHECK(voter.raftEndpoint == "10.9.0.7:6680");
+    CHECK(voter.schedulerEndpoint == std::optional<std::string> { "10.9.0.7:6674" });
+
+    // A learner dials in: whatever the resolver derived for it, its record's Raft endpoint stands.
+    CHECK(SelfDesire(held, Cluster::MemberSeat::Learner, "10.9.0.7:6674", "10.9.0.7:6680").raftEndpoint == "office:6680");
+    CHECK(OwnRaftEndpoint(Cluster::MemberSeat::Learner, "10.9.0.7:6680").empty());
+
+    // Nothing to assert -- none derived, or one only this machine reaches -- keeps the record's.
+    for (auto const* const none: { "", "127.0.0.1:6680", "0.0.0.0:6680" })
+    {
+        INFO(none);
+        CHECK(SelfDesire(held, Cluster::MemberSeat::Voter, "10.9.0.7:6674", none).raftEndpoint == "office:6680");
+        CHECK(OwnRaftEndpoint(Cluster::MemberSeat::Voter, none).empty());
+    }
+
+    // The `0xFC` endpoint stays an assertion even empty.
+    CHECK(SelfDesire(held, Cluster::MemberSeat::Voter, "127.0.0.1:6674", "").schedulerEndpoint
+          == std::optional<std::string> { std::string {} });
+}
+
+TEST_CASE("A leader asserts its own moved Raft endpoint and resets its sessions when it moves again",
+          "[node][consensus][endpoint]")
+{
+    // A real one-voter tier, over a real listener and state directory: the resolver publishes where
+    // its Raft port answers, and the leader's next pass records it -- as it records its `0xFC` one.
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+
+    auto held = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(held);
+    REQUIRE(held->IsBound());
+    auto const port = held->boundPort();
+
+    Testing::ScratchDirectory const scratchDirectory { "consensus-own-raft-move" };
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    cfg.nodeId = "n1";
+    cfg.raftListen = std::format("127.0.0.1:{}", port);
+    cfg.raftSelf = "127.0.0.1";
+    cfg.clusterDir = scratchDirectory.Path() / "state";
+
+    // Loopback at the start, which no record holds: nothing asserted, the formation's entry stands.
+    AnnouncedEndpoint raft { std::format("127.0.0.1:{}", port) };
+    auto started = ConsensusTier::Start(
+        cfg,
+        TestAdvertised(),
+        raft,
+        Testing::TestKeyPair("n1"),
+        [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+        [](Cluster::ClusterState const&) {},
+        ConsensusTier::LeaderContactObserver {},
+        metrics,
+        logger,
+        nullptr,
+        FormationHooks {},
+        std::move(held));
+    INFO("start refused: " << RefusalOf(started));
+    REQUIRE(started.has_value());
+    auto const& tier = *started;
+
+    auto const recordedRaft = [&tier]() -> std::string {
+        auto const state = tier->ClusterState();
+        auto const* const self = core::findOrNull(state.members, Consensus::NodeId { "n1" }, &Cluster::ClusterMember::id);
+        return self != nullptr ? self->raftEndpoint : std::string {};
+    };
+    auto const moves = [&logger] {
+        return std::ranges::count_if(logger.Snapshot(), [](CapturingLogger::Record const& record) {
+            return record.message.contains("raft: this node moved to");
+        });
+    };
+    REQUIRE(Testing::WaitUntil(
+        "the one-voter tier to lead and record itself",
+        [&tier, &recordedRaft] { return tier->Status().role == Consensus::Role::Leader && !recordedRaft().empty(); },
+        [&recordedRaft] { return std::format("recorded at '{}'", recordedRaft()); }));
+    CHECK(recordedRaft() == std::format("127.0.0.1:{}", port));
+
+    // Roamed: the first address another machine could dial is recorded. Not a move of THIS node's
+    // sessions yet -- nothing was asserted before it.
+    auto const roamed = std::format("10.9.0.7:{}", port);
+    raft.Publish(roamed);
+    REQUIRE(Testing::WaitUntil(
+        "the leader to record its roamed Raft endpoint",
+        [&recordedRaft, &roamed] { return recordedRaft() == roamed; },
+        [&recordedRaft] { return std::format("recorded at '{}'", recordedRaft()); }));
+    CHECK(moves() == 0);
+
+    // And roamed again: recorded, and said once.
+    auto const again = std::format("10.9.0.8:{}", port);
+    raft.Publish(again);
+    REQUIRE(Testing::WaitUntil(
+        "the leader to record its moved Raft endpoint",
+        [&recordedRaft, &again] { return recordedRaft() == again; },
+        [&recordedRaft] { return std::format("recorded at '{}'", recordedRaft()); }));
+    CHECK(moves() == 1);
+    CHECK(tier->Status().role == Consensus::Role::Leader);
+}
+
 TEST_CASE("Every state a consensus tier applies reaches the shared-cache directory, host and upstream, in order",
           "[node][consensus][shared-cache]")
 {
@@ -918,6 +1038,7 @@ TEST_CASE("Every state a consensus tier applies reaches the shared-cache directo
         StartConsensusOrExplain(cfg,
                                 noScheduler,
                                 TestAdvertised(),
+                                TestRaftAdvertised(),
                                 Testing::TestKeyPair("n1"),
                                 membership,
                                 *Unwrap(roster),
@@ -1017,6 +1138,7 @@ TEST_CASE("Every applied state reaches where this node registers, so a voter's r
         StartConsensusOrExplain(cfg,
                                 noScheduler,
                                 TestAdvertised(),
+                                TestRaftAdvertised(),
                                 Testing::TestKeyPair("n1"),
                                 membership,
                                 *Unwrap(roster),
@@ -1069,6 +1191,7 @@ TEST_CASE("A leader counts its sends to a learner with no endpoint as a learner 
     auto started = ConsensusTier::Start(
         cfg,
         TestAdvertised(),
+        TestRaftAdvertised(),
         Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
@@ -1177,6 +1300,7 @@ TEST_CASE("A restarted leader counts its sends to a learner it has not re-applie
         return ConsensusTier::Start(
             cfg,
             TestAdvertised(),
+            TestRaftAdvertised(),
             Testing::TestKeyPair("n1"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [](Cluster::ClusterState const&) {},
@@ -1349,6 +1473,7 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         return ConsensusTier::Start(
             cfg,
             TestAdvertised(),
+            TestRaftAdvertised(),
             Testing::TestKeyPair("n1"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [published](Cluster::ClusterState const&) { published->fetch_add(1); },
@@ -1686,6 +1811,7 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
     auto started = ConsensusTier::Start(
         cfg,
         TestAdvertised(),
+        TestRaftAdvertised(),
         Testing::TestKeyPair("n2"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
@@ -1771,6 +1897,7 @@ TEST_CASE("Only a node that founded its cluster bootstraps it; one that joined a
         return ConsensusTier::Start(
             cfg,
             TestAdvertised(),
+            TestRaftAdvertised(),
             Testing::TestKeyPair("n2"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [](Cluster::ClusterState const&) {},
@@ -1872,6 +1999,7 @@ TEST_CASE("A node announces the seat its mode holds: a learner is never announce
         return ConsensusTier::Start(
             cfg,
             TestAdvertised(),
+            TestRaftAdvertised(),
             Testing::TestKeyPair("n2"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [](Cluster::ClusterState const&) {},
@@ -2055,6 +2183,7 @@ void StopTierOrExit(std::unique_ptr<ConsensusTier> tier, std::string_view who, C
     return ConsensusTier::Start(
         cfg,
         TestAdvertised(),
+        TestRaftAdvertised(),
         Testing::TestKeyPair(cfg.nodeId),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
@@ -2595,6 +2724,7 @@ TEST_CASE("A running tier hands its leader-contact observer the election timeout
     auto started = ConsensusTier::Start(
         cfg,
         TestAdvertised(),
+        TestRaftAdvertised(),
         Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
@@ -2664,6 +2794,7 @@ TEST_CASE("A learner started as main starts it names its leader's scheduling end
         StartConsensusOrExplain(fleet.joiner,
                                 noScheduler,
                                 joinerAdvertised,
+                                TestRaftAdvertised(),
                                 Testing::TestKeyPair("n2"),
                                 *membership,
                                 *Unwrap(roster),

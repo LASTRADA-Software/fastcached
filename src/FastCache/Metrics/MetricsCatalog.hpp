@@ -1173,10 +1173,11 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftInboundSessionsSuperseded,
       .prometheusName = "fastcache_raft_inbound_sessions_superseded_total",
-      .help = "Two-way Raft sessions a peer's newer session superseded: the same id proved a second session "
-              "while its first was still attached, and the first was closed. One per reconnect is a roaming "
-              "learner whose old connection had not yet been seen to end; a steady rate from one peer names two "
-              "machines holding one identity key -- a copied --cluster-dir -- taking the session from each other.",
+      .help = "Raft sessions a peer's newer session superseded: the same id proved a second session while its first was "
+              "still open, and the first was closed -- a two-way session by the transport, a one-way session by the "
+              "acceptor. One per reconnect is a roaming member whose old connection had not yet been seen to end; a "
+              "steady rate from one peer names two machines holding one identity key -- a copied --cluster-dir -- "
+              "taking the session from each other.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster,
       .prometheusName = "fastcache_worker_jobs_refused_lease_no_roster_total",
@@ -1473,6 +1474,16 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "at start: answered roster-not-yet-applied, and retried by the prover, rather than node-key-unknown. A "
               "few at every start are the boot order; a steady rise is a node that cannot elect or cannot hear its "
               "leader.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeEndpointChanges,
+      .prometheusName = "fastcache_node_endpoint_changes_total",
+      .help = "Times this node's advertised endpoint moved because the address it routes from changed or a reload "
+              "re-pinned it.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeRaftEndpointChanges,
+      .prometheusName = "fastcache_node_raft_endpoint_changes_total",
+      .help = "Times this node's advertised Raft endpoint moved because the address it routes from changed or a "
+              "reload re-pinned it.",
       .type = MetricType::Counter },
 } };
 

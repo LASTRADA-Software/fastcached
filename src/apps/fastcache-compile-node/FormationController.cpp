@@ -105,7 +105,8 @@ Wire::FleetSummary FormationController::CurrentLocked() const
         .leaderId = _leaderId,
         .leaderNodeEndpoint = _leaderNodeEndpoint,
         .nodeId = _self.nodeId,
-        .raftEndpoint = row.raftListener == Cluster::RaftListenerState::Open ? _self.raftEndpoint : std::string {},
+        .raftEndpoint =
+            row.raftListener == Cluster::RaftListenerState::Open ? _self.raftAdvertised.Current() : std::string {},
         .members = std::move(members),
         .memberTotal = total,
         .nodeEndpoint = StatedNodeEndpoint(_self.advertised.Current()),

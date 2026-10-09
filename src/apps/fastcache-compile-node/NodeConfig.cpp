@@ -380,6 +380,44 @@ namespace
         };
     }
 
+    /// The value `--advertise` / `--raft-self` take to say "derive it", which is also what
+    /// leaving either unset means.
+    constexpr std::string_view AdvertiseAutoWord = "auto";
+
+    /// The `--advertise` spelling that derives the host but states the port: `auto:<port>`.
+    constexpr std::string_view AdvertiseAutoPortPrefix = "auto:";
+
+    /// Whether @p value is one of the derived (`AdvertiseMode::Auto`) spellings.
+    /// @param value An `--advertise` or `--raft-self` value.
+    /// @return True for "", `auto`, and anything spelled `auto:<...>`.
+    [[nodiscard]] constexpr bool IsAutoAdvertise(std::string_view value) noexcept
+    {
+        return value.empty() || value == AdvertiseAutoWord || value.starts_with(AdvertiseAutoPortPrefix);
+    }
+
+    /// The port an `auto:<port>` value states.
+    /// @param value An `--advertise` value.
+    /// @return The port, or nullopt when @p value states none or one out of range.
+    [[nodiscard]] std::optional<std::uint16_t> AutoAdvertisePort(std::string_view value) noexcept
+    {
+        if (!value.starts_with(AdvertiseAutoPortPrefix))
+            return std::nullopt;
+        return ParseTcpPort(value.substr(AdvertiseAutoPortPrefix.size()));
+    }
+
+    /// A parse refusal of @p value, explained by @p why.
+    /// @param value The value refused.
+    /// @param why What is wrong with it.
+    /// @return The error.
+    [[nodiscard]] ConfigError AdvertiseValueError(std::string_view value, std::string_view why)
+    {
+        return ConfigError { .code = ConfigErrorCode::ParseError,
+                             .source = {},
+                             .line = 0,
+                             .field = {},
+                             .context = std::format("'{}' {}", value, why) };
+    }
+
     /// An `--advertise` value: text, and no longer than a scheduler records an endpoint.
     ///
     /// Both are asked by the parse for `ParseToolchain`'s reason: a scheduler refuses a
@@ -388,8 +426,13 @@ namespace
     /// one no resolver answers for, so nothing that worked is refused.
     /// @param sv The flag's value.
     /// @return `sv` verbatim, or why a scheduler would refuse it.
+    ///
+    /// `auto:<port>` is checked for a port in range here, because nothing downstream would: the
+    /// derivation would otherwise fall back to the bound port and advertise one nobody typed.
     [[nodiscard]] std::expected<std::string, ConfigError> ParseAdvertise(std::string_view sv)
     {
+        if (sv.starts_with(AdvertiseAutoPortPrefix) && !AutoAdvertisePort(sv).has_value())
+            return std::unexpected(AdvertiseValueError(sv, "is not auto:<port> with a port from 1 to 65535"));
         auto text = ParseUtf8Text(sv);
         if (text.has_value() && sv.size() > CompileCacheWire::MaxEndpointBytes)
             return std::unexpected(ConfigError { .code = ConfigErrorCode::ParseError,
@@ -402,6 +445,18 @@ namespace
                                                                         sv.size(),
                                                                         CompileCacheWire::MaxEndpointBytes) });
         return text;
+    }
+
+    /// A `--raft-self` value: a host, or `auto`, and never `auto:<port>` -- the port comes from
+    /// `--listen-raft`, so a port stated here would be one the node silently ignored.
+    /// @param sv The flag's value.
+    /// @return `sv` verbatim, or why it names a port.
+    [[nodiscard]] std::expected<std::string, ConfigError> ParseRaftSelf(std::string_view sv)
+    {
+        if (sv.starts_with(AdvertiseAutoPortPrefix))
+            return std::unexpected(
+                AdvertiseValueError(sv, "names a port, which --raft-self takes from --listen-raft: write auto"));
+        return ParseText(sv);
     }
 
     /// A `--toolchain` value, with the half that TRAVELS checked for being text.
@@ -974,18 +1029,22 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         {
             .primary = "--advertise",
             .arity = Arity::Value,
-            .operand = "=<host:port>",
+            .operand = "=<host:port|auto[:port]>",
             .apply = AssignFrom<&NodeConfig::advertise, ParseAdvertise>(),
             .explicitBit = &NodeConfig::advertiseExplicit,
             .description = "host:port CLIENTS should use to reach this worker.\n"
-                           "Defaults to this machine's fully qualified name on the\n"
-                           "--listen-node port while that binds the wildcard, and\n"
-                           "to --listen-node itself otherwise: the scheduler hands\n"
-                           "this string to clients verbatim, so a worker that\n"
-                           "advertises an address only it can reach is leased and\n"
-                           "then never answers. Reloadable: a node that learns its\n"
-                           "address late re-registers under the new one and\n"
-                           "retires the old entry.",
+                           "Default (auto): the address this machine routes from,\n"
+                           "on the --listen-node port while that binds the\n"
+                           "wildcard, re-derived when the network changes; its\n"
+                           "fully qualified name until a route is known; and\n"
+                           "--listen-node itself when that binds one address.\n"
+                           "auto:<port> derives the host and states the port. A\n"
+                           "literal IP pins it and turns roaming off. The\n"
+                           "scheduler hands this string to clients verbatim, so\n"
+                           "a worker that advertises an address only it can\n"
+                           "reach is leased and then never answers. Reloadable:\n"
+                           "a node that learns its address late re-registers\n"
+                           "under the new one and retires the old entry.",
             .yamlKey = "advertise",
             // Reloadable since #1279, and it is the flag the third classification list
             // exists for. `AddressReloadableFlags`: the registration has to move, the
@@ -1190,16 +1249,24 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         {
             .primary = "--raft-self",
             .arity = Arity::Value,
-            .operand = "=<host>",
-            .apply = AssignFrom<&NodeConfig::raftSelf, ParseText>(),
+            .operand = "=<host|auto>",
+            .apply = AssignFrom<&NodeConfig::raftSelf, ParseRaftSelf>(),
             .explicitBit = &NodeConfig::raftSelfExplicit,
             .description = "the host this node's peers dial it at; the port comes\n"
-                           "from --listen-raft. This machine's fully qualified\n"
-                           "name unless given. How a node names ITSELF when its\n"
-                           "identity was derived rather than typed. A bare\n"
-                           "--listen-raft binds the wildcard, so what this\n"
-                           "node binds is usually not what a peer can dial.",
+                           "from --listen-raft. Default (auto): the address this\n"
+                           "machine routes from, re-derived when the network\n"
+                           "changes, and its fully qualified name until a route\n"
+                           "is known. A literal IP pins it and turns roaming off.\n"
+                           "How a node names ITSELF when its identity was derived\n"
+                           "rather than typed. A bare --listen-raft binds the\n"
+                           "wildcard, so what this node binds is usually not what\n"
+                           "a peer can dial. Reloadable.",
             .yamlKey = "raft_self",
+            // Reloadable for `--advertise`'s reason, and on its list (`AddressReloadableFlags`):
+            // it moves the address peers dial, never what is served. Judged by the startup rules
+            // on reload too (`ValidateNodeReloadable`), so a save naming a host consensus cannot
+            // use is refused by name.
+            .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::raftSelf>(),
         },
         {
@@ -2756,6 +2823,23 @@ bool RunsConsensus(NodeConfig const& cfg) noexcept
     return !RowFor(NodeSurface::Raft).Resolve(cfg).empty();
 }
 
+namespace
+{
+    /// The host a WILDCARD bind is advertised under, by `AdvertisedEndpoint` and `RaftSelfEndpoint`
+    /// alike: the probed route host when the probe found one, else this machine's fully qualified
+    /// name once resolved, else nothing.
+    /// @param cfg The configuration, with its runtime facts applied.
+    /// @return The host, or empty when neither is known yet.
+    [[nodiscard]] std::string_view WildcardStandInHost(NodeConfig const& cfg) noexcept
+    {
+        if (cfg.routeHost.has_value() && !cfg.routeHost->empty())
+            return *cfg.routeHost;
+        if (cfg.hostNames.has_value())
+            return cfg.hostNames->fqdn;
+        return {};
+    }
+} // namespace
+
 std::string RaftSelfEndpoint(NodeConfig const& cfg)
 {
     // The PORT off the surface row, never off `cfg.raftListen`: a bare `--listen-raft`
@@ -2766,8 +2850,8 @@ std::string RaftSelfEndpoint(NodeConfig const& cfg)
     auto const& bindHost = bound.front().host;
     auto const port = bound.front().port;
 
-    // The flag's host whenever it was given.
-    if (!cfg.raftSelf.empty())
+    // The flag's host whenever it pins one; `auto` is the same as leaving it unset.
+    if (AdvertiseModeOf(cfg.raftSelf) != AdvertiseMode::Auto)
         return FormatHostPort(cfg.raftSelf, port);
 
     // Otherwise exactly `AdvertisedEndpoint`'s rule, for the same reason: **this machine's name
@@ -2779,8 +2863,8 @@ std::string RaftSelfEndpoint(NodeConfig const& cfg)
     // name to give.
     if (!IsWildcardHost(bindHost))
         return FormatHostPort(bindHost, port);
-    if (cfg.hostNames.has_value() && !cfg.hostNames->fqdn.empty())
-        return FormatHostPort(cfg.hostNames->fqdn, port);
+    if (auto const host = WildcardStandInHost(cfg); !host.empty())
+        return FormatHostPort(host, port);
     return {};
 }
 
@@ -2801,7 +2885,7 @@ std::expected<std::string, ConsensusDialGap> ConsensusDialAddressOf(NodeConfig c
     // Not stated yet rather than unstated: the host name it falls back to is resolved at
     // startup, and a parse or an install has not got there. Only a RESOLVED empty name is a
     // node that names itself neither way.
-    if (cfg.raftSelf.empty() && !cfg.hostNames.has_value())
+    if (AdvertiseModeOf(cfg.raftSelf) == AdvertiseMode::Auto && !cfg.hostNames.has_value())
         return std::unexpected { ConsensusDialGap::AwaitingHostName };
     return std::unexpected { ConsensusDialGap::Unstated };
 }
@@ -2812,7 +2896,7 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     // `MakeWorkerLeaseValidator` and to the heartbeat's REGISTER, and the refusals
     // below judge it -- so the three consumers of this endpoint cannot disagree about
     // what it is. This expression once stood character-for-character in `main.cpp` too.
-    if (!cfg.advertise.empty())
+    if (AdvertiseModeOf(cfg.advertise) != AdvertiseMode::Auto)
         return cfg.advertise;
 
     // The fallback is the `Node` surface, which is where a dispatched compile now
@@ -2837,20 +2921,59 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     //
     // A name that reaches only this machine is withheld (`AdvertisedNameWithheld`), and then
     // NOTHING is advertised: the wildcard would send a client to itself, and so would the name.
-    if (IsWildcardHost(node.front().host) && cfg.hostNames.has_value() && !cfg.hostNames->fqdn.empty())
-        return FormatHostPort(cfg.hostNames->fqdn, node.front().port);
+    //
+    // The probed route host (`routeHost`) stands in ahead of the name: it is the address this
+    // machine actually routes from, and it follows the network when that changes. `auto:<port>`
+    // keeps the derivation and states the port.
+    auto const port = AutoAdvertisePort(cfg.advertise).value_or(node.front().port);
+    if (IsWildcardHost(node.front().host))
+        if (auto const host = WildcardStandInHost(cfg); !host.empty())
+            return FormatHostPort(host, port);
 
     // A withheld name is offered to no peer. A scheduler on THIS machine reaches the wildcard
-    // bind at loopback, so that is what it is told; one elsewhere is told nothing, and the start
-    // refuses it by name (`WorkerNameReachesOnlyThisMachineRefusal`).
+    // bind at loopback, so that is what it is told -- at the port the node BINDS, since an
+    // `auto:<port>` override names a port mapped in front of it for other machines; one elsewhere
+    // is told nothing, and the start refuses it by name (`WorkerNameReachesOnlyThisMachineRefusal`).
     if (AdvertisedNameWithheld(cfg))
         return SchedulerIsRemote(cfg) ? std::string {} : FormatHostPort(ThisMachineLoopbackHost, node.front().port);
-    return FormatHostPort(node.front().host, node.front().port);
+    return FormatHostPort(node.front().host, port);
+}
+
+namespace
+{
+    /// What each `AdvertiseMode` promises, in enumerator order.
+    constexpr auto AdvertiseModeRows = EnumTable<AdvertiseMode, AdvertiseModeRow> { {
+        { .mode = AdvertiseMode::Auto,
+          .followsRoute = true,
+          .describe = "derived: the bound address when it names one, else the address this machine routes from, "
+                      "re-derived when the network changes" },
+        { .mode = AdvertiseMode::PinnedName,
+          .followsRoute = false,
+          .describe = "pinned to the name the operator typed, which peers resolve themselves" },
+        { .mode = AdvertiseMode::PinnedLiteral,
+          .followsRoute = false,
+          .describe = "pinned to the IP address the operator typed; roaming is off" },
+    } };
+    static_assert(RowsInEnumeratorOrder(AdvertiseModeRows, &AdvertiseModeRow::mode),
+                  "AdvertiseModeRows must hold one row per AdvertiseMode, in enumerator order");
+} // namespace
+
+AdvertiseModeRow const& AdvertiseModeRowFor(AdvertiseMode mode) noexcept
+{
+    return AdvertiseModeRows.at(static_cast<std::size_t>(mode));
+}
+
+AdvertiseMode AdvertiseModeOf(std::string_view value) noexcept
+{
+    if (IsAutoAdvertise(value))
+        return AdvertiseMode::Auto;
+    return IsIpLiteralHost(HostOfEndpoint(value)) ? AdvertiseMode::PinnedLiteral : AdvertiseMode::PinnedName;
 }
 
 bool AdvertisedNameWithheld(NodeConfig const& cfg)
 {
-    if (!cfg.advertise.empty() || !cfg.hostNames.has_value() || cfg.hostNames->withheld.empty())
+    if (AdvertiseModeOf(cfg.advertise) != AdvertiseMode::Auto || cfg.routeHost.has_value() || !cfg.hostNames.has_value()
+        || cfg.hostNames->withheld.empty())
         return false;
     auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
     return !node.empty() && IsWildcardHost(node.front().host);
@@ -2877,7 +3000,8 @@ std::string DescribeAdvertisedEndpoint(NodeConfig const& cfg)
 
 bool ConsensusNameWithheld(NodeConfig const& cfg)
 {
-    if (!cfg.raftSelf.empty() || !cfg.hostNames.has_value() || cfg.hostNames->withheld.empty())
+    if (AdvertiseModeOf(cfg.raftSelf) != AdvertiseMode::Auto || cfg.routeHost.has_value() || !cfg.hostNames.has_value()
+        || cfg.hostNames->withheld.empty())
         return false;
 
     // Only a WILDCARD bind would have taken the name (`RaftSelfEndpoint`). Parsed off the row's
@@ -2939,7 +3063,7 @@ bool DiscoveryAnnouncesOnlyThisMachine(NodeConfig const& cfg)
 
 bool AdvertisedNameAwaited(NodeConfig const& cfg)
 {
-    if (!cfg.advertise.empty() || cfg.hostNames.has_value())
+    if (AdvertiseModeOf(cfg.advertise) != AdvertiseMode::Auto || cfg.hostNames.has_value() || cfg.routeHost.has_value())
         return false;
     auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
     return !node.empty() && IsWildcardHost(node.front().host);
@@ -3395,10 +3519,12 @@ bool AdvertisedNameAwaited(NodeConfig const& cfg)
     for (auto const& endpoint: RowFor(NodeSurface::Node).Resolve(cfg))
         if (!IsWildcardHost(endpoint.host))
             own.push_back(endpoint.host);
-    if (!cfg.advertise.empty())
+    if (AdvertiseModeOf(cfg.advertise) != AdvertiseMode::Auto)
         own.emplace_back(HostOfEndpoint(cfg.advertise));
     if (cfg.hostNames.has_value() && !cfg.hostNames->fqdn.empty())
         own.push_back(cfg.hostNames->fqdn);
+    if (cfg.routeHost.has_value())
+        own.push_back(*cfg.routeHost);
 
     return std::ranges::any_of(SchedulersOf(cfg, AsConfigured), [&own](std::string const& scheduler) {
         auto const endpoint = SplitHostPort(scheduler);
@@ -3949,7 +4075,10 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // A ROW rather than a check in a tier, for this table's standing reason:
         // `--install-service` returns long before any tier exists, so a registration
         // would otherwise bake the typo in and replay it at every boot.
-        { .refuses = [](NodeConfig const& c) { return !c.advertise.empty() && !ParseDialEndpoint(c.advertise).has_value(); },
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return AdvertiseModeOf(c.advertise) != AdvertiseMode::Auto && !ParseDialEndpoint(c.advertise).has_value();
+              },
           .message = "--advertise is not an address clients can dial: it must be host:port (or [v6]:port), with a "
                      "host that names a machine and a port in range. A worker whose advertised address does not "
                      "parse registers, heartbeats, is leased out, and is never reached -- with no error at either "
@@ -4084,13 +4213,19 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // First the configuration no record shaped. Its mode is UNKNOWN, so the row names the mode
         // and no flag. A READING that refused is answered by the first row of this table; what
         // reaches this one is a configuration nothing tried to shape.
-        { .refuses = [](NodeConfig const& c) { return !c.raftSelf.empty() && !c.formation.has_value(); },
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return AdvertiseModeOf(c.raftSelf) != AdvertiseMode::Auto && !c.formation.has_value();
+              },
           .explain = RaftSelfWithNoModeRefusal },
         // Then the one a record shaped: its mode opens the consensus port and an empty
         // `--listen-raft=` closed it -- which is the only way left, since a mode that opens no
         // port (a learner's) runs consensus by dialling, and a malformed address is answered by
         // the surface-grammar walk above, echoing what was typed.
-        { .refuses = [](NodeConfig const& c) { return !c.raftSelf.empty() && c.formation.has_value() && !RunsConsensus(c); },
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return AdvertiseModeOf(c.raftSelf) != AdvertiseMode::Auto && c.formation.has_value() && !RunsConsensus(c);
+              },
           .message = RaftSelfWithConsensusClosedRefusal },
         // The other half of the same flag group: the cluster's addresses given with
         // the switch that turns consensus on left off. `--cluster-dir` is deliberately

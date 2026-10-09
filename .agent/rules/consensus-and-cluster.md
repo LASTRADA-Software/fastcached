@@ -581,6 +581,40 @@ simpler design gets wrong.
     the backoff above. A voter that is not leading writes a learner nothing, so those sessions end at
     the bound too: one handshake per voter per backoff cycle, the stated price.
 
+- **The newest ONE-WAY session per proven dialler wins; the acceptor closes the one it
+  supersedes** (`OpenConnections::oneWay`, `NewestOneWaySession` in `RaftPeerServer.cpp`). A
+  dialler holds one outbound session per peer, so an older one-way session from the same proven
+  id is a path that vanished -- a voter whose address moved closes its sessions and redials
+  (`RaftPeerTransport::ResetSessions`). Nothing else ends it: the acceptor reads no EOF from a
+  path that is gone, and it arms no idle bound on a one-way session, because follower-to-follower
+  sessions are legitimately silent. Without the supersede every move parks a stale session against
+  `maxConnections` (64), and a member that roams often enough fills the listener and is refused
+  `Full` by its own peers.
+  - **"Newest" is the newest PROOF, never the newest dial.** A dial the dialler abandoned at its
+    handshake bound can have its proof judged after the redial's, and then supersedes the live
+    session; the abandoned socket ends at the dialler's FIN and the dialler redials once the live
+    one closes -- one spurious supersede and one redial. Do not "fix" it by comparing dial times:
+    the acceptor cannot know them, and the proof is the only thing about a connection it can trust.
+  - **The entry is erased by the session's own end, and only while it still NAMES that session.**
+    Never erased, the map would name a freed socket and the next proof of that id would close
+    freed memory -- the ordinary path, a dialler that restarted cleanly. Erased by id alone, a
+    superseded session ending late would forget its successor. The close happens outside the map's
+    lock (an in-memory close resumes the superseded task inline, and its guard takes that lock).
+  - **Counted on the transport's two-way row, `RaftInboundSessionsSuperseded`, and logged at its
+    level, Info**, because the reading is the same: one per reconnect is a roaming member, a steady
+    rate two machines sharing one key. One counter has one level, so a cloned pair shows in default
+    logs whichever direction its sessions run.
+  - **Two machines holding ONE identity key take the one-way session from each other on every
+    redial**, where both sessions used to coexist. An accepted cost, and the same position as a
+    copied state directory (*A state directory copied to a second machine copies the node, and that
+    is NOT refused*, below): nothing here can tell a clone from a move at one event, so the
+    counter's steady RATE is the signal and no condition claims a clone from it.
+  - Only a proof of the id can supersede, so a stranger cannot close a member's session. Two-way
+    sessions are not in the map -- the transport's `Attach` supersedes those by id.
+    `RaftPeerLink_test` ("A second one-way session from the same member supersedes the first",
+    "One-way sessions from different members coexist", "A member's session that ended on its own
+    is not superseded when it redials").
+
 - **The acceptor goes first because its port is the surface anybody can reach.** It signs
   nothing until the other end has proved an id, so a stranger who connects learns a nonce
   and an ephemeral public key and nothing else. The dialler signs only for an address it
@@ -1088,6 +1122,10 @@ and it is recorded here because the question will be asked again.
     an operator meets the directory, and that resolution never mints for an invocation
     that only asks a question (`--print-surfaces`, a cluster verb, `--uninstall-service`)
     -- a flag whose own comment says it changes nothing must keep saying so.
+    **Its accepted cost on the Raft wire:** the two copies take each other's sessions on every
+    redial -- two-way at the transport's `Attach`, one-way at the acceptor (*The newest ONE-WAY
+    session per proven dialler wins*, under The Raft peer wire) -- and the steady rate of
+    `raft_inbound_sessions_superseded`, logged at Info, is how it shows.
 - **The hostname is a LABEL on the fleet page and decides nothing.** It reaches the
   leader on REGISTER's nested capacity record, beside `version` and for the same arity
   reason, and renders as a `name` column. Nothing keys on it, routes by it, admits by it
@@ -1855,6 +1893,49 @@ and it is recorded here because the question will be asked again.
       announcement, a leader's own word -- states none in its place. Three routes with three
       filters had recorded a loopback member the join route refused, and a resolver sent there
       reaches ITSELF with no error at either end.
+    - **An announced move also moves a COUPLED member's Raft endpoint -- the host-coupling
+      rule** (`Cluster::CoupledRaftEndpoint`). A NODE-ANNOUNCE carries the `0xFC` endpoint
+      alone, and adding a field is a fleet flag day, while a voter whose address moved and
+      whose Raft endpoint did not is unreachable for good: peers dial the old address, and its
+      replies ride their dials. So when a member's recorded Raft host and recorded `0xFC` host
+      are ONE host and its seat is DIALLED, the leader moves the Raft host to the announced one,
+      on the recorded Raft port. `auto` advertises one routed address for both, so every
+      default voter is coupled; a node that pins `--raft-self` and `--advertise` apart said
+      where each answers and is never coupled, and a learner's leftover Raft endpoint is
+      nobody's to dial and is never moved. A moved node resets its own sessions
+      (`RaftPeerTransport::ResetSessions`) so its senders redial instead of writing into dead
+      paths; the acceptor's half is *the newest ONE-WAY session per proven dialler wins*, under
+      The Raft peer wire.
+      - **A discovery desire can never move a coupled member's Raft HOST**
+        (`Cluster::WithCoupledRaftEndpointsKept`, at the decision). Discovery re-publishes its
+        whole authenticated set whenever any peer proves itself, a roamed voter's PRE-move
+        beacon included, and a beacon cannot be ordered against an announcement: the leader
+        re-proposed the old Raft endpoint over a committed coupled move and left the record
+        DECOUPLED for good. Holding the desire (rather than refusing at the decision) did not
+        work, because the next republish overwrote it -- the shape *a forget outranks an
+        observation* already names. A same-host port change, an uncoupled member and a member
+        the state does not record pass. `AnnouncedEndpoints_test` ("Discovery's stale Raft host
+        for a coupled member yields to the record, and nothing else does"), and
+        `MembershipCluster_test` ("A coupled move stays committed under a new leader that holds
+        the stale discovery desire").
+      - **Accepted, and stated so nobody files them as defects:** a `--raft-self` reload onto
+        a host OTHER than the `0xFC` address is not adopted from a follower's beacon -- the
+        record still couples the member, so its Raft host moves only with an announced `0xFC`
+        move (to the ANNOUNCED host) or by its own self desire while it leads; hosts compare
+        by SPELLING, case included (`SameHost`), so `Office.lan` and `office.lan` are two hosts
+        and the member reads as uncoupled -- the safe direction, since an uncoupled member
+        moves nothing it should not; and a LEARNER whose address moves resets nothing, because
+        it dials in and its redial backoff finds the voters from wherever it now is.
+      - **The move is RECORDED by a commit, so it heals only while the voters that did not move
+        are a quorum** ([#1644](https://github.com/LASTRADA-Software/fastcached/issues/1644)). The moved voter reaches the leader through any voter
+        that did not move (its own scheduler hears no leader -- `AppliedSchedulers` walks the
+        recorded voters after it), and the leader re-records it; but `LearnMembers` dials only
+        committed endpoints and a beacon cannot move a coupled host, so nothing ELSE re-addresses
+        a member. A two-voter fleet where either moves, and a majority renumbered at once (a router
+        replacement, a DHCP scope change), commit nothing and stay apart. Before `auto`, records
+        held names and DNS healed both. The docs state the limit and the operator's way out: three
+        or more voters moved one at a time, or names pinned on always-on voters; once it has
+        happened, old addresses back for a quorum, then one move at a time.
   - **`--cluster-admit` is the counterpart `--cluster-forget` never had.** Nothing
     could put a member *into* the replicated state without `--discovery`, so a typed
     fleet could shrink and never grow. It carries `<id>=<host>:<port>` — the same
@@ -2389,6 +2470,12 @@ right, because the wire now trusts it.
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
 
+- **[#1644](https://github.com/LASTRADA-Software/fastcached/issues/1644)** — a voter move that leaves the voters that did not
+  move without a quorum (a two-voter fleet, or a majority renumbered at once) does not heal by
+  itself: the new address is recorded only by a commit, and nothing else re-addresses a recorded
+  member. What is left is a recovery that needs no quorum without the moved voters -- for
+  example a PROVEN self-announcement re-addressing a peer's transport before the commit --
+  without letting a stale beacon revert a committed coupled address (#1528).
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a
   follower answering `/fleet` names the leader but cannot link to it, because
   where a dashboard is served is local configuration and any URL it built would be

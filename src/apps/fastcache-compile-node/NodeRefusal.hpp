@@ -32,7 +32,7 @@ namespace FastCache::Node
 enum class NodeRefusalCause : std::uint8_t
 {
     EarlierRule,         ///< A rule the startup table, `main` or an option parser answers first.
-    HandedOverListeners, ///< The listeners a supervisor handed over, against `--advertise`.
+    HandedOverListeners, ///< The listeners a supervisor handed over, and where they are bound.
     CredentialFile,      ///< A credential file a flag names that was read, and holds nothing.
     LeaseValidation,     ///< How this worker would check a lease, against how it is reached.
     ConsensusState,      ///< A Raft state this build cannot read.
@@ -60,7 +60,7 @@ inline constexpr auto NodeRefusalCauses = EnumTable<NodeRefusalCause, NodeRefusa
     { .cause = NodeRefusalCause::EarlierRule, .exit = ProcessExit::Refused, .reads = "the configuration" },
     { .cause = NodeRefusalCause::HandedOverListeners,
       .exit = ProcessExit::Refused,
-      .reads = "the socket unit that handed the listeners over, and --advertise" },
+      .reads = "the socket unit that handed the listeners over, and where they are bound" },
     { .cause = NodeRefusalCause::CredentialFile,
       .exit = ProcessExit::Refused,
       .reads = "the bytes of a file the operator named" },
