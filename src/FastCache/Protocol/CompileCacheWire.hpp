@@ -6767,11 +6767,13 @@ struct NodeRuntimeFields
     /// reads exactly like an idle fleet.
     std::optional<WireSchedulerRole> schedulerRole {};
 
-    /// Where the leader answers, or empty when no leader is known.
+    /// Where the leader answers, or empty when this node names no leader.
     ///
-    /// Empty is a READING only on a node that runs consensus, where it means an election
-    /// in progress (`Undecided`) or a learner whose leader has been silent past the
-    /// election timeout (#1641). Which kind of node sent it is said beside it, not here:
+    /// Empty is a READING only on a node that runs consensus, and what it says depends on
+    /// the node: beside role `Leader`, that THIS node is the leader, since a leader names
+    /// no other; beside `Undecided`, an election in progress; on a learner, that it has
+    /// heard from no leader yet, or that its leader has been silent past the election
+    /// timeout (#1641). Which kind of node sent it is said beside it, not here:
     /// the `Consensus` component bit or a scheduler role (the client's
     /// `Cli::ReportsConsensus` asks exactly that), and a learner reports this field with
     /// no role at all, since it runs no scheduler. On a node running no consensus the

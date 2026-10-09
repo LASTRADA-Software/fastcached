@@ -435,10 +435,10 @@ Beside them, what that worker is offering and whether anyone knows about it:
   `voter`, `learner`, `no-cluster` (waiting to be admitted) or `outsider` (its
   configuration names others and not it). This field, not `scheduler-role`, says whether
   the node stands for election when the leader goes: a node recorded as a voter that
-  consensus has not counted yet, because it has not caught up
-  ([#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)), reports
+  consensus does not count until it is dialable and has caught up
+  ([#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)) reports
   `follower` beside a `learner` standing, exactly as a following voter's role reads. A
-  node that joined as a learner runs no scheduler and reports no role at all. A node
+  node still seated as a learner runs no scheduler and reports no role at all. A node
   running no consensus reports no such field.
 - **`roster-version`, `roster-voters`, `roster-revoked`** — the roster this node checks
   lease grants against ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)):
