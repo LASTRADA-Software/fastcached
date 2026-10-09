@@ -419,7 +419,16 @@ Beside them, what that worker is offering and whether anyone knows about it:
   empty and reads exactly like an idle fleet. `undecided` means an election is in
   progress, so a node running **no** scheduler reports no role at all rather than
   claiming to be in one; an `undecided` node reports the `leader` cell as absent,
-  because no leader is known yet.
+  because no leader is known yet. The leader itself names no other leader, and reports
+  `leader` as `this node`, the spelling the `node` panel draws
+  ([#1647](https://github.com/LASTRADA-Software/fastcached/issues/1647)). So in JSON
+  `leader` is a `host:port` endpoint, the string `"this node"`, or `null` when no leader
+  is named. A node that runs consensus and no scheduler — a
+  learner — reports no role but still reports `leader`: the leader's scheduling endpoint
+  it redirects launchers to, read from the same place the redirect is
+  ([#1641](https://github.com/LASTRADA-Software/fastcached/issues/1641)), and absent while
+  it has heard from no leader within the election timeout. A node running no consensus
+  reports neither field.
 - **`consensus-endpoint`** — the `host:port` this node's consensus peers DIAL it at,
   which is the half of `--cluster-admit`'s receipt to compare against. Not `raft-port`,
   which is the port the node BOUND, on an address that is routinely the wildcard. It is
@@ -428,9 +437,13 @@ Beside them, what that worker is offering and whether anyone knows about it:
   A node running no consensus reports no such field rather than an empty one.
 - **`consensus-standing`** — which set consensus counts this node in right now:
   `voter`, `learner`, `no-cluster` (waiting to be admitted) or `outsider` (its
-  configuration names others and not it). A learner and a following voter report the
-  same `scheduler-role`, and only one of them stands for election when the leader
-  goes. A node running no consensus reports no such field.
+  configuration names others and not it). This field, not `scheduler-role`, says whether
+  the node stands for election when the leader goes: a node recorded as a voter that
+  consensus does not count until it is dialable and has caught up
+  ([#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)) reports
+  `follower` beside a `learner` standing, exactly as a following voter's role reads. A
+  node still seated as a learner runs no scheduler and reports no role at all. A node
+  running no consensus reports no such field.
 - **`roster-version`, `roster-voters`, `roster-revoked`** — the roster this node checks
   lease grants against ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)):
   which one, how many voters sign grants under it, and how many keys the cluster revoked.

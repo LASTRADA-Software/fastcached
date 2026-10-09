@@ -8,6 +8,7 @@
 #include "NodeConditions.hpp"
 #include "NodeMachineStanding.hpp"
 #include "NodeRoster.hpp"
+#include "SchedulingRedirect.hpp"
 #include "SharedCacheStatus.hpp"
 
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -542,6 +543,16 @@ struct NodeRuntimeSources
     /// where that configuration names one at all, so a node running no consensus, or one that dials
     /// in, still reports the field ABSENT.
     Cc::IAdvertisedEndpointSource const* raftEndpoint { nullptr };
+
+    /// Where the leader this node redirects scheduling to answers (#1641); set only on a node
+    /// that redirects scheduling (`Node::RedirectsScheduling`), null everywhere else.
+    ///
+    /// The SAME object `SchedulingRedirectResponder` reads, so NODE-STATUS names exactly the leader
+    /// a redirected launcher is sent to, and empty exactly while the redirect names nobody -- two
+    /// sources would be two answers to *where is my leader* that can disagree. Only the leader
+    /// endpoint is read through it: `schedulerRole` stays ABSENT on such a node, because it runs no
+    /// scheduler, and absence is the truth there rather than a role it does not hold.
+    ISchedulingLeaderSource const* schedulingLeader { nullptr };
 };
 
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.

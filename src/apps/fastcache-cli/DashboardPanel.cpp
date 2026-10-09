@@ -1289,16 +1289,6 @@ namespace
         return in.model->carriedNodeStatus.has_value() ? &*in.model->carriedNodeStatus : nullptr;
     }
 
-    /// Whether @p status is of a node running consensus: its component, or a role only a scheduler reports.
-    /// @param status The status, or nullptr.
-    /// @return False before a status was read.
-    [[nodiscard]] bool RunsConsensus(CompileCacheWire::NodeStatusFields const* status) noexcept
-    {
-        return status != nullptr
-               && ((status->components & CompileCacheWire::NodeComponentBit::Consensus) != 0
-                   || status->runtime.schedulerRole.has_value());
-    }
-
     /// @p value written, or the absent marker for a node that did not say.
     /// @param in The frame's inputs.
     /// @param value The number.
@@ -1511,9 +1501,6 @@ namespace
         return fact;
     }
 
-    /// What a leading node's `leader` reads: it names no endpoint because it is the leader.
-    constexpr std::string_view SelfLeader = "this node";
-
     /// What renders one status fact.
     struct StatusFactSpec
     {
@@ -1576,7 +1563,7 @@ namespace
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
               // Whether the line applies is what the node last said it runs; the role is what it says now, the marker
               // beside a gap.
-              if (!RunsConsensus(CarriedStatusOf(in)))
+              if (!ReportsConsensus(CarriedStatusOf(in)))
                   return std::nullopt;
               auto const* status = StatusOf(in);
               if (status == nullptr || !status->runtime.schedulerRole.has_value())
@@ -1589,24 +1576,20 @@ namespace
               // Empty is a READING -- no leader is known -- so it is the marker, on the line the role is on. Except on
               // the leader itself, which names nobody because it is the one: it says so rather than drawing the
               // marker for the one fact it knows best.
-              if (!RunsConsensus(CarriedStatusOf(in)))
+              if (!ReportsConsensus(CarriedStatusOf(in)))
                   return std::nullopt;
               auto const* status = StatusOf(in);
               if (status == nullptr)
                   return Said(std::string { in.absent });
-              auto const& runtime = status->runtime;
-              if (!runtime.leaderEndpoint.empty())
-                  return Said(runtime.leaderEndpoint);
-              if (runtime.schedulerRole == CompileCacheWire::WireSchedulerRole::Leader)
-                  return Said(std::string { SelfLeader });
-              return Said(std::string { in.absent });
+              auto leader = NamedLeader(*status);
+              return Said(leader.has_value() ? std::move(*leader) : std::string { in.absent });
           } },
         { .fact = StatusFact::DialledAt,
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
               // The address the admission receipt asks an operator to compare, as the node states it -- not the raft
               // BIND, which under a bare `--listen-raft` is the wildcard (#1418). Disengaged on a node that runs
               // consensus is a build older than the field (#1328), so it is the marker, never a blank.
-              if (!RunsConsensus(CarriedStatusOf(in)))
+              if (!ReportsConsensus(CarriedStatusOf(in)))
                   return std::nullopt;
               auto const* status = StatusOf(in);
               if (status == nullptr || !status->runtime.consensusEndpoint.has_value())
