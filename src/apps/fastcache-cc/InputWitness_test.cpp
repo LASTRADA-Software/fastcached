@@ -14,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -292,6 +293,22 @@ TEST_CASE("Every verdict decides the STORE and the manifest exactly", "[input-wi
     CHECK(DescribeInstability({ .stability = InputStability::MovedDuringCompile, .path = "/r/a.cpp" })
           == "an input changed during the compile: /r/a.cpp");
     CHECK(DescribeInstability({ .stability = InputStability::Stable, .path = "" }).empty());
+}
+
+TEST_CASE("Only a row that allows the STORE yields a permit for it", "[input-witness][1650]")
+{
+    // The object STORE takes a `StorePermit` by value, and this is the only factory: so every
+    // verdict but `Stable`, and the row for a value that is no verdict, must yield none.
+    CHECK(PermitStore(RowOf(InputStability::Stable)).has_value());
+    CHECK_FALSE(PermitStore(RowOf(InputStability::MovedDuringCompile)).has_value());
+    CHECK_FALSE(PermitStore(RowOf(InputStability::MovedBeforeKey)).has_value());
+    CHECK_FALSE(PermitStore(RowOf(InputStability::Unwitnessed)).has_value());
+    CHECK_FALSE(PermitStore(RowOf(InputStability::Last)).has_value());
+    CHECK_FALSE(PermitStore(UnknownStabilityRow).has_value());
+    // Spent, not shared: a permit cannot be copied, and nothing but `PermitStore` makes one.
+    STATIC_CHECK_FALSE(std::is_copy_constructible_v<StorePermit>);
+    STATIC_CHECK(std::is_move_constructible_v<StorePermit>);
+    STATIC_CHECK_FALSE(std::is_default_constructible_v<StorePermit>);
 }
 
 TEST_CASE("The witnessed content answers keyed hashes, and guards a late path by the clock", "[input-witness][1650]")

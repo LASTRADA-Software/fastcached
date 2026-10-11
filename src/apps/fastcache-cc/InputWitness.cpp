@@ -19,6 +19,13 @@ StabilityRow const& RowOf(InputStability stability) noexcept
     return index < StabilityTable.size() ? StabilityTable[index] : UnknownStabilityRow;
 }
 
+std::optional<StorePermit> PermitStore(StabilityRow const& row) noexcept
+{
+    if (row.store != StoreObject::Yes)
+        return std::nullopt;
+    return StorePermit {};
+}
+
 std::string DescribeInstability(StabilityFinding const& finding)
 {
     if (finding.stability == InputStability::Stable)

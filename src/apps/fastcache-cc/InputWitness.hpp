@@ -112,6 +112,32 @@ inline constexpr StabilityRow UnknownStabilityRow { .stability = InputStability:
 /// @return Its row; `UnknownStabilityRow` for a value that is not a verdict.
 [[nodiscard]] StabilityRow const& RowOf(InputStability stability) noexcept;
 
+class StorePermit;
+
+/// @param row The verdict's row.
+/// @return A permit when the row allows the object STORE (`StoreObject::Yes`); nullopt otherwise.
+[[nodiscard]] std::optional<StorePermit> PermitStore(StabilityRow const& row) noexcept;
+
+/// What the object STORE takes, by value, so it cannot run without a verdict that allows it
+/// (#1650). Only `PermitStore` makes one, and only for an allowing row: the guard is folded INTO
+/// the operation rather than called beside it, which is what makes it self-enforcing -- a STORE
+/// reached on a path that skipped the verdict does not build. Move-only, so a permit is spent
+/// rather than shared.
+class StorePermit
+{
+  public:
+    StorePermit(StorePermit const&) = delete;
+    StorePermit& operator=(StorePermit const&) = delete;
+    StorePermit(StorePermit&&) noexcept = default;
+    StorePermit& operator=(StorePermit&&) noexcept = default;
+    ~StorePermit() = default;
+
+  private:
+    StorePermit() = default;
+
+    friend std::optional<StorePermit> PermitStore(StabilityRow const& row) noexcept;
+};
+
 /// A verdict and the path it is about.
 struct StabilityFinding
 {

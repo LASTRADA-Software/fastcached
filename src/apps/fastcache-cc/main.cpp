@@ -2255,15 +2255,15 @@ void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
 /// @param cfg            Launcher config; a manifest is recorded only in direct mode.
 /// @param moved          The witness's verdict after the compile.
 /// @param recordManifest Records the manifest from the keyed content; answers whether it did.
-/// @return Whether the object may be stored.
-[[nodiscard]] Cc::StoreObject GuardStore(InvocationRecord& record,
-                                         Config const& cfg,
-                                         Cc::StabilityFinding const& moved,
-                                         std::invocable auto const& recordManifest)
+/// @return The permit `StoreCompiledObject` takes when the object may be stored; nullopt otherwise.
+[[nodiscard]] std::optional<Cc::StorePermit> GuardStore(InvocationRecord& record,
+                                                        Config const& cfg,
+                                                        Cc::StabilityFinding const& moved,
+                                                        std::invocable auto const& recordManifest)
 {
     auto const& row = Cc::RowOf(moved.stability);
-    if (row.store == Cc::StoreObject::Yes)
-        return Cc::StoreObject::Yes;
+    if (auto permit = Cc::PermitStore(row))
+        return permit;
     auto const keepsManifest = cfg.direct && row.manifest == Cc::KeepManifest::Yes;
     record.outcome = row.outcome; // INPUTS-MOVED for a moved input, UNCACHEABLE for an unobservable one (Ruling 10)
     // The row's FIXED sentence, never the path: `--show-stats` tallies this detail, and a path in it
@@ -2277,7 +2277,83 @@ void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
         manifestNote = recordManifest() == ManifestRecorded::Yes ? "; manifest recorded from the keyed content"
                                                                  : "; no manifest recorded";
     Note(record.verbose, std::format("{}; compiled, not stored{}", Cc::DescribeInstability(moved), manifestNote));
-    return Cc::StoreObject::No;
+    return std::nullopt;
+}
+
+/// The object STORE after a miss, behind its root-bound marker when the object names a root.
+///
+/// Takes the input witness's `Cc::StorePermit` by value (the unnamed first parameter), so no path
+/// reaches it without a verdict that allows the STORE (#1650): the guard is folded into the
+/// operation rather than called beside it.
+/// @param record    The invocation record.
+/// @param cfg       Launcher config.
+/// @param key       The object's portable key.
+/// @param object    The fresh object, which `PlanStore` reads for the roots it names.
+/// @param encoded   The encoded compile value to store.
+/// @param checkout  This checkout's roots.
+/// @param metMarker The marker the fetch met at the portable key, if any.
+void StoreCompiledObject(Cc::StorePermit /*permit*/,
+                         InvocationRecord& record,
+                         Config const& cfg,
+                         std::string const& key,
+                         std::span<std::byte const> object,
+                         std::span<std::byte const> encoded,
+                         Cc::CheckoutRoots const& checkout,
+                         std::optional<Cc::CheckoutParts> const& metMarker)
+{
+    // WHERE the object goes is read off the object, and this is the one place that can:
+    // it holds both the fresh object -- compiled here or returned by a worker, which is
+    // why a dispatched compile needs nothing of its own -- and the roots it would name.
+    // An object naming neither root is stored as it always was and keeps every
+    // cross-checkout hit it ever had. One naming a root is keyed apart under the roots,
+    // behind a marker at the portable key, so another checkout following the marker
+    // MISSES rather than being served a `__FILE__` or a `source_location` naming this
+    // one; see RootBinding.hpp for the whole of it and for why the scan errs broad.
+    //
+    // The marker is stored FIRST: between the two stores, a reader in another checkout
+    // then misses rather than being served whatever the portable key held before.
+    auto const plan = Cc::PlanStore(key, object, checkout, metMarker);
+    if (plan.markerKey.has_value())
+    {
+        Note(record.verbose,
+             std::format("root-bound object (it {}); storing it under key={} behind a marker at key={}",
+                         plan.scan.evidence,
+                         plan.objectKey,
+                         *plan.markerKey));
+        auto const marker = Cc::EncodeRootBoundMarker(plan.scan.parts);
+        StoreRaw(record,
+                 cfg.addr,
+                 cfg,
+                 *plan.markerKey,
+                 std::string_view { reinterpret_cast<char const*>(marker.data()), marker.size() });
+    }
+
+    // Best-effort store: a failure here must never fail the build (the compile
+    // already succeeded). Surface the outcome under verbose so store rejections
+    // (e.g. a value over the server's --storage-max-value) are diagnosable — and
+    // now with the daemon's own reason, which the bare acknowledgement byte the
+    // old framing carried could never express. An unreachable daemon lands here as
+    // a transport failure, which reads the same way it always did.
+    auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
+    auto const outcome = CacheExchange(record,
+                                       "store",
+                                       cfg.addr,
+                                       Wire::EncodeStore(Wire::StoreRequest { .key = plan.objectKey,
+                                                                              .prefetchGroup = cfg.prefetchGroup,
+                                                                              .srcRoot = cfg.srcRoot,
+                                                                              .buildTree = cfg.buildTree,
+                                                                              .value = encoded }),
+                                       presented.credential,
+                                       BudgetOf(cfg));
+    if (outcome.IsHit())
+        Note(record.verbose, std::format("STORED key={} bytes={}", plan.objectKey, encoded.size()));
+    else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
+        Note(
+            record.verbose,
+            std::format(
+                "STORE key={} bytes={} {}", plan.objectKey, encoded.size(), Cc::RecordedReason(outcome, presented.missing)));
+    else
+        Note(record.verbose, std::format("STORE exchange failed key={}", plan.objectKey));
 }
 
 /// DIRECT MODE. Preprocessing a translation unit to derive its key costs ~1.4 s
@@ -2933,10 +3009,11 @@ void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
     // T0 (#1650). The key, the object and the manifest are each taken from the filesystem at a
     // different moment, and a save between them filed one content's object or manifest under
     // another content's key -- served as a HIT, exit 0, to every checkout and machine whose
-    // files match the saved version. The witness snapshots every input here, after the key's
-    // preprocess and after the compile, and `Cc::StabilityTable` decides what of this invocation
-    // is still sound. Hashing only when a manifest may be recorded: with direct mode off the
-    // STORE is guarded by identity alone.
+    // files match the saved version. The witness fences T0 and identifies the TU here -- the
+    // header set is unknown until the key's preprocess has run -- then snapshots every input
+    // after that preprocess (T1') and re-identifies them after the compile (T2), and
+    // `Cc::StabilityTable` decides what of this invocation is still sound. Hashing only when a
+    // manifest may be recorded: with direct mode off the STORE is guarded by identity alone.
     //
     // The TU is resolved exactly as `BuildManifest` resolves `RecordManifest`'s `resolvedSource`,
     // so the witness's entry for it is the one `KeyedHash` is asked about.
@@ -3087,10 +3164,14 @@ void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
         // distributed one.
         probed = { .paths = std::move(probe->dependencyPaths), .unreadable = probe->dependenciesUnreadable };
 
+        // The key is taken: the preprocess timer ends HERE, before the T1' snapshot below, so
+        // `--show-stats`' preprocess latency measures what it always measured and the witness's
+        // hashing does not move it for an unnamed reason.
+        record.preprocessMs = MsSince(preprocessStarted);
+
         // T1': what the key was just taken from. These hashes are what a manifest records.
         witness.Snapshot(Cc::ProjectDependencyPaths(probed.paths, workingDirectoryText, layout), *inputFiles);
     }
-    record.preprocessMs = MsSince(preprocessStarted);
 
     // Every manifest this invocation records -- the backfill on a HIT, the one kept when the
     // object is not stored, and the one after the STORE -- is built from the content the key was
@@ -3369,7 +3450,8 @@ void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
     auto const moved = witness.AfterCompile(
         Cc::ProjectDependencyPaths(ManifestDependencies(probed, cmd, reconciler), workingDirectoryText, layout),
         *inputFiles);
-    if (GuardStore(record, cfg, moved, recordManifest) == Cc::StoreObject::No)
+    auto permit = GuardStore(record, cfg, moved, recordManifest);
+    if (!permit)
         return code;
 
     auto const objectBytes = Cc::ReadFileBytes(cmd.objPath);
@@ -3465,60 +3547,7 @@ void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
         return code;
     }
 
-    // WHERE the object goes is read off the object, and this is the one place that can:
-    // it holds both the fresh object -- compiled here or returned by a worker, which is
-    // why a dispatched compile needs nothing of its own -- and the roots it would name.
-    // An object naming neither root is stored as it always was and keeps every
-    // cross-checkout hit it ever had. One naming a root is keyed apart under the roots,
-    // behind a marker at the portable key, so another checkout following the marker
-    // MISSES rather than being served a `__FILE__` or a `source_location` naming this
-    // one; see RootBinding.hpp for the whole of it and for why the scan errs broad.
-    //
-    // The marker is stored FIRST: between the two stores, a reader in another checkout
-    // then misses rather than being served whatever the portable key held before.
-    auto const plan = Cc::PlanStore(key, value.objectBlob, checkout, metMarker);
-    if (plan.markerKey.has_value())
-    {
-        Note(record.verbose,
-             std::format("root-bound object (it {}); storing it under key={} behind a marker at key={}",
-                         plan.scan.evidence,
-                         plan.objectKey,
-                         *plan.markerKey));
-        auto const marker = Cc::EncodeRootBoundMarker(plan.scan.parts);
-        StoreRaw(record,
-                 cfg.addr,
-                 cfg,
-                 *plan.markerKey,
-                 std::string_view { reinterpret_cast<char const*>(marker.data()), marker.size() });
-    }
-
-    // Best-effort store: a failure here must never fail the build (the compile
-    // already succeeded). Surface the outcome under verbose so store rejections
-    // (e.g. a value over the server's --storage-max-value) are diagnosable — and
-    // now with the daemon's own reason, which the bare acknowledgement byte the
-    // old framing carried could never express. An unreachable daemon lands here as
-    // a transport failure, which reads the same way it always did.
-    auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
-    auto const outcome =
-        CacheExchange(record,
-                      "store",
-                      cfg.addr,
-                      Wire::EncodeStore(Wire::StoreRequest { .key = plan.objectKey,
-                                                             .prefetchGroup = cfg.prefetchGroup,
-                                                             .srcRoot = cfg.srcRoot,
-                                                             .buildTree = cfg.buildTree,
-                                                             .value = std::span<std::byte const> { encoded } }),
-                      presented.credential,
-                      BudgetOf(cfg));
-    if (outcome.IsHit())
-        Note(record.verbose, std::format("STORED key={} bytes={}", plan.objectKey, encoded.size()));
-    else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
-        Note(
-            record.verbose,
-            std::format(
-                "STORE key={} bytes={} {}", plan.objectKey, encoded.size(), Cc::RecordedReason(outcome, presented.missing)));
-    else
-        Note(record.verbose, std::format("STORE exchange failed key={}", plan.objectKey));
+    StoreCompiledObject(std::move(*permit), record, cfg, key, value.objectBlob, encoded, checkout, metMarker);
 
     // Record the direct-mode manifest so the NEXT compile of this TU can reach the
     // object without preprocessing. The include set comes from the /showIncludes
