@@ -201,8 +201,10 @@ Why each row is sound:
 ## What the operator sees
 
 - **Under `FASTCACHE_VERBOSE`:**
-  `fastcache-cc: an input changed during the compile: <path>; compiled, not stored`, with
-  `; manifest recorded from the keyed content` added for `MovedDuringCompile`. The other
+  `fastcache-cc: an input changed during the compile: <path>; compiled, not stored`. For
+  `MovedDuringCompile` in direct mode the manifest is recorded FIRST and the line then says
+  what happened (Ruling 15): `; manifest recorded from the keyed content`, or `; no manifest
+  recorded` when the recording declined (its own note, on the line before, says why). The other
   two sentences are `an input changed while the key was taken` and `an input could not be
   observed`. On a hit whose backfill was refused, the line ends `; served the hit, recorded
   no manifest`.
