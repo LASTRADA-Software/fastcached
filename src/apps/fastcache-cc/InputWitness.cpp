@@ -13,10 +13,10 @@ namespace FastCache::Cc
 StabilityRow const& RowOf(InputStability stability) noexcept
 {
     // Indexed rather than searched: `RowsInEnumeratorOrder` beside the table makes the index a
-    // fact. `Last` is the table's length rather than a verdict and would index past its end; it is
-    // answered with the last row, `Unwitnessed`, which stores nothing and records nothing.
-    auto const index = std::min(static_cast<std::size_t>(stability), StabilityTable.size() - 1);
-    return StabilityTable[index];
+    // fact. `Last` is the table's length rather than a verdict and would index past its end, so it
+    // (and any byte past it) is answered by the row that says the verdict is unknown.
+    auto const index = static_cast<std::size_t>(stability);
+    return index < StabilityTable.size() ? StabilityTable[index] : UnknownStabilityRow;
 }
 
 std::string DescribeInstability(StabilityFinding const& finding)
@@ -50,7 +50,9 @@ void InputWitness::Snapshot(std::span<std::string const> resolvedProjectPaths, I
     };
     auto const hashing = _hashing == ContentHashing::Yes;
 
+    // Re-entrant: a second snapshot starts from nothing, its finding included.
     _entries.clear();
+    _atKey = StabilityFinding { .stability = InputStability::Stable, .path = {} };
     _entries.reserve(paths.size());
     for (auto const& path: paths)
     {

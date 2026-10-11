@@ -6,10 +6,13 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <expected>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -20,15 +23,28 @@ using namespace FastCache::Cc;
 namespace
 {
 /// Identities and contents a case sets by hand, and a clock it moves by hand.
+///
+/// A path with an identity SEQUENCE answers `Identify` from it instead of from `identities`: each
+/// call takes the next answer, and the last one repeats forever. That is how a case places a
+/// change BETWEEN two looks the witness takes in one step.
 class FakeInputFiles final: public IInputFiles
 {
   public:
     std::map<std::string, FileIdentity, std::less<>> identities;
     std::map<std::string, std::string, std::less<>> hashes;
+    mutable std::map<std::string, std::deque<std::optional<FileIdentity>>, std::less<>> sequences;
     FileInstant now { 1'000 };
 
     [[nodiscard]] std::optional<FileIdentity> Identify(std::string_view path) const override
     {
+        if (sequences.contains(path))
+        {
+            auto& queue = sequences.find(path)->second;
+            auto answer = queue.front();
+            if (queue.size() > 1)
+                queue.pop_front();
+            return answer;
+        }
         if (!identities.contains(path))
             return std::nullopt;
         return identities.at(std::string { path });
@@ -64,6 +80,12 @@ FakeInputFiles QuietFiles()
 }
 
 std::vector<std::string> const HeaderOnly { std::string { Header } };
+
+/// An identity changed long before T0 (= 1000), with file id @p id.
+constexpr FileIdentity OldIdentity(std::uint64_t id)
+{
+    return FileIdentity { .changeTime = 10, .size = 5, .volumeId = 1, .fileIdHigh = 0, .fileIdLow = id };
+}
 } // namespace
 
 TEST_CASE("Nothing moved is Stable, at the key and after the compile", "[input-witness][1650]")
@@ -304,4 +326,75 @@ TEST_CASE("Two checkouts with equal content record byte-identical manifests and 
     }
     CHECK(encoded[0] == encoded[1]);
     CHECK(manifestKeys[0] == manifestKeys[1]);
+}
+
+TEST_CASE("A header whose identity moves while it is hashed is MovedBeforeKey", "[input-witness][1650]")
+{
+    // Snapshot rule 2: both identities are old, so only before != after can tell.
+    auto files = QuietFiles();
+    files.sequences[std::string { Header }] = { OldIdentity(2), OldIdentity(22) };
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey()
+          == StabilityFinding { .stability = InputStability::MovedBeforeKey, .path = std::string { Header } });
+}
+
+TEST_CASE("A TU absent at T0 and present at the snapshot is Unwitnessed", "[input-witness][1650]")
+{
+    // Snapshot rule 4a: nothing to compare the T1' identity with, and nothing dereferenced.
+    auto files = QuietFiles();
+    files.sequences[std::string { Tu }] = { std::nullopt, OldIdentity(1) };
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey() == StabilityFinding { .stability = InputStability::Unwitnessed, .path = std::string { Tu } });
+}
+
+TEST_CASE("A TU replaced between T0 and the snapshot by the same bytes is MovedBeforeKey", "[input-witness][1650]")
+{
+    // Snapshot rule 4b: same hash, old change time; only the file id moved between T0 and T1'.
+    auto files = QuietFiles();
+    files.sequences[std::string { Tu }] = { OldIdentity(1), OldIdentity(11) };
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey() == StabilityFinding { .stability = InputStability::MovedBeforeKey, .path = std::string { Tu } });
+}
+
+TEST_CASE("The witnessed content refuses a late path it can identify but not hash", "[input-witness][1650]")
+{
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    files.identities["/r/src/late.hpp"] = OldIdentity(7); // identified, but no hash
+    WitnessedManifestContent const content { witness, files };
+    CHECK(content.HashAsKeyed("/r/src/late.hpp")
+          == std::expected<std::string, ManifestFault> { std::unexpected(ManifestFault::Unreadable) });
+}
+
+TEST_CASE("The witnessed content refuses a late path whose identity moves while it is hashed", "[input-witness][1650]")
+{
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    files.hashes["/r/src/late.hpp"] = "late";
+    files.sequences["/r/src/late.hpp"] = { OldIdentity(7), OldIdentity(77) };
+    WitnessedManifestContent const content { witness, files };
+    CHECK(content.HashAsKeyed("/r/src/late.hpp")
+          == std::expected<std::string, ManifestFault> { std::unexpected(ManifestFault::ChangedDuringInvocation) });
+}
+
+TEST_CASE("A value that is not a verdict answers its own row, never the nearest", "[input-witness][1650]")
+{
+    auto const& row = RowOf(InputStability::Last);
+    CHECK(&row == &UnknownStabilityRow);
+    CHECK(row.stability == InputStability::Last);
+    CHECK(row.store == StoreObject::No);
+    CHECK(row.manifest == KeepManifest::No);
+    CHECK(row.sentence == "an unknown input verdict");
+    CHECK(DescribeInstability({ .stability = InputStability::Last, .path = "/r/a.cpp" })
+          == "an unknown input verdict: /r/a.cpp");
 }

@@ -86,9 +86,16 @@ inline constexpr EnumTable<InputStability, StabilityRow> StabilityTable { {
 static_assert(RowsInEnumeratorOrder(StabilityTable, &StabilityRow::stability),
               "StabilityTable must hold one row per InputStability, in enumerator order");
 
+/// The row `RowOf` answers for a value outside the table -- `InputStability::Last`, or a byte no
+/// enumerator names. It is not any verdict's row, so it says so rather than borrowing the nearest
+/// one, and it stores nothing and records nothing.
+inline constexpr StabilityRow UnknownStabilityRow { .stability = InputStability::Last,
+                                                    .store = StoreObject::No,
+                                                    .manifest = KeepManifest::No,
+                                                    .sentence = "an unknown input verdict" };
+
 /// @param stability A verdict.
-/// @return Its row. `InputStability::Last`, which is not a verdict, answers `Unwitnessed`'s row,
-///         which stores nothing and records nothing.
+/// @return Its row; `UnknownStabilityRow` for a value that is not a verdict.
 [[nodiscard]] StabilityRow const& RowOf(InputStability stability) noexcept;
 
 /// A verdict and the path it is about.
@@ -128,6 +135,9 @@ class InputWitness
     [[nodiscard]] static InputWitness Begin(std::string resolvedSource, IInputFiles const& files, ContentHashing hashing);
 
     /// Take T1', right after the key's preprocess, and decide `AtKey`.
+    ///
+    /// Re-entrant: each call replaces the entries AND resets `AtKey` to `Stable` before deciding
+    /// it again, so a second snapshot never inherits the first one's finding.
     /// @param resolvedProjectPaths The project dependencies the preprocess reported, resolved.
     /// @param files The input files.
     void Snapshot(std::span<std::string const> resolvedProjectPaths, IInputFiles const& files);
@@ -153,6 +163,10 @@ class InputWitness
     }
 
   private:
+    /// Private, so `Begin` is the only way to obtain a witness: one without T0 would judge every
+    /// change time against the epoch.
+    InputWitness() = default;
+
     struct Entry
     {
         std::string path;
