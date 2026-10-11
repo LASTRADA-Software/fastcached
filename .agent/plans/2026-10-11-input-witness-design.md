@@ -48,10 +48,10 @@ That second case is in the code but nobody has reproduced it.
 
 ## Components
 
-All of it lives in `_fc_cc_core`, so it is in `fastcache-cc-tests`. `main.cpp` is in no
-test target (#909).
+All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-cc-tests`.
+`main.cpp` is in no test target (#909).
 
-### `InputWitness.hpp` / `InputWitness.cpp`
+### `InputFiles.hpp` / `InputFiles.cpp`, and `InputWitness.hpp` / `InputWitness.cpp`
 
 - **`FileIdentity`**: `{ changeTime, size, fileId, volumeId }`.
   - **Windows:** `GetFileInformationByHandleEx` with `FileBasicInfo` (`ChangeTime`) and
@@ -62,10 +62,15 @@ test target (#909).
     last-write time instead of reporting zero.
   - Change time and file id, not last-write time, are the point. `copy`, `CopyFileW` and
     robocopy keep `LastWriteTime` (measured in #1650), and a rename-over changes the id.
-- **`IFileIdentitySource`** is the seam: `Identify(path) -> std::optional<FileIdentity>`.
-  `MakeDiskIdentitySource()` returns the disk implementation.
-- **`IInstantSource`** gives T0, in the same units as `changeTime`. It is injected, so tests
-  control the boundary.
+- **`IInputFiles`** is the one seam, with three methods: `Identify(path)` returns an
+  `optional<FileIdentity>`, `Hash(path)` returns the content hash, and `Now()` reads the clock
+  in the same units as `changeTime`. They are one seam because the witness only ever compares
+  their answers with each other. `MakeDiskInputFiles()` returns the disk implementation, and
+  tests inject a fake that controls every boundary.
+  - **The clock is read COARSELY:** `GetSystemTimeAsFileTime`, or `CLOCK_REALTIME_COARSE`
+    where it exists. A filesystem stamps a change with the kernel's tick-granular time, so a
+    finer clock can read an instant LATER than the stamp of a change that follows it, and the
+    T0 rule would then call that change older than the invocation.
 - **`InputWitness`**, a pure value:
   - T0;
   - the TU's identity and content hash at T0;
@@ -85,9 +90,13 @@ test target (#909).
 
 ### Changes to `DirectManifest`
 
-- **`BuildManifest` stops hashing files it has a witness for.** `ManifestInputs` carries
-  the witnessed `(resolved path -> T1′ hash)` set, and every entry takes its hash from
-  there.
+- **`BuildManifest` stops reading files.** It takes each entry's hash from an
+  `IManifestContent`, a required reference in `ManifestInputs` with no default. In production
+  that is the witness, which answers with the T1′ hashes; tests that are about classification
+  use a test-only source that hashes when asked.
+- **`ProjectDependencyPaths`** resolves and filters the reported dependencies exactly as
+  `BuildManifest` does. The witness is taken over its output, so it answers every lookup
+  `BuildManifest` makes, and a test pins that the two ask about the same paths.
 - **The `-MF` fallback** in `RecordManifest` reads the build's own depfile after the compile,
   so it can name paths the probe never reported. Those entries are hashed at record time,
   and only if each file's change time is older than T0.
@@ -108,7 +117,8 @@ test target (#909).
 
 ### Changes to `Stats`
 
-- **A new `Outcome::InputsMoved`, persisted as the token `moved`.** It means "compiled; an
+- **A new `Outcome::InputsMoved`, persisted as the token `INPUTS-MOVED`.** That is uppercase,
+  like every existing token (`VERIFY-MISMATCH` is the precedent). It means "compiled; an
   input changed during the invocation, so nothing was stored".
   - It is not `Miss`, which claims *compiled and stored*.
   - It is not `Uncacheable`, which claims a permanent property of the TU.
@@ -118,21 +128,29 @@ test target (#909).
 ## Data flow in `RunCached`
 
 1. **T0**, just before `Preprocess` (and after `TryDirectMode`, which records nothing): read
-   the instant, then identify and hash the TU.
+   the instant, then identify and hash the TU. With direct mode off nothing is hashed, here or
+   at T1′: no manifest will be recorded, and identity alone guards the STORE.
 2. **T1′**, right after `Preprocess`:
    - Re-identify the TU and re-hash it.
    - For every reported dependency that `ClassifyResolved` calls `Project`, record its
      identity and hash. This is the same classification `BuildManifest` applies, so the
      witness covers exactly the manifest's entries.
    - Toolchain paths are not witnessed, as today: the toolchain stamp covers them.
-   - The TU's T0 and T1′ readings must agree, and every header's change time must be older
-     than T0. If not, the verdict is `MovedBeforeKey`.
+   - The TU's T0 and T1′ readings must agree, every file's (the TU's included) change time
+     must be older than T0, and each file's identity must not move while it is hashed. If
+     not, the verdict is `MovedBeforeKey`.
 3. **On a preprocessed hit:** the hit is served whatever the verdict. The backfill
    `RecordManifest` runs only if the verdict is `Stable`, and it uses the witness's hashes.
 4. **T2**, after the compile returns and before `PlanStore`: re-identify every witnessed
    file and compare against T1′. This covers local and dispatched compiles alike, so
    dispatch's second preprocess and the whole remote compile are inside the window. Any
    difference makes the verdict `MovedDuringCompile`.
+   - **No clock comparison is needed here.** Every witnessed file's T1′ change time is older
+     than T0, and any rewrite after T1′ is stamped at or after T0, so the identity always
+     differs. That includes a same-size rewrite in the same clock tick.
+   - **Paths only the build's own `-MF` names,** read after the compile when the probe
+     reported nothing, have no T1′ snapshot. They are judged by the clock alone: a change
+     time at or after T0 is `MovedDuringCompile`, and an unreadable one is `Unwitnessed`.
 5. **The STORE and `RecordManifest`** run as the decision table says.
 
 ### The decision table
@@ -141,9 +159,9 @@ test target (#909).
 | `InputStability` | what moved | STORE | manifest (miss) | backfill (hit) | outcome |
 |---|---|---|---|---|---|
 | `Stable` | nothing | yes | yes, from the T1′ hashes | yes | `Miss` / `Hit` |
-| `MovedDuringCompile` | a witnessed file's identity differs between T1′ and T2 | no | yes | (no compile on a hit) | `InputsMoved` |
-| `MovedBeforeKey` | the TU differs between T0 and T1′, or a header's change time is ≥ T0 | no | no | no; the hit is still served | `InputsMoved` / `Hit` + detail |
-| `Unwitnessed` | a project file could not be identified or hashed at T1′ | no | no | no | `InputsMoved` + detail |
+| `MovedDuringCompile` | a witnessed file's identity differs between T1′ and T2, or an `-MF`-only path changed after T0 | no | yes | (no compile on a hit) | `InputsMoved` |
+| `MovedBeforeKey` | the TU differs between T0 and T1′, a file's change time is ≥ T0, or a file moved while it was hashed | no | no | no; the hit is still served | `InputsMoved` / `Hit` |
+| `Unwitnessed` | a project file could not be identified or hashed | no | no | no | `InputsMoved` |
 
 Why each row is sound:
 
@@ -152,26 +170,44 @@ Why each row is sound:
   no such object exists yet, a direct lookup misses the pointer and preprocesses.
 - **`MovedBeforeKey` serves the hit.** The object under the key was compiled from exactly
   the text that was preprocessed, which is what a local compile racing the edit would
-  produce. Only the backfill is unsound.
+  produce. Only the backfill is unsound, and the hit stays a `Hit`, with a verbose note.
 - **`Unwitnessed` fails closed for the STORE:** nothing proves the pairing. It occurs only
   where `BuildManifest` already refuses `Unreadable` today.
 
 ## What the operator sees
 
 - **Under `FASTCACHE_VERBOSE`:**
-  `fastcache-cc: an input changed during this compile (<path>, <window>); compiled, not stored`.
-  For `MovedDuringCompile` it adds `; manifest recorded from the keyed content`.
-- **The statistics log:** `moved`, with the detail.
+  `fastcache-cc: an input changed during the compile: <path>; compiled, not stored`, with
+  `; manifest recorded from the keyed content` added for `MovedDuringCompile`. The other
+  two sentences are `an input changed while the key was taken` and `an input could not be
+  observed`. On a hit whose backfill was refused, the line ends `; served the hit, recorded
+  no manifest`.
+- **The statistics log:** `INPUTS-MOVED`, with that sentence and the path in `detail`.
+  `--show-stats` reports `inputs moved : N` and names the files.
 - **No unconditional stderr line.** The build got a correct object; the cache only declined
   to keep it.
 
+## Documentation and the rulebook
+
+- **`.agent/rules/compile-cache.md`** gets a section, "The key, the object and the manifest
+  describe ONE moment", with an `AGENT.md` tripwire. `AGENT.md`'s line budget is an equality
+  ratchet, so the bullet's lines are reclaimed by re-wrapping, never by raising the budget.
+- **Its `## Open work`** gets the shadowing-header issue.
+- **`docs/operations/upgrading-a-fleet.md`** says, under "Coming from 0.4.0", that every
+  direct-mode manifest is recorded once more, and that nothing recompiles.
+- **`docs/tools/fastcache-cc.md`** documents `INPUTS-MOVED`.
+
 ## Known limits, stated rather than closed
 
-- **The preprocess window is the only clock comparison,** headers only. A header on a
-  network share whose server clock lags this machine's can look older than T0, so a change
-  there during the preprocess goes undetected. This fails open, in a sub-second window.
-  Everything after T1′ is a snapshot comparison and is exact. Refusing to cache everything
-  on a remote filesystem would remove a feature, so it is documented instead.
+- **The only clock comparison is against T0.** On a network share whose server clock lags
+  this machine's, a header changed during the preprocess can look older than T0, so the
+  change goes undetected. The TU's own T0/T1′ comparison still holds there; a header's does
+  not. This fails open, in a sub-second window. After T1′ the comparison is between
+  snapshots and is exact. Refusing to cache everything on a remote filesystem would remove a
+  feature, so it is documented instead.
+- **FAT and exFAT keep no change time,** so their last-write time stands in for it. That
+  weakens the T0 rule there: `CopyFile` keeps a last-write time, and FAT's is 2-second
+  granular. The T0/T1′ comparison of the TU and the identity comparison after T1′ still hold.
 - **A header *created* during the invocation,** at an include path that shadows the one the
   preprocess resolved, is in no witness. ccache has the same gap. It gets its own issue,
   linked from `.agent/rules/compile-cache.md`'s `## Open work`.
@@ -182,51 +218,61 @@ Why each row is sound:
 
 ### Unit (`fastcache-cc-tests`)
 
-1. **`InputWitness_test.cpp`**, with a fake `IFileIdentitySource` and a fake `IInstantSource`
-   over real scratch files (`src/tests/ScratchPath.hpp`):
+1. **`InputFiles_test.cpp`**, against this machine's filesystem:
+   - change times are on the seam's own clock and unit;
+   - a file written after an instant is stamped at or after it;
+   - on Windows, `CopyFileW` (which keeps `LastWriteTime`) still moves the change time;
+   - on POSIX, `utimensat` back to the old mtime still moves `st_ctim`, and a retargeted
+     symlink changes the identity read through it;
+   - a rename-over changes the file id;
+   - a missing file has no identity, and a non-ASCII path is identified.
+2. **`InputWitness_test.cpp`**, with a fake `IInputFiles`:
    - one case per verdict, each asserting *which* verdict and which path it names;
    - **ABA:** same content but a new identity is `MovedDuringCompile`;
-   - **the boundary:** a change time equal to T0 is moved, and one tick earlier is not.
-2. **The disk identity source,** against this machine's filesystem:
-   - a write changes the identity, and so does a rename-over;
-   - on Windows, `CopyFileW` (which keeps `LastWriteTime`) changes it;
-   - on POSIX, `utimensat` back to the old mtime still changes `st_ctim`.
-3. **The decision table:** every row's STORE, manifest and backfill actions and the
-   recorded outcome, asserted exactly.
-4. **`DirectManifest_test.cpp`:**
-   - witness V1, write V2, build the manifest: it carries the V1 hash, and
-     `ValidateManifest` against V2 fails;
-   - the `-MF` fallback with an entry whose change time is ≥ T0 is refused
-     `ChangedDuringInvocation`, naming the path.
-5. **The sharing invariant:** two scratch checkouts under different roots, with identical
+   - **the boundary:** a change time equal to T0 is moved, and one tick earlier is not;
+   - **the TU's hash alone:** a TU whose identity is unchanged and whose content moved is
+     `MovedBeforeKey`, without any clock;
+   - the decision table, row by row;
+   - the witnessed content answers the keyed hash after a save, and refuses a late path
+     changed after T0 as `ChangedDuringInvocation`.
+3. **The sharing invariant:** two scratch checkouts under different roots, with identical
    content but different identities and change times, produce byte-identical encoded
    manifests and manifest keys.
-6. **`CacheKey_test.cpp`:** the pinned `manifest-v8` digest.
-7. **`Stats_test.cpp`:** `moved` round-trips and has its report row.
+4. **`DirectManifest_test.cpp`:**
+   - `BuildManifest` takes every hash from its content source, never from the disk, and
+     asks about exactly the TU plus `ProjectDependencyPaths`;
+   - a content source's refusal names its path and fault;
+   - the pinned digest moves to `manifest-v8`, and `manifest-v7` is retired.
+5. **`Stats_test.cpp`:** `INPUTS-MOVED` round-trips and has its report row.
 
-### End to end (real launcher, private cache-only node)
+### End to end (real launcher)
 
-A stub compiler forwards to the real one and, while a trigger file exists, saves V2 after
-the compiler exits. The POSIX version is a shell stub in `scripts/compile-cache-e2e.sh`.
-The Windows version is built in the fixture from the issue's `wrapcl.cpp`, in
-`src/apps/fastcache-cc/run-launcher-e2e.ps1`.
+**`mid-compile-edit-stub`** is a test executable built in `src/tests`, never installed. It
+forwards to the real compiler and, while a trigger file exists, overwrites a source either
+after a real compile or before a dispatch preprocess. Each fixture copies it under the real
+compiler's own file name, because the launcher picks its driver grammar by that name. It runs
+in `scripts/compile-cache-e2e.sh` and `src/apps/fastcache-cc/run-launcher-e2e.ps1`.
 
 <!-- table-total: none -->
 | leg | expected |
 |---|---|
-| TU saved mid-compile | run 1 `moved`, no `STORED`, no `MANIFEST`; delete the object and rebuild: `MISS`, object V2 |
+| TU saved mid-compile | run 1 `INPUTS-MOVED`, no `STORED`; delete the object and rebuild: `MISS`, object V2 |
 | header saved mid-compile | the same |
-| a second checkout holding V2 | `MISS`, V2 (issue step 5, inverted) |
-| control: same stub, no trigger | `MISS`, `STORED`, `MANIFEST`, then a direct `HIT` |
+| a second checkout holding V2 | object V2 (issue step 5, inverted) |
+| control: same stub, no trigger | `STORED`, `MANIFEST stored`, then a direct `HIT` |
 | control: a second checkout, nothing moved | a direct `HIT` from the first checkout's manifest |
 
-**The dispatch leg** goes in `scripts/dist-compile-e2e.sh` and `.ps1`: a stub-gated save
-during a dispatched compile ends in `moved`.
+**The dispatch leg** goes in `scripts/dist-compile-e2e.sh` and `.ps1`. The save lands before
+the dispatch preprocess, which is #1650's T1→T2 window. The compile is `DISPATCHED` and
+recorded `INPUTS-MOVED`, and a rebuild of the original content is a `MISS` that builds it.
+Before the fix, that rebuild was a `HIT` serving the worker's object of the saved content.
+The leg first asserts that the stub leaves the toolchain fingerprint unchanged; otherwise
+nothing through it could be dispatched, and the leg would be testing a local compile.
 
 ### Proving the tests can fail
 
-- With the T2 re-identify neutered, the mid-compile e2e legs and unit test 3 go red, and the
-  controls stay green.
-- With `BuildManifest` hashing at record time again, unit test 4 goes red.
+- With the T2 re-identify neutered, the during-compile unit cases and e2e legs go red, and
+  the controls and the before-key cases stay green.
+- With `BuildManifest` reading the disk again, its content-source cases go red.
 
 Both runs, and which cases failed, are recorded in the pull request.
