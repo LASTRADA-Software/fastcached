@@ -806,19 +806,19 @@ git commit -s -m "cc: a manifest's hashes come from a content source, and manife
   - The first finding in entry order (TU first) becomes `atKey`. Within one entry, the first matching rule wins:
     1. `before` or `after` is missing, or hashing is on and `hash` is empty: `Unwitnessed`.
     2. `before != after`: `MovedBeforeKey`.
-    3. `after->changeTime >= started`: `MovedBeforeKey`.
+    3. `ChangedAtOrAfter(after->changeTime, started)` (Task 1's comparison, never a raw `>=`): `MovedBeforeKey`.
     4. TU only: `atStart` is missing gives `Unwitnessed`; `*atStart != *after` gives `MovedBeforeKey`; hashing is on and `hashAtStart != hash` gives `MovedBeforeKey`.
   - If nothing matches, `atKey` is `Stable`.
 - **`AfterCompile`** (T2):
   - If `atKey` is not `Stable`, return it.
   - For each entry: `now = Identify(p)`. If `now` is missing, or `*now != stored`: `MovedDuringCompile`.
-  - No clock comparison is needed here. Any rewrite after T1′ stamps a change time at or after T0, and every entry's T1′ change time is before T0 (rule 3 above), so the identity always differs. A clock check at T2 would be redundant.
-  - Then for each late path that is not an entry: `now = Identify(p)`. Missing gives `Unwitnessed`; `now->changeTime >= started` gives `MovedDuringCompile`.
+  - No clock comparison is needed here. Every entry's T1′ stamp lies below T0 floored to that stamp's own granularity (rule 3 above), and any rewrite after T0 is stamped at or above that floor, so the identity always differs, on a whole-second filesystem as well. A clock check at T2 would be redundant.
+  - Then for each late path that is not an entry: `now = Identify(p)`. Missing gives `Unwitnessed`; `ChangedAtOrAfter(now->changeTime, started)` gives `MovedDuringCompile`.
   - Otherwise `Stable`.
 - **`KeyedHash(p)`**: the stored hash of the entry whose path equals `p`, if it is non-empty; otherwise nullopt.
 - **`WitnessedManifestContent::HashAsKeyed(p)`**:
   - if the witness has a `KeyedHash(p)`, return it;
-  - otherwise `id = Identify(p)`; missing gives `Unreadable`, and `id->changeTime >= Started()` gives `ChangedDuringInvocation`;
+  - otherwise `id = Identify(p)`; missing gives `Unreadable`, and `ChangedAtOrAfter(id->changeTime, Started())` gives `ChangedDuringInvocation`;
   - then `hash = Hash(p)`; empty gives `Unreadable`;
   - `Identify(p) != id` gives `ChangedDuringInvocation`;
   - otherwise return `hash`.
@@ -1038,6 +1038,22 @@ TEST_CASE("A late dependency changed after T0 is MovedDuringCompile; one unreada
     CHECK(witness.AfterCompile(missing, files).stability == InputStability::Unwitnessed);
 }
 
+TEST_CASE("A whole-second stamp in T0's own second counts as moved", "[input-witness][1650]")
+{
+    // A filesystem that stamps whole seconds (HFS+, ext4 with 128-byte inodes) stamps an edit made
+    // at 5.9 s as 5.0 s; with T0 = 5.7 s a raw >= would call it older than the invocation. The
+    // comparison is ChangedAtOrAfter, which floors T0 to the stamp's own granularity (Ruling 5).
+    FakeInputFiles files;
+    files.now = 5'700'000'000;
+    files.Set(std::string { Tu }, "tu-v1", 10, 1);
+    files.Set(std::string { Header }, "h-v2", 5'000'000'000, 2); // an odd whole second: 1 s granular
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 6'000'000'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey()
+          == StabilityFinding { .stability = InputStability::MovedBeforeKey, .path = std::string { Header } });
+}
+
 TEST_CASE("Every verdict decides the STORE and the manifest exactly", "[input-witness][1650]")
 {
     CHECK(RowOf(InputStability::Stable).store == StoreObject::Yes);
@@ -1173,7 +1189,7 @@ Implement exactly the rules listed above this task's Step 1. `Snapshot` loops `f
 - [ ] **Step 5: Register in CMake, build, run the tests**
 
 Run: `cmake --build --preset cl-debug --target fastcache-cc-tests`, then `out/build/cl-debug/src/apps/fastcache-cc/fastcache-cc-tests.exe "[input-witness]"`.
-Expected: `test cases: 14 | 14 passed`.
+Expected: `test cases: 15 | 15 passed`.
 
 - [ ] **Step 6: Commit**
 

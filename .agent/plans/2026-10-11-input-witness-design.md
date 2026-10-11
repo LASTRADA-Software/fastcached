@@ -67,6 +67,14 @@ All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-c
   in the same units as `changeTime`. They are one seam because the witness only ever compares
   their answers with each other. `MakeDiskInputFiles()` returns the disk implementation, and
   tests inject a fake that controls every boundary.
+  - **Every comparison with T0 is `ChangedAtOrAfter(changeTime, T0)`, never a raw `>=`.** It
+    floors T0 to the granularity the stamp itself shows: a whole 2 s, a whole second, or none.
+    A filesystem that stamps whole seconds (HFS+, ext4 with 128-byte inodes) stamps an edit at
+    5.9 s as 5.0 s, which a raw comparison with T0 = 5.7 s would call older than the
+    invocation. A blanket floor (ccache's "include file too new") is rejected: it would stop
+    caching every consumer of a header generated in the same build second, so a clean build
+    with generated headers would never store those translation units. Where the platform has
+    no coarse realtime clock (macOS), `Now()` subtracts a named 10 ms safety tick.
   - **The clock is read COARSELY:** `GetSystemTimeAsFileTime`, or `CLOCK_REALTIME_COARSE`
     where it exists. A filesystem stamps a change with the kernel's tick-granular time, so a
     finer clock can read an instant LATER than the stamp of a change that follows it, and the
@@ -137,7 +145,8 @@ All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-c
      witness covers exactly the manifest's entries.
    - Toolchain paths are not witnessed, as today: the toolchain stamp covers them.
    - The TU's T0 and T1′ readings must agree, every file's (the TU's included) change time
-     must be older than T0, and each file's identity must not move while it is hashed. If
+     must be older than T0 (compared by `ChangedAtOrAfter`, below), and each file's identity
+     must not move while it is hashed. If
      not, the verdict is `MovedBeforeKey`.
 3. **On a preprocessed hit:** the hit is served whatever the verdict. The backfill
    `RecordManifest` runs only if the verdict is `Stable`, and it uses the witness's hashes.
@@ -146,7 +155,8 @@ All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-c
    dispatch's second preprocess and the whole remote compile are inside the window. Any
    difference makes the verdict `MovedDuringCompile`.
    - **No clock comparison is needed here.** Every witnessed file's T1′ change time is older
-     than T0, and any rewrite after T1′ is stamped at or after T0, so the identity always
+     than T0 floored to its stamp's granularity, and any rewrite after T1′ is stamped at or
+     above that floor, so the identity always
      differs. That includes a same-size rewrite in the same clock tick.
    - **Paths only the build's own `-MF` names,** read after the compile when the probe
      reported nothing, have no T1′ snapshot. They are judged by the clock alone: a change
