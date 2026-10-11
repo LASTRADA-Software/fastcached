@@ -69,12 +69,17 @@ All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-c
     (see Known limits).
 - **`IInputFiles`** is the one seam: `Identify(path)` returns an `optional<FileIdentity>`,
   `Hash(path)` returns the content hash, `Now()` reads the clock in the same units as
-  `changeTime`, and `Fence()` (Ruling 11) waits for the clock to cross one tick and returns
-  T0. Every change made before the call is stamped strictly below T0, and every change after
-  it returns is stamped at or above, so "saved just before the launch" is never mistaken for
-  "saved during the preprocess". Measured: without the fence, 5 of 30 compiles launched right
-  after a write refused to store on a 4 ms-tick kernel. Cost: up to one tick per invocation
-  that preprocesses. They are one seam because the witness only ever compares
+  `changeTime`, and `Fence()` (Rulings 11 and 17) returns T0: it reads the FINE clock at the
+  call, then waits until the COARSE clock reads strictly above both its own first reading and
+  that fine reading, and returns that coarse reading. Every change made before the call is
+  then stamped strictly below T0 (coarse, fine or Linux 6.13+ "multigrain" stamp alike: none
+  exceeds the fine time at the call), and every change after it returns is stamped at or
+  above, so "saved just before the launch" is never mistaken for "saved during the
+  preprocess". Measured: without the fence, 5 of 30 compiles launched right after a write
+  refused to store on a 4 ms-tick kernel; with a coarse-only wait, CI's Linux 6.13+ runners
+  still failed 57 of 60 fence iterations (multigrain stamps a file stat'ed since its last
+  change FINELY, above the first changed coarse reading). Cost: one to two ticks per
+  invocation that preprocesses. They are one seam because the witness only ever compares
   their answers with each other. `MakeDiskInputFiles()` returns the disk implementation, and
   tests inject a fake that controls every boundary.
   - **Every comparison with T0 is `ChangedAtOrAfter(changeTime, T0)`, never a raw `>=`.** It
