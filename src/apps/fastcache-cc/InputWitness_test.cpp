@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "DirectManifest.hpp"
+#include "InputWitness.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <array>
+#include <cstdint>
+#include <expected>
+#include <map>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <tests/ScratchPath.hpp>
+
+using namespace FastCache::Cc;
+
+namespace
+{
+/// Identities and contents a case sets by hand, and a clock it moves by hand.
+class FakeInputFiles final: public IInputFiles
+{
+  public:
+    std::map<std::string, FileIdentity, std::less<>> identities;
+    std::map<std::string, std::string, std::less<>> hashes;
+    FileInstant now { 1'000 };
+
+    [[nodiscard]] std::optional<FileIdentity> Identify(std::string_view path) const override
+    {
+        if (!identities.contains(path))
+            return std::nullopt;
+        return identities.at(std::string { path });
+    }
+    [[nodiscard]] std::string Hash(std::string_view path) const override
+    {
+        return hashes.contains(path) ? hashes.at(std::string { path }) : std::string {};
+    }
+    [[nodiscard]] FileInstant Now() const override
+    {
+        return now;
+    }
+
+    /// Put @p path at content @p hash, changed at @p changeTime, with id @p id.
+    void Set(std::string const& path, std::string hash, FileInstant changeTime, std::uint64_t id)
+    {
+        identities[path] =
+            FileIdentity { .changeTime = changeTime, .size = hash.size(), .volumeId = 1, .fileIdHigh = 0, .fileIdLow = id };
+        hashes[path] = std::move(hash);
+    }
+};
+
+constexpr std::string_view Tu = "/r/src/a.cpp";
+constexpr std::string_view Header = "/r/src/h.hpp";
+
+/// A quiet TU and header, both last changed long before T0 (= 1000).
+FakeInputFiles QuietFiles()
+{
+    FakeInputFiles files;
+    files.Set(std::string { Tu }, "tu-v1", 10, 1);
+    files.Set(std::string { Header }, "h-v1", 10, 2);
+    return files;
+}
+
+std::vector<std::string> const HeaderOnly { std::string { Header } };
+} // namespace
+
+TEST_CASE("Nothing moved is Stable, at the key and after the compile", "[input-witness][1650]")
+{
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey() == StabilityFinding { .stability = InputStability::Stable, .path = "" });
+    files.now = 3'000;
+    CHECK(witness.AfterCompile({}, files) == StabilityFinding { .stability = InputStability::Stable, .path = "" });
+    CHECK(witness.KeyedHash(Tu) == std::optional<std::string> { "tu-v1" });
+    CHECK(witness.KeyedHash(Header) == std::optional<std::string> { "h-v1" });
+}
+
+TEST_CASE("A TU saved during the compile is MovedDuringCompile, and names the TU", "[input-witness][1650]")
+{
+    // The incident: the save landed after the key and before the launcher returned.
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    files.Set(std::string { Tu }, "tu-v2", 2'500, 1);
+    CHECK(witness.AfterCompile({}, files)
+          == StabilityFinding { .stability = InputStability::MovedDuringCompile, .path = std::string { Tu } });
+    // The manifest still gets the keyed content, not the saved one.
+    CHECK(witness.KeyedHash(Tu) == std::optional<std::string> { "tu-v1" });
+}
+
+TEST_CASE("Same bytes, new identity is still moved", "[input-witness][1650]")
+{
+    // Review focus 4. A content-only bracket would call this stable; an interleaving (V2 read by
+    // the compiler, then V1 restored) cannot be excluded, so it is not.
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    files.Set(std::string { Header }, "h-v1", 10, 99); // same bytes, same old change time, new id
+    CHECK(witness.AfterCompile({}, files).stability == InputStability::MovedDuringCompile);
+}
+
+TEST_CASE("A header deleted during the compile is MovedDuringCompile", "[input-witness][1650]")
+{
+    // Review focus 3.
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    files.identities.erase(std::string { Header });
+    CHECK(witness.AfterCompile({}, files)
+          == StabilityFinding { .stability = InputStability::MovedDuringCompile, .path = std::string { Header } });
+}
+
+TEST_CASE("A same-size, same-id rewrite after the snapshot is seen through its change time", "[input-witness][1650]")
+{
+    // Size and file id unchanged, so only the change time can tell. It must: every entry's
+    // T1' change time is before T0, and any rewrite after T1' is stamped at or after T0.
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    files.identities[std::string { Header }].changeTime = 2'000;
+    CHECK(witness.AfterCompile({}, files).stability == InputStability::MovedDuringCompile);
+}
+
+TEST_CASE("A header changed while the key was taken is MovedBeforeKey", "[input-witness][1650]")
+{
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.Set(std::string { Header }, "h-v2", 1'500, 2); // after T0 = 1000, before the snapshot
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey()
+          == StabilityFinding { .stability = InputStability::MovedBeforeKey, .path = std::string { Header } });
+    CHECK(witness.AfterCompile({}, files).stability == InputStability::MovedBeforeKey);
+}
+
+TEST_CASE("A TU whose content moved between T0 and the snapshot is MovedBeforeKey, without a clock", "[input-witness][1650]")
+{
+    // A filesystem whose clock lags this machine's (a network share) stamps the change BEFORE T0;
+    // the TU's own T0/T1' comparison still sees it.
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.Set(std::string { Tu }, "tu-v2", 10, 1); // same size, change time and id: only the hash differs
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey() == StabilityFinding { .stability = InputStability::MovedBeforeKey, .path = std::string { Tu } });
+}
+
+TEST_CASE("A change time equal to T0 counts as moved, one tick earlier does not", "[input-witness][1650]")
+{
+    // Review focus 5: the boundary is >=, so a change in T0's own coarse tick fails closed.
+    for (auto const [changeTime, expected]: { std::pair { FileInstant { 1'000 }, InputStability::MovedBeforeKey },
+                                              std::pair { FileInstant { 999 }, InputStability::Stable } })
+    {
+        auto files = QuietFiles();
+        files.Set(std::string { Header }, "h-v1", changeTime, 2);
+        auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+        files.now = 2'000;
+        witness.Snapshot(HeaderOnly, files);
+        CHECK(witness.AtKey().stability == expected);
+    }
+}
+
+TEST_CASE("A file that cannot be read at the snapshot is Unwitnessed", "[input-witness][1650]")
+{
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.hashes.erase(std::string { Header });
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey() == StabilityFinding { .stability = InputStability::Unwitnessed, .path = std::string { Header } });
+}
+
+TEST_CASE("With hashing off nothing is hashed and an unreadable hash is not Unwitnessed", "[input-witness][1650]")
+{
+    // Direct mode off: no manifest, so the witness guards the STORE by identity alone.
+    auto files = QuietFiles();
+    files.hashes.clear();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::No);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey().stability == InputStability::Stable);
+    CHECK_FALSE(witness.KeyedHash(Header).has_value());
+}
+
+TEST_CASE("A late dependency changed after T0 is MovedDuringCompile; one unreadable is Unwitnessed", "[input-witness][1650]")
+{
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot({}, files);
+    files.Set("/r/src/late.hpp", "late", 1'500, 7);
+    std::vector<std::string> const late { "/r/src/late.hpp" };
+    CHECK(witness.AfterCompile(late, files)
+          == StabilityFinding { .stability = InputStability::MovedDuringCompile, .path = "/r/src/late.hpp" });
+    std::vector<std::string> const missing { "/r/src/missing.hpp" };
+    CHECK(witness.AfterCompile(missing, files).stability == InputStability::Unwitnessed);
+}
+
+TEST_CASE("A whole-second stamp in T0's own second counts as moved", "[input-witness][1650]")
+{
+    // A filesystem that stamps whole seconds (HFS+, ext4 with 128-byte inodes) stamps an edit made
+    // at 5.9 s as 5.0 s; with T0 = 5.7 s a raw >= would call it older than the invocation. The
+    // comparison is ChangedAtOrAfter, which floors T0 to the stamp's own granularity (Ruling 5).
+    FakeInputFiles files;
+    files.now = 5'700'000'000;
+    files.Set(std::string { Tu }, "tu-v1", 10, 1);
+    files.Set(std::string { Header }, "h-v2", 5'000'000'000, 2); // an odd whole second: 1 s granular
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 6'000'000'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey()
+          == StabilityFinding { .stability = InputStability::MovedBeforeKey, .path = std::string { Header } });
+}
+
+TEST_CASE("Every verdict decides the STORE and the manifest exactly", "[input-witness][1650]")
+{
+    CHECK(RowOf(InputStability::Stable).store == StoreObject::Yes);
+    CHECK(RowOf(InputStability::Stable).manifest == KeepManifest::Yes);
+    CHECK(RowOf(InputStability::MovedDuringCompile).store == StoreObject::No);
+    CHECK(RowOf(InputStability::MovedDuringCompile).manifest == KeepManifest::Yes);
+    CHECK(RowOf(InputStability::MovedBeforeKey).store == StoreObject::No);
+    CHECK(RowOf(InputStability::MovedBeforeKey).manifest == KeepManifest::No);
+    CHECK(RowOf(InputStability::Unwitnessed).store == StoreObject::No);
+    CHECK(RowOf(InputStability::Unwitnessed).manifest == KeepManifest::No);
+    CHECK(DescribeInstability({ .stability = InputStability::MovedDuringCompile, .path = "/r/a.cpp" })
+          == "an input changed during the compile: /r/a.cpp");
+    CHECK(DescribeInstability({ .stability = InputStability::Stable, .path = "" }).empty());
+}
+
+TEST_CASE("The witnessed content answers keyed hashes, and guards a late path by the clock", "[input-witness][1650]")
+{
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    files.Set(std::string { Header }, "h-v2", 2'500, 2); // saved after the snapshot
+    files.Set("/r/src/old.hpp", "old", 10, 8);           // late, untouched
+    files.Set("/r/src/new.hpp", "new", 1'500, 9);        // late, changed after T0
+    WitnessedManifestContent const content { witness, files };
+    CHECK(content.HashAsKeyed(Header) == std::expected<std::string, ManifestFault> { "h-v1" });
+    CHECK(content.HashAsKeyed("/r/src/old.hpp") == std::expected<std::string, ManifestFault> { "old" });
+    CHECK(content.HashAsKeyed("/r/src/new.hpp")
+          == std::expected<std::string, ManifestFault> { std::unexpected(ManifestFault::ChangedDuringInvocation) });
+    CHECK(content.HashAsKeyed("/r/src/none.hpp")
+          == std::expected<std::string, ManifestFault> { std::unexpected(ManifestFault::Unreadable) });
+}
+
+TEST_CASE("Two checkouts with equal content record byte-identical manifests and keys", "[input-witness][1650]")
+{
+    // Spec invariant 1, at the seam: identities differ in every field between the two
+    // checkouts (and between two machines), and nothing of them may reach the record.
+    FastCache::Testing::ScratchDirectory const scratchA { "fc-witness-share-a" };
+    FastCache::Testing::ScratchDirectory const scratchB { "fc-witness-share-b-deeper" };
+    std::array<std::string, 2> encoded;
+    std::array<std::string, 2> manifestKeys;
+    for (auto const index: { 0, 1 })
+    {
+        auto const& scratch = index == 0 ? scratchA : scratchB;
+        scratch.Write("src/h.hpp", "#pragma once\nint h();\n");
+        scratch.Write("src/a.cpp", "#include \"h.hpp\"\nint a() { return h(); }\n");
+        auto const& root = scratch.Path();
+        FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
+        auto const source = (root / "src" / "a.cpp").string();
+        auto const header = (root / "src" / "h.hpp").string();
+        auto const resolvedSource = ResolveAgainst(source, root.string(), layout);
+        auto const resolvedHeader = ResolveAgainst(header, root.string(), layout);
+
+        FakeInputFiles files;
+        auto const disk = MakeDiskInputFiles();
+        files.identities[resolvedSource] = FileIdentity {
+            .changeTime = 10 + index, .size = 1, .volumeId = 100U + index, .fileIdHigh = 0, .fileIdLow = 1U + index
+        };
+        files.identities[resolvedHeader] = FileIdentity {
+            .changeTime = 20 + index, .size = 2, .volumeId = 100U + index, .fileIdHigh = 0, .fileIdLow = 3U + index
+        };
+        files.hashes[resolvedSource] = disk->Hash(resolvedSource);
+        files.hashes[resolvedHeader] = disk->Hash(resolvedHeader);
+
+        auto witness = InputWitness::Begin(resolvedSource, files, ContentHashing::Yes);
+        files.now = 2'000;
+        witness.Snapshot(ProjectDependencyPaths(std::vector<std::string> { header }, root.string(), layout), files);
+        REQUIRE(witness.AtKey().stability == InputStability::Stable);
+        WitnessedManifestContent const content { witness, files };
+        auto const manifest = BuildManifest({ .sourcePath = source,
+                                              .reportedDependencies = ReportedDependencies::Observed({ header }),
+                                              .workingDirectory = root.string(),
+                                              .toolchainStamp = "stamp",
+                                              .objectKey = "objkey",
+                                              .content = content },
+                                            layout);
+        REQUIRE(manifest.has_value());
+        encoded[index] = EncodeManifest(*manifest);
+        auto const token = CanonicalSourceToken(source, layout, root.string());
+        REQUIRE(token.has_value());
+        manifestKeys[index] = ComputeManifestKey(*token, { "-c", *token }, "stamp");
+    }
+    CHECK(encoded[0] == encoded[1]);
+    CHECK(manifestKeys[0] == manifestKeys[1]);
+}
