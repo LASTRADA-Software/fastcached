@@ -229,8 +229,10 @@ Why each row is sound:
 - **The only clock comparison is against T0.** On a network share whose server clock lags
   this machine's, a header changed during the preprocess can look older than T0, so the
   change goes undetected. The TU's own T0/T1′ comparison still holds there; a header's does
-  not. This fails open, in a sub-second window. After T1′ the comparison is between
-  snapshots and is exact. Refusing to cache everything on a remote filesystem would remove a
+  not. This fails open, in a sub-second window. After T1′ every SNAPSHOTTED input is
+  compared by identity and the comparison is exact; a path only the build's `-MF` names has
+  no T1′ snapshot and is judged by the clock alone until its manifest entry is hashed, so
+  the lag reaches it there too. Refusing to cache everything on a remote filesystem would remove a
   feature, so it is documented instead.
 - **FAT and exFAT keep no change time,** so their last-write time stands in for it. That
   weakens the T0 rule there: `CopyFile` keeps a last-write time, and FAT's is 2-second
@@ -238,11 +240,12 @@ Why each row is sound:
 - **A header replaced DURING THE KEY'S PREPROCESS by a copy that keeps an older change time**
   (`CopyFileW` on NTFS copies the source's change time) reads as older than T0, so the T0
   rule cannot see it, and nothing earlier snapshots that header: the set of headers is
-  unknown until the preprocess has run. The window is the preprocess alone; a copy after
-  T1′ changes the identity and is caught. Its own issue, linked from `## Open work`.
+  unknown until the preprocess has run. For a snapshotted header the window is the
+  preprocess (a copy after T1′ changes the identity and is caught); for a path only the
+  build's `-MF` names it runs until that path's manifest entry is hashed. #1653.
 - **A header *created* during the invocation,** at an include path that shadows the one the
-  preprocess resolved, is in no witness. ccache has the same gap. It gets its own issue,
-  linked from `.agent/rules/compile-cache.md`'s `## Open work`.
+  preprocess resolved, is in no witness when the probe reported its set, for the whole
+  invocation. ccache has the same gap. #1654.
 - **Out-of-root headers (#1597)** are a different defect: a coverage gap rather than a timing
   window. Untouched here.
 
@@ -253,7 +256,8 @@ Why each row is sound:
 1. **`InputFiles_test.cpp`**, against this machine's filesystem:
    - change times are on the seam's own clock and unit;
    - a file written after an instant is stamped at or after it;
-   - on Windows, `CopyFileW` (which keeps `LastWriteTime`) still moves the change time;
+   - on Windows, `CopyFileW` over a file changes its identity while carrying the source's
+     last-write time (it copies the source's change time too, measured; Ruling 13);
    - on POSIX, `utimensat` back to the old mtime still moves `st_ctim`, and a retargeted
      symlink changes the identity read through it;
    - a rename-over changes the file id;
