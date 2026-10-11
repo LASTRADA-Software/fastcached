@@ -144,19 +144,36 @@ class IInputFiles
     ///         `FileInstant`).
     [[nodiscard]] virtual FileInstant Now() const = 0;
 
-    /// An instant that ORDERS every change against it: one made before this call is stamped
-    /// strictly below the result, and one made after it returns is stamped at or above it. Blocks
-    /// until the clock change times are stamped with has crossed one tick to get there.
+    /// An instant meant to ORDER every change against it: one made before this call stamped
+    /// strictly below the result, one made after it returns at or above it. Reads the FINE clock
+    /// at the call, then blocks until the coarse clock reads strictly above both that and its own
+    /// reading at the call -- typically one tick -- and returns that coarse reading.
+    ///
+    /// Why the fine clock bounds the past and the coarse one does not: Linux 6.13+ (multigrain
+    /// timestamps, on ext4, xfs, btrfs and tmpfs) stamps a change to a file stat'ed since its last
+    /// change with a FINE time, and the coarse clock lags real time by up to a tick, so its first
+    /// new reading can still lie BELOW a fine stamp written just before this call. MEASURED in CI:
+    /// with a fence that waited only for the coarse clock to change, 57 of 60 changes made just
+    /// before it read as at-or-after it on a `Linux-gcc-release-arm64` runner (#1650). That
+    /// multigrain stamping is the cause is INFERRED; no local kernel here reproduces it.
+    ///
+    /// The ordering is a property of the clocks, so it holds only where they behave as assumed --
+    /// a later stamp is never below the coarse clock, an earlier one never above the fine clock --
+    /// and under the condition `ChangedAtOrAfter` states: a filesystem stamping from THIS
+    /// machine's clock on a decimal or 2 s grid. Outside that (another machine's clock, a
+    /// non-decimal grid, a clock stepped backwards between the reads) it is not a guarantee, and
+    /// the fail-closed fallback below gives none either, though it can only call MORE changes
+    /// recent.
+    /// Where the coarse clock has not passed the floor within 100 ms, or stops answering, the
+    /// result is the last coarse reading moved back by a safety tick; where no coarse clock
+    /// exists, the fine clock after waiting that tick out, moved back by it.
     ///
     /// Why not `Now`: an instant read INSIDE the current coarse tick shares that tick with every
     /// change stamped in it, before the read or after, so a change saved a moment before an
     /// invocation started cannot be told from one saved after -- `ChangedAtOrAfter` must call it
     /// "at or after", and the invocation refuses its store. Measured on WSL (4 ms ticks): 5 of 30
     /// compiles launched right after a write refused to store (#1650). Waiting for the next tick
-    /// removes the ambiguity rather than failing closed on it, at the cost of at most one tick.
-    ///
-    /// Holds under the condition `ChangedAtOrAfter` states: a filesystem stamping from THIS
-    /// machine's clock on a decimal or 2 s grid.
+    /// removes the ambiguity rather than failing closed on it, at the cost of about one tick.
     /// @return The fenced instant, on the clock `Now` reads.
     [[nodiscard]] virtual FileInstant Fence() const = 0;
 
@@ -174,10 +191,10 @@ class IInputFiles
 ///
 /// - Windows: `GetFileInformationByHandleEx`, on a handle opened for attributes only with full
 ///   sharing, so it never contends with a compiler holding the file open. The clock is
-///   `GetSystemTimeAsFileTime`.
+///   `GetSystemTimeAsFileTime`, with `GetSystemTimePreciseAsFileTime` as `Fence`'s floor.
 /// - POSIX: `stat`. The clock is `CLOCK_REALTIME_COARSE` where it exists; elsewhere (macOS), or
 ///   when that read fails, `CLOCK_REALTIME` moved back by a safety tick; and 0 -- every input
-///   reads as changed -- when no clock answers.
+///   reads as changed -- when no clock answers. `Fence` reads `CLOCK_REALTIME` for its floor.
 ///
 /// @return The implementation.
 [[nodiscard]] std::unique_ptr<IInputFiles> MakeDiskInputFiles();

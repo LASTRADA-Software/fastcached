@@ -19,6 +19,7 @@
     #include <windows.h>
 #else
     #include <sys/stat.h>
+    #include <sys/utsname.h>
 
     #include <fcntl.h>
     #include <unistd.h>
@@ -31,6 +32,20 @@ namespace
 {
 /// One minute in the seam's unit, for the sanity bound on the epoch and the scale.
 constexpr FileInstant OneMinute = std::int64_t { 60 } * 1'000'000'000;
+
+/// @return The running kernel's name and release (`uname -sr`), for a failure to name the kernel
+///         it ran on: whether a kernel stamps multigrain times decides what the fence case meets.
+std::string KernelRelease()
+{
+#if defined(_WIN32)
+    return "Windows";
+#else
+    utsname name {};
+    if (::uname(&name) != 0)
+        return "unknown (uname failed)";
+    return std::format("{} {}", static_cast<char const*>(name.sysname), static_cast<char const*>(name.release));
+#endif
+}
 } // namespace
 
 TEST_CASE("A change time is on the seam's own clock, in its own unit", "[input-files]")
@@ -66,6 +81,12 @@ TEST_CASE("A fence orders a change made just before it below it and one made aft
     // "at or after" and the compile refused its store -- about 1 in 6 launches right after a write
     // on WSL's 4 ms tick. One pass can pass by luck, so the property is asked many times in a row:
     // `Iterations` writes each landing as close before the fence as this process can put them.
+    //
+    // Each write lands on a file the previous iteration stat'ed, which is what makes Linux 6.13+
+    // (multigrain timestamps) stamp it with a FINE time; a fence that waited only for the COARSE
+    // clock to change returned an instant below such a stamp in 57 of 60 iterations on a CI arm64
+    // runner. No kernel available locally stamps multigrain times, so a local pass cannot tell
+    // the fine-clock floor from that wait -- the kernel is in the failure message for that reason.
     constexpr auto Iterations = 60;
     FastCache::Testing::ScratchDirectory const scratch { "fc-input-files-fence" };
     auto const path = (scratch / "a.hpp").string();
@@ -91,7 +112,7 @@ TEST_CASE("A fence orders a change made just before it below it and one made aft
         if (!ChangedAtOrAfter(after->changeTime, fence))
             ++afterReadAsBefore;
     }
-    INFO("of " << Iterations << " iterations");
+    INFO("of " << Iterations << " iterations, kernel " << KernelRelease());
     CHECK(unreadable == 0);
     CHECK(beforeReadAsAfter == 0);
     CHECK(afterReadAsBefore == 0);
@@ -129,6 +150,26 @@ TEST_CASE("CopyFileW over a file changes its identity while carrying the source'
     // The trap is real on this machine: the copy carried the hour-old last-write time.
     CHECK(std::filesystem::last_write_time(oldPath) < anHourAgo + std::chrono::minutes { 1 });
     CHECK(Unwrap(before) != Unwrap(after));
+}
+
+TEST_CASE("Setting a file's last-write time back still moves its NTFS change time", "[input-files]")
+{
+    // The Windows twin of the utimensat case: what the seam reads is `ChangeTime`, which a backdated
+    // `LastWriteTime` does not hide. A seam reading `LastWriteTime` instead would fail the last check.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-input-files-backdate" };
+    scratch.Write("a.hpp", "MESSAGE_V1_OLD\n");
+    auto const path = scratch / "a.hpp";
+    auto const files = MakeDiskInputFiles();
+    auto const before = files->Fence();
+    scratch.Write("a.hpp", "MESSAGE_V2_NEW\n");
+    auto const anHourAgo = std::filesystem::file_time_type::clock::now() - std::chrono::hours { 1 };
+    std::filesystem::last_write_time(path, anHourAgo);
+    auto const identity = files->Identify(path.string());
+    REQUIRE(identity.has_value());
+
+    // The trap is real: the last-write time now reads an hour old.
+    CHECK(std::filesystem::last_write_time(path) < anHourAgo + std::chrono::minutes { 1 });
+    CHECK(Unwrap(identity).changeTime >= before);
 }
 #else
 TEST_CASE("Setting a file's modification time back still moves its change time", "[input-files]")
@@ -184,6 +225,22 @@ TEST_CASE("A rename over a file changes its identity, same bytes and size", "[in
     auto const before = Unwrap(first);
     auto const after = Unwrap(second);
     CHECK((before.fileIdHigh != after.fileIdHigh || before.fileIdLow != after.fileIdLow));
+}
+
+TEST_CASE("A rename over a file after a fence is stamped at or after it", "[input-files]")
+{
+    // #1650: a header replaced by a rename during the key's preprocess is caught by the T0 clock
+    // rule only if the RENAME moves the change time read through the path -- the replacing file's
+    // content was written BEFORE the fence, so only the rename itself happens after it.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-input-files-rename-fence" };
+    scratch.Write("h.hpp", "old\n");
+    scratch.Write("h.tmp", "new\n");
+    auto const files = MakeDiskInputFiles();
+    auto const fence = files->Fence();
+    std::filesystem::rename(scratch / "h.tmp", scratch / "h.hpp");
+    auto const identity = files->Identify((scratch / "h.hpp").string());
+    REQUIRE(identity.has_value());
+    CHECK(ChangedAtOrAfter(Unwrap(identity).changeTime, fence));
 }
 
 TEST_CASE("A missing file has no identity and no hash", "[input-files]")
