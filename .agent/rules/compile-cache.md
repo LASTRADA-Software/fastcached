@@ -2414,7 +2414,7 @@ A manifest's hashes are the T1′ hashes -- `BuildManifest` takes them from its 
 hit a racing backfill would have spoiled is still served. Five rules make it hold, and the first
 four were each wrong in a draft of #1650 before they were right:
 
-- **Identity, not the clock, for every input snapshotted at T1′.** An entry is compared by change
+- **Identity, not the clock, after T1′, for every input snapshotted there.** An entry is compared by change
   time, size, volume and file id, never by last-write time alone (FAT and exFAT keep no change
   time, so theirs stands in): `copy` and robocopy keep a file's mtime, `utimensat` sets it, and on
   NTFS `CopyFileW` copies the SOURCE's change time as well (measured during #1650, on two
@@ -2422,11 +2422,20 @@ four were each wrong in a draft of #1650 before they were right:
   same clock tick is seen the same way, since every T1′ stamp lies below the floored T0. A path
   named ONLY by the build's own `-MF` (read when the probe reported nothing) has no T1′ snapshot
   and is judged by the clock alone, at T2 and when its manifest entry is hashed.
-- **T0 is FENCED.** `IInputFiles::Fence()` waits for the coarse clock to cross one tick and
-  returns that reading, so a save made before the fence is stamped strictly below T0 and one
-  made after it at or above. Without the fence, 5 of 30 compiles launched right after a write
-  refused to store (WSL, 4 ms ticks; measured, and 30 of 30 stored with it). Read the clock
-  COARSELY, too: a finer clock can read later than the stamp of a change that follows it.
+- **T0 is FENCED, against the FINE clock.** `IInputFiles::Fence()` reads the fine clock at the
+  call, waits for the coarse clock to read strictly above both that and its own first reading,
+  and returns that coarse reading -- so, where the clocks behave as assumed (an earlier stamp
+  never above the fine clock, a later one never below the coarse clock) and under
+  `ChangedAtOrAfter`'s condition, a save made before the fence is stamped below T0 and one made
+  after it at or above. That is a property of the clocks, NOT an unconditional fact: see the
+  limits below. Waiting only for the coarse clock to CHANGE was wrong on Linux 6.13+, whose
+  multigrain timestamps stamp a file stat'ed since its last change with a FINE time the coarse
+  clock can still be below -- MEASURED: 57 of 60 such saves read as after the fence on
+  `Linux-gcc-release-arm64` in CI; the multigrain cause is INFERRED, and no local kernel (WSL
+  included) reproduces it, so only that CI leg can tell the two fences apart. Without any fence,
+  5 of 30 compiles launched right after a write refused to store (WSL, 4 ms ticks; measured, and
+  30 of 30 stored with it). Read T0 COARSELY, too: a finer clock can read later than the stamp
+  of a change that follows it.
 - **Every comparison with T0 is `Cc::ChangedAtOrAfter`, never a raw `>=`.** It floors T0 to the
   grid the stamp itself shows -- the largest of 2 s, then each decimal unit from 1 s down to
   10 ns, that divides it -- because exFAT stamps at 10 ms and HFS+ at 1 s, and a change in T0's
@@ -2442,13 +2451,15 @@ four were each wrong in a draft of #1650 before they were right:
   `InputWitness_test`'s two-checkout case pins the bytes. `manifest-v8` retired every manifest
   recorded before the fix, and `objkey-v*` deliberately did not move.
 
-**Known limits, each failing OPEN.** Every one of them is a place where only the CLOCK answers:
+**Known limits.** Every one of them is a place where only the clock answers, or nothing does
+([#1654](https://github.com/LASTRADA-Software/fastcached/issues/1654)). The first four fail
+OPEN -- a wrong object can be stored -- and the last fails CLOSED:
 
 - A header REPLACED during the key's preprocess (T0 to T1′) by a copy that keeps an older change
   time (`CopyFileW` on NTFS) reads as older than T0, and nothing earlier snapshots it, because the
   header set is unknown until the preprocess has run. For a snapshotted header, a copy after T1′
   changes the identity and is caught; for an `-MF`-only path, which has no T1′ identity, the
-  window runs to T2. [#1653](https://github.com/LASTRADA-Software/fastcached/issues/1653).
+  window runs until its manifest entry is hashed (after the STORE on a miss; at the backfill on a hit). [#1653](https://github.com/LASTRADA-Software/fastcached/issues/1653).
 - A header CREATED at any point of the invocation, the compile included, in an include
   directory searched before the one the preprocess resolved is in no snapshot and checked by
   nothing: at T2 the late paths are the probe's own set, all already entries (ccache has the
@@ -2456,11 +2467,20 @@ four were each wrong in a draft of #1650 before they were right:
 - A stamp from ANOTHER machine's clock that lags this one (a network share, a WSL `/mnt/<drive>`
   the Windows host stamps), and a stamp grid that is neither 2 s nor a decimal unit. The TU's
   own T0/T1′ comparison still holds there; a header's T0 comparison does not, and for an
-  `-MF`-only path the window runs to T2. Documented, not filed: refusing remote filesystems would
-  remove a feature.
+  `-MF`-only path the window runs until its manifest entry is hashed (after the STORE on a miss; at the backfill on a hit). Documented, not filed: refusing remote filesystems
+  would remove a feature.
 - FAT and exFAT keep no change time, so their last-write time stands in, and `CopyFile` keeps a
   last-write time (FAT's is 2 s granular): the T0 rule is weaker there. The TU's T0/T1′
   comparison and the identity comparison after T1′ still hold.
+- **The fail-CLOSED direction of the same clock limits.** A filesystem whose clock LEADS this
+  machine's (an SMB or NFS share, or `/mnt/<drive>` under a WSL clock that lags the Windows
+  host) stamps a fresh file at or above T0, and so does a coarse-grid filesystem (FAT, HFS+,
+  ext4 with 128-byte inodes) for a file written in T0's own slot. Such an input reads as moved,
+  so `INPUTS-MOVED` RECURS for files nobody edited -- in a clean CI build whose generated
+  headers live on such a share, on every run. It never serves a wrong object, but the
+  statistics row's "the next build caches as usual" is false there: what to check is the
+  share's clock against this machine's, or whether the filesystem stamps whole seconds. No
+  runtime hint names it yet.
 
 ## Accepted trade-offs
 
@@ -2824,7 +2844,8 @@ nobody can account for.
   and the T0 clock rule passes it, and no earlier snapshot of it exists, because the header set
   is unknown until the preprocess runs. A copy after T1′ changes a snapshotted header's identity
   and is caught, so for those the window is the preprocess; a path named only by the build's own
-  `-MF` has no T1′ identity and is judged by the clock alone, so for it the window runs to T2.
+  `-MF` has no T1′ identity and is judged by the clock alone, so for it the window runs
+  until its manifest entry is hashed (after the STORE on a miss; at the backfill on a hit).
   Not reproduced end to end: derived from the measurement and the witness's construction. See *The key, the object and the manifest describe ONE moment*.
 
 - **[#1654](https://github.com/LASTRADA-Software/fastcached/issues/1654)** — a header CREATED
