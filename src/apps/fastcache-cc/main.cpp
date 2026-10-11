@@ -1978,6 +1978,14 @@ struct MaterializedHit
     return FinishServedHit(record, cfg, cmd, argv, key, fetched);
 }
 
+/// Whether `RecordManifest` offered a manifest to the cache, so a caller's own line can say so
+/// truthfully rather than announcing a manifest a refusal declined (#1650). Private.
+enum class ManifestRecorded : std::uint8_t
+{
+    No,
+    Yes,
+};
+
 /// Report that this compile gets no direct-mode manifest, and why.
 ///
 /// One spelling for all three refusals, so a build log shows the same sentence
@@ -2072,17 +2080,19 @@ void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
 /// @param reconciler      Translates a driver's spelling into this build's.
 /// @param content         Where each entry's hash comes from: the input witness's T1'
 ///                        snapshot, the content the key was taken from (#1650).
-void RecordManifest(InvocationRecord const& record,
-                    Config const& cfg,
-                    Cc::ParsedCommand const& cmd,
-                    PathCanon::Layout const& layout,
-                    std::filesystem::path const& workingDirectory,
-                    std::vector<std::string> const& relativizedArgs,
-                    std::string const& toolchainStamp,
-                    ProbedDependencies const& probed,
-                    std::string_view objectKeyForPointer,
-                    Cc::RootReconciler& reconciler,
-                    Cc::IManifestContent const& content)
+/// @return Whether a manifest was offered to the cache: `No` on every refusal, each of which
+///         has already said why; `Yes` once the STORE exchange has run.
+[[nodiscard]] ManifestRecorded RecordManifest(InvocationRecord const& record,
+                                              Config const& cfg,
+                                              Cc::ParsedCommand const& cmd,
+                                              PathCanon::Layout const& layout,
+                                              std::filesystem::path const& workingDirectory,
+                                              std::vector<std::string> const& relativizedArgs,
+                                              std::string const& toolchainStamp,
+                                              ProbedDependencies const& probed,
+                                              std::string_view objectKeyForPointer,
+                                              Cc::RootReconciler& reconciler,
+                                              Cc::IManifestContent const& content)
 {
     auto const workingDirectoryText = workingDirectory.string();
     auto const resolvedSource = reconciler.Directory(cmd.source);
@@ -2095,7 +2105,7 @@ void RecordManifest(InvocationRecord const& record,
         // off for this translation unit permanently while the compile goes on
         // succeeding: nothing else in the log so much as mentions it (issue #68).
         NoteNoManifest(record, Cc::DescribeManifestFailure(canonicalSource.error()));
-        return;
+        return ManifestRecorded::No;
     }
 
     auto includes = ManifestDependencies(probed, cmd, reconciler);
@@ -2108,7 +2118,7 @@ void RecordManifest(InvocationRecord const& record,
     if (reconciler.UnreadablePaths() != 0)
     {
         NoteNoManifest(record, "a reported dependency path is not text this host can read");
-        return;
+        return ManifestRecorded::No;
     }
 
     // The manifest points at the object's ordinary key rather than causing a second
@@ -2173,7 +2183,7 @@ void RecordManifest(InvocationRecord const& record,
                                          Cc::IncludeNoteMarker,
                                          resolvedSource)
                            : Cc::DescribeManifestFailure(manifest.error()));
-        return;
+        return ManifestRecorded::No;
     }
 
     // Both counts, for the reason the key's dependency-set note gives them: the pair
@@ -2208,6 +2218,7 @@ void RecordManifest(InvocationRecord const& record,
              std::string_view { reinterpret_cast<char const*>(manifestFrame.data()), manifestFrame.size() });
     if (record.verbose)
         std::cerr << "fastcache-cc: MANIFEST stored key=" << manifestKey << " entries=" << manifest->entries.size() << '\n';
+    return ManifestRecorded::Yes;
 }
 
 /// What the input witness hashes (#1650): contents only when a manifest may be recorded. With
@@ -2243,7 +2254,7 @@ void RecordManifest(InvocationRecord const& record,
 /// @param record         The invocation record; takes the row's outcome and the finding as its detail.
 /// @param cfg            Launcher config; a manifest is recorded only in direct mode.
 /// @param moved          The witness's verdict after the compile.
-/// @param recordManifest Records the manifest from the keyed content.
+/// @param recordManifest Records the manifest from the keyed content; answers whether it did.
 /// @return Whether the object may be stored.
 [[nodiscard]] Cc::StoreObject GuardStore(InvocationRecord& record,
                                          Config const& cfg,
@@ -2259,12 +2270,13 @@ void RecordManifest(InvocationRecord const& record,
     // ranks one row per file rather than one per cause (`RecordFallback`'s rule). The path is on
     // the verbose line below.
     record.outcomeDetail = row.sentence;
-    Note(record.verbose,
-         std::format("{}; compiled, not stored{}",
-                     Cc::DescribeInstability(moved),
-                     keepsManifest ? "; manifest recorded from the keyed content" : ""));
+    // Recorded BEFORE the line, so the line says what happened rather than what was meant to: a
+    // refusal inside the recording names its reason on the line above this one.
+    auto manifestNote = std::string_view {};
     if (keepsManifest)
-        recordManifest();
+        manifestNote = recordManifest() == ManifestRecorded::Yes ? "; manifest recorded from the keyed content"
+                                                                 : "; no manifest recorded";
+    Note(record.verbose, std::format("{}; compiled, not stored{}", Cc::DescribeInstability(moved), manifestNote));
     return Cc::StoreObject::No;
 }
 
@@ -3084,17 +3096,17 @@ void RecordManifest(InvocationRecord const& record,
     // object is not stored, and the one after the STORE -- is built from the content the key was
     // taken from, never from the disk as it stands after the compile (#1650).
     auto const recordManifest = [&] {
-        RecordManifest(record,
-                       cfg,
-                       cmd,
-                       layout,
-                       workingDirectory,
-                       relativizedArgs,
-                       toolchainStamp,
-                       probed,
-                       key,
-                       reconciler,
-                       keyedContent);
+        return RecordManifest(record,
+                              cfg,
+                              cmd,
+                              layout,
+                              workingDirectory,
+                              relativizedArgs,
+                              toolchainStamp,
+                              probed,
+                              key,
+                              reconciler,
+                              keyedContent);
     };
 
     auto const cacheStarted = std::chrono::steady_clock::now();

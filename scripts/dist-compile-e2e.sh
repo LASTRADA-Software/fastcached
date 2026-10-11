@@ -87,7 +87,7 @@
 # for a CI runner shared with the other smoke tests to collide — a failure that
 # reads as "distribution is broken" when it means "something else was listening".
 #
-# All twelve of those are loopback end to end. Who a worker admits from ANOTHER
+# Every case is loopback end to end. Who a worker admits from ANOTHER
 # address is not asked here: `FleetTickets_test` and `FrameEndpoint_test` ask it in
 # process, over a real endpoint whose peer reports a non-loopback host (#235).
 #
@@ -112,7 +112,8 @@ cli=""
 # FAILS without it: the ctest registration passes it whenever the stub is built.
 edit_stub=""
 
-# Which body of assertions to run: `suite` is the twelve cases above, and `self-test`
+# Which body of assertions to run: `suite` is all sixteen cases (1 to 14, with 2b and 7b;
+# 14 runs only where a DWARF reader is found), and `self-test`
 # drives the pure verdict decisions below with no binary built.
 mode="suite"
 
@@ -1076,7 +1077,17 @@ echo "   the edit stub keeps the toolchain fingerprint (${stub_fingerprint})"
 
 # V1 is the content the key is taken from; V2, the saved content, differs in its `// unique:`
 # line and in one LITERAL -- a comment does not survive preprocessing, the literal does.
-write_source "${moved}/v1/one-moved.cpp" "movedone"
+#
+# Both include a PROJECT header whose content never changes, so the manifest the raced compile
+# keeps has a project dependency to record on every driver: a driver whose dependency report
+# does not name the TU itself (`cl`'s /showIncludes) would otherwise report nothing under the
+# root, the manifest would be refused, and this case could not pin the keyed-manifest suffix.
+# One beside each copy of the TU, because a quoted include resolves against the TU's directory.
+for dir in "${moved}/v1" "${moved}/v2" "$proj"; do
+    printf '#pragma once\n#define ONE_MOVED_HEADER 1\n' > "${dir}/one-moved.hpp"
+done
+write_source "${moved}/v1/one-moved.body" "movedone"
+{ printf '#include "one-moved.hpp"\n'; cat "${moved}/v1/one-moved.body"; } > "${moved}/v1/one-moved.cpp"
 sed -e 's|^// unique: movedone$|// unique: movedone-saved|' \
     -e 's|{ "movedone", { 1, 2, 3 } }|{ "movedone-saved", { 1, 2, 3 } }|' \
     "${moved}/v1/one-moved.cpp" > "${moved}/v2/one-moved.cpp"
@@ -1121,6 +1132,8 @@ cmp -s "${moved}/v2/one-moved.cpp" "${proj}/one-moved.cpp" \
 # identity is case 1's property, so the comparison is exact.
 cmp -s "${moved}/v2-ref.o" "${proj}/build/one-moved.o" \
     || fail "case 2b: the dispatched object is not the saved content's, so the save did not land between the key and the dispatch preprocess"
+# The WHOLE line pins the window's LOWER bound: a save before the key's own snapshot logs
+# INPUTS-MOVED as well, but says "while the key was taken" and keeps no manifest.
 grep -qE "an input changed during the compile: [^;]*/one-moved\.cpp; compiled, not stored; manifest recorded from the keyed content\$" \
     "${workdir}/case2b-1.log" \
     || fail "case 2b: the save between the key and the dispatch was not seen, or the line does not name the saved file and the keyed manifest"
@@ -1140,6 +1153,11 @@ moved_compile "${workdir}/case2b-2.log" FASTCACHE_E2E_CASE=moved \
 cat "${workdir}/case2b-2.log"
 grep -q "fastcache-cc: MISS" "${workdir}/case2b-2.log" \
     || fail "case 2b: the original content was served from the cache -- the worker's object of the saved content under the original key (the #1650 defect)"
+# The SAME key the raced compile was taken on, or this MISS says nothing about that key.
+raced_key="$(sed -n 's/^fastcache-cc: MISS key=\([^ ]*\).*/\1/p' "${workdir}/case2b-1.log")"
+rebuilt_key="$(sed -n 's/^fastcache-cc: MISS key=\([^ ]*\).*/\1/p' "${workdir}/case2b-2.log")"
+[[ -n "$raced_key" && "$raced_key" == "$rebuilt_key" ]] \
+    || fail "case 2b: the rebuild missed on key '${rebuilt_key}', not on the raced compile's key '${raced_key}'"
 grep -q "STORED key=" "${workdir}/case2b-2.log" \
     || fail "case 2b: the original content compiled but was not stored"
 cmp -s "${moved}/v1-ref.o" "${proj}/build/one-moved.o" \

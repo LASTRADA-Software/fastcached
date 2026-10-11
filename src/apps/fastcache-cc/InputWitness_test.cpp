@@ -63,12 +63,16 @@ class FakeInputFiles final: public IInputFiles
     {
         return now;
     }
-    /// `now` as well: a scripted clock has no tick to cross, so the fenced instant IS the reading,
-    /// and every change time a case sets is ordered against it exactly as written.
+    /// `now` plus `FenceOffset`: a scripted clock has no tick to cross, so the fenced instant is the
+    /// reading, offset by a value no case uses as a change time so that T0 taken from `Now()` instead
+    /// of from `Fence()` is a different instant and a case can tell (`Begin takes T0 from the fence`).
     [[nodiscard]] FileInstant Fence() const override
     {
-        return now;
+        return now + FenceOffset;
     }
+
+    /// How far the fake's fence lies past its clock.
+    static constexpr FileInstant FenceOffset = 7;
 
     /// Put @p path at content @p hash, changed at @p changeTime, with id @p id.
     void Set(std::string const& path, std::string hash, FileInstant changeTime, std::uint64_t id)
@@ -82,7 +86,7 @@ class FakeInputFiles final: public IInputFiles
 constexpr std::string_view Tu = "/r/src/a.cpp";
 constexpr std::string_view Header = "/r/src/h.hpp";
 
-/// A quiet TU and header, both last changed long before T0 (= 1000).
+/// A quiet TU and header, both last changed long before T0 (the fence, 1007).
 FakeInputFiles QuietFiles()
 {
     FakeInputFiles files;
@@ -93,7 +97,7 @@ FakeInputFiles QuietFiles()
 
 std::vector<std::string> const HeaderOnly { std::string { Header } };
 
-/// An identity changed long before T0 (= 1000), with file id @p id.
+/// An identity changed long before T0 (the fence, 1007), with file id @p id.
 constexpr FileIdentity OldIdentity(std::uint64_t id)
 {
     return FileIdentity { .changeTime = 10, .size = 5, .volumeId = 1, .fileIdHigh = 0, .fileIdLow = id };
@@ -111,6 +115,16 @@ TEST_CASE("Nothing moved is Stable, at the key and after the compile", "[input-w
     CHECK(witness.AfterCompile({}, files) == StabilityFinding { .stability = InputStability::Stable, .path = "" });
     CHECK(witness.KeyedHash(Tu) == std::optional<std::string> { "tu-v1" });
     CHECK(witness.KeyedHash(Header) == std::optional<std::string> { "h-v1" });
+}
+
+TEST_CASE("Begin takes T0 from the fence, not the clock", "[input-witness][1650]")
+{
+    // The fence is what puts a save made just before the invocation on the near side of T0; a
+    // Begin that read `Now()` instead would pass every other case here, whose times sit far apart.
+    auto const files = QuietFiles();
+    auto const witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    CHECK(witness.Started() == files.Fence());
+    CHECK(witness.Started() != files.Now());
 }
 
 TEST_CASE("A TU saved during the compile is MovedDuringCompile, and names the TU", "[input-witness][1650]")
@@ -167,7 +181,7 @@ TEST_CASE("A header changed while the key was taken is MovedBeforeKey", "[input-
 {
     auto files = QuietFiles();
     auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
-    files.Set(std::string { Header }, "h-v2", 1'500, 2); // after T0 = 1000, before the snapshot
+    files.Set(std::string { Header }, "h-v2", 1'500, 2); // after T0 = 1007, before the snapshot
     files.now = 2'000;
     witness.Snapshot(HeaderOnly, files);
     CHECK(witness.AtKey()
@@ -190,8 +204,10 @@ TEST_CASE("A TU whose content moved between T0 and the snapshot is MovedBeforeKe
 TEST_CASE("A change time equal to T0 counts as moved, one tick earlier does not", "[input-witness][1650]")
 {
     // Review focus 5: the boundary is >=, so a change in T0's own coarse tick fails closed.
-    for (auto const [changeTime, expected]: { std::pair { FileInstant { 1'000 }, InputStability::MovedBeforeKey },
-                                              std::pair { FileInstant { 999 }, InputStability::Stable } })
+    // T0 is the fence, 1007: neither it nor 1006 lies on a coarser stamp grid, so both are compared
+    // at one-tick granularity and the boundary is exactly T0.
+    for (auto const [changeTime, expected]: { std::pair { FileInstant { 1'007 }, InputStability::MovedBeforeKey },
+                                              std::pair { FileInstant { 1'006 }, InputStability::Stable } })
     {
         auto files = QuietFiles();
         files.Set(std::string { Header }, "h-v1", changeTime, 2);

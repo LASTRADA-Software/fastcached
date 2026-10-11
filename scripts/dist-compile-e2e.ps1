@@ -1422,10 +1422,22 @@ try {
 
             # V1 is the content the key is taken from; V2, the saved content, differs in one
             # LITERAL, which is what survives preprocessing.
+            #
+            # Both include a PROJECT header whose content never changes. /showIncludes never
+            # names the TU itself, so without one this compile reports no dependency under the
+            # root, the manifest is refused, and the line below could not pin the keyed-manifest
+            # suffix. One beside each copy of the TU: a quoted include resolves against its
+            # directory.
             $v1Src = New-Source (Join-Path $moved "v1") "$cc-dist-case-moved"
             $v2Src = New-Source (Join-Path $moved "v2") "$cc-dist-case-moved-saved"
             $mroot = Join-Path $moved "proj"
             New-Item -ItemType Directory -Force -Path (Join-Path $mroot "build") | Out-Null
+            foreach ($dir in @((Join-Path $moved "v1"), (Join-Path $moved "v2"), $mroot)) {
+                "#pragma once`n#define U_MOVED_HEADER 1`n" | Set-Content -NoNewline -Encoding utf8 (Join-Path $dir "u.hpp")
+            }
+            foreach ($tu in @($v1Src, $v2Src)) {
+                ("#include `"u.hpp`"`n" + [IO.File]::ReadAllText($tu)) | Set-Content -NoNewline -Encoding utf8 $tu
+            }
             $msrc = Join-Path $mroot "u.cpp"
             $mobj = Join-Path $mroot "build\u.obj"
 
@@ -1463,7 +1475,7 @@ try {
             $logged = Get-E2ELauncherLogField (Get-Content -LiteralPath $launcherState.Log -Tail 1) 'outcome'
             Write-Host $r.stderr
             if ($r.code -ne 0) { throw "case 2b: the racing compile failed (exit $($r.code))" }
-            if ($r.stderr -notmatch "DISPATCHED to ") {
+            if ($r.stderr -cnotmatch "DISPATCHED to ") {
                 Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$dispatchPort" $fingerprint
                 Write-Host "--- worker log ---"
                 Write-Host (Read-LiveText $workerLog)
@@ -1477,13 +1489,16 @@ try {
             if (-not (Test-Path -LiteralPath $mobj) -or -not (Test-EquivalentObject $v2Ref $mobj $rules)) {
                 throw "case 2b: the dispatched object is not the saved content's, so the save did not land between the key and the dispatch preprocess"
             }
-            if ($r.stderr -notmatch "an input changed during the compile: [^;\r\n]*[\\/]u\.cpp; compiled, not stored; manifest recorded from the keyed content\r?(\n|$)") {
+            # The WHOLE line pins the window's LOWER bound: a save before the key's own snapshot
+            # logs INPUTS-MOVED as well, but says "while the key was taken" and keeps no manifest.
+            if ($r.stderr -cnotmatch "an input changed during the compile: [^;\r\n]*[\\/]u\.cpp; compiled, not stored; manifest recorded from the keyed content\r?(\n|$)") {
                 throw "case 2b: the save between the key and the dispatch was not seen, or the line does not name the saved file and the keyed manifest"
             }
             if ($r.stderr.Contains("STORED key=")) {
                 throw "case 2b: the worker's object of the saved content was stored under the original content's key"
             }
-            if ($logged -ne "INPUTS-MOVED") { throw "case 2b: recorded '$logged', not INPUTS-MOVED" }
+            if ($logged -cne "INPUTS-MOVED") { throw "case 2b: recorded '$logged', not INPUTS-MOVED" }
+            $racedKey = [regex]::Match($r.stderr, 'fastcache-cc: MISS key=(\S+)').Groups[1].Value
 
             # The original content again, written in place: its key is the one the raced
             # compile was keyed on, and nothing may stand behind it.
@@ -1492,8 +1507,13 @@ try {
             $r = Invoke-Dispatching $movedStub $mroot $mobj "127.0.0.1:$dispatchPort" $cachePort
             Write-Host $r.stderr
             if ($r.code -ne 0) { throw "case 2b: the rebuild of the original content failed (exit $($r.code))" }
-            if ($r.stderr -notmatch "fastcache-cc: MISS") {
+            if ($r.stderr -cnotmatch "fastcache-cc: MISS") {
                 throw "case 2b: the original content was served from the cache -- the worker's object of the saved content under the original key (the #1650 defect)"
+            }
+            # The SAME key the raced compile was taken on, or this MISS says nothing about that key.
+            $rebuiltKey = [regex]::Match($r.stderr, 'fastcache-cc: MISS key=(\S+)').Groups[1].Value
+            if (-not $racedKey -or $racedKey -cne $rebuiltKey) {
+                throw "case 2b: the rebuild missed on key '$rebuiltKey', not on the raced compile's key '$racedKey'"
             }
             if (-not $r.stderr.Contains("STORED key=")) { throw "case 2b: the original content compiled but was not stored" }
             if (-not (Test-EquivalentObject $v1Ref $mobj $rules)) {
