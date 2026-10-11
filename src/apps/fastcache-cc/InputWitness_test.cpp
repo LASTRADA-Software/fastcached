@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <expected>
@@ -26,18 +27,22 @@ namespace
 ///
 /// A path with an identity SEQUENCE answers `Identify` from it instead of from `identities`: each
 /// call takes the next answer, and the last one repeats forever. That is how a case places a
-/// change BETWEEN two looks the witness takes in one step.
+/// change BETWEEN two looks the witness takes in one step. An EMPTY sequence answers like an
+/// unsequenced path, from `identities`, rather than reading the front of an empty deque.
+///
+/// `hashCalls` counts every `Hash`, so a case can assert that nothing was hashed.
 class FakeInputFiles final: public IInputFiles
 {
   public:
     std::map<std::string, FileIdentity, std::less<>> identities;
     std::map<std::string, std::string, std::less<>> hashes;
     mutable std::map<std::string, std::deque<std::optional<FileIdentity>>, std::less<>> sequences;
+    mutable std::size_t hashCalls = 0;
     FileInstant now { 1'000 };
 
     [[nodiscard]] std::optional<FileIdentity> Identify(std::string_view path) const override
     {
-        if (sequences.contains(path))
+        if (sequences.contains(path) && !sequences.find(path)->second.empty())
         {
             auto& queue = sequences.find(path)->second;
             auto answer = queue.front();
@@ -51,6 +56,7 @@ class FakeInputFiles final: public IInputFiles
     }
     [[nodiscard]] std::string Hash(std::string_view path) const override
     {
+        ++hashCalls;
         return hashes.contains(path) ? hashes.at(std::string { path }) : std::string {};
     }
     [[nodiscard]] FileInstant Now() const override
@@ -210,6 +216,7 @@ TEST_CASE("With hashing off nothing is hashed and an unreadable hash is not Unwi
     witness.Snapshot(HeaderOnly, files);
     CHECK(witness.AtKey().stability == InputStability::Stable);
     CHECK_FALSE(witness.KeyedHash(Header).has_value());
+    CHECK(files.hashCalls == 0);
 }
 
 TEST_CASE("A late dependency changed after T0 is MovedDuringCompile; one unreadable is Unwitnessed", "[input-witness][1650]")
@@ -223,7 +230,8 @@ TEST_CASE("A late dependency changed after T0 is MovedDuringCompile; one unreada
     CHECK(witness.AfterCompile(late, files)
           == StabilityFinding { .stability = InputStability::MovedDuringCompile, .path = "/r/src/late.hpp" });
     std::vector<std::string> const missing { "/r/src/missing.hpp" };
-    CHECK(witness.AfterCompile(missing, files).stability == InputStability::Unwitnessed);
+    CHECK(witness.AfterCompile(missing, files)
+          == StabilityFinding { .stability = InputStability::Unwitnessed, .path = "/r/src/missing.hpp" });
 }
 
 TEST_CASE("A whole-second stamp in T0's own second counts as moved", "[input-witness][1650]")
@@ -387,7 +395,7 @@ TEST_CASE("The witnessed content refuses a late path whose identity moves while 
           == std::expected<std::string, ManifestFault> { std::unexpected(ManifestFault::ChangedDuringInvocation) });
 }
 
-TEST_CASE("A value that is not a verdict answers its own row, never the nearest", "[input-witness][1650]")
+TEST_CASE("A value that is not a verdict answers its own row and never the nearest", "[input-witness][1650]")
 {
     auto const& row = RowOf(InputStability::Last);
     CHECK(&row == &UnknownStabilityRow);
@@ -397,4 +405,62 @@ TEST_CASE("A value that is not a verdict answers its own row, never the nearest"
     CHECK(row.sentence == "an unknown input verdict");
     CHECK(DescribeInstability({ .stability = InputStability::Last, .path = "/r/a.cpp" })
           == "an unknown input verdict: /r/a.cpp");
+}
+
+TEST_CASE("A header that cannot be identified at the snapshot is Unwitnessed though it can be hashed",
+          "[input-witness][1650]")
+{
+    // Snapshot rule 1, both identity arms at once: the hash is there, so only the identity arms can tell.
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.identities.erase(std::string { Header });
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey() == StabilityFinding { .stability = InputStability::Unwitnessed, .path = std::string { Header } });
+}
+
+TEST_CASE("A header that vanishes while it is hashed is Unwitnessed with hashing on or off", "[input-witness][1650]")
+{
+    // Snapshot rule 1's `!after` arm alone. With hashing off the empty-hash arm cannot stand in.
+    for (auto const hashing: { ContentHashing::Yes, ContentHashing::No })
+    {
+        auto files = QuietFiles();
+        files.sequences[std::string { Header }] = { OldIdentity(2), std::nullopt };
+        auto witness = InputWitness::Begin(std::string { Tu }, files, hashing);
+        files.now = 2'000;
+        witness.Snapshot(HeaderOnly, files);
+        CHECK(witness.AtKey()
+              == StabilityFinding { .stability = InputStability::Unwitnessed, .path = std::string { Header } });
+    }
+}
+
+TEST_CASE("A header that appears while it is hashed is Unwitnessed with hashing on or off", "[input-witness][1650]")
+{
+    // Snapshot rule 1's `!before` arm alone; the TU is unsequenced, so the header's queue is untouched
+    // until the snapshot.
+    for (auto const hashing: { ContentHashing::Yes, ContentHashing::No })
+    {
+        auto files = QuietFiles();
+        files.sequences[std::string { Header }] = { std::nullopt, OldIdentity(2) };
+        auto witness = InputWitness::Begin(std::string { Tu }, files, hashing);
+        files.now = 2'000;
+        witness.Snapshot(HeaderOnly, files);
+        CHECK(witness.AtKey()
+              == StabilityFinding { .stability = InputStability::Unwitnessed, .path = std::string { Header } });
+    }
+}
+
+TEST_CASE("A second snapshot decides afresh and does not inherit the first one's finding", "[input-witness][1650]")
+{
+    auto files = QuietFiles();
+    auto witness = InputWitness::Begin(std::string { Tu }, files, ContentHashing::Yes);
+    files.Set(std::string { Header }, "h-v2", 1'500, 2); // after T0
+    files.now = 2'000;
+    witness.Snapshot(HeaderOnly, files);
+    REQUIRE(witness.AtKey()
+            == StabilityFinding { .stability = InputStability::MovedBeforeKey, .path = std::string { Header } });
+    files.Set(std::string { Header }, "h-v1", 10, 2); // quiet again
+    witness.Snapshot(HeaderOnly, files);
+    CHECK(witness.AtKey() == StabilityFinding { .stability = InputStability::Stable, .path = "" });
+    CHECK(witness.KeyedHash(Header) == std::optional<std::string> { "h-v1" });
 }
