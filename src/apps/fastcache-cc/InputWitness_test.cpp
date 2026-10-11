@@ -206,8 +206,8 @@ TEST_CASE("A change time equal to T0 counts as moved, one tick earlier does not"
     // Review focus 5: the boundary is >=, so a change in T0's own coarse tick fails closed.
     // T0 is the fence, 1007: neither it nor 1006 lies on a coarser stamp grid, so both are compared
     // at one-tick granularity and the boundary is exactly T0.
-    for (auto const [changeTime, expected]: { std::pair { FileInstant { 1'007 }, InputStability::MovedBeforeKey },
-                                              std::pair { FileInstant { 1'006 }, InputStability::Stable } })
+    for (auto const& [changeTime, expected]: { std::pair { FileInstant { 1'007 }, InputStability::MovedBeforeKey },
+                                               std::pair { FileInstant { 1'006 }, InputStability::Stable } })
     {
         auto files = QuietFiles();
         files.Set(std::string { Header }, "h-v1", changeTime, 2);
