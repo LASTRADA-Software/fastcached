@@ -1683,15 +1683,17 @@ would have spoiled is still served. Three rules make it hold, and each has alrea
 - **Change time, never last-write time.** `copy`, `CopyFileW`, robocopy and `utimensat` keep a
   file's mtime; #1650's own reproduction used `CopyFileW`, which an mtime check cannot see.
 - **The clock at T0, identity after T1'.** A file whose change time is at or after T0 moved
-  while the key was taken; after T1' every entry's stamp is older than T0, so any rewrite moves
-  its identity. The clock is read COARSE, so it is never later than the stamp of a change that
-  follows it -- a finer clock calls such a change older than the invocation.
+  while the key was taken, compared through `Cc::ChangedAtOrAfter`, never a raw `>=`: it floors
+  T0 to the grid the stamp itself shows (the largest of 2 s down to 10 ns that divides it),
+  because exFAT stamps at 10 ms and HFS+ at 1 s, and a change in T0's own slot is stamped BELOW
+  T0. After T1' every entry's stamp is below that floor, so any rewrite moves its identity.
 - **Nothing the witness holds travels.** No identity reaches a key or a manifest, or two
   checkouts stop sharing; `InputWitness_test`'s two-checkout case pins the bytes.
 
-The one clock comparison that can fail OPEN is the preprocess window on a filesystem whose clock
-lags this machine's (a network share) -- the TU's own T0/T1' comparison still holds there, a
-header's does not. Documented, not closed: refusing remote filesystems would remove a feature.
+The clock comparison can fail OPEN in the preprocess window in two places: a stamp from ANOTHER
+machine's clock that lags this one (a network share, a WSL `/mnt/<drive>` the Windows host
+stamps), and a stamp grid that is not a decimal unit or 2 s. The TU's own T0/T1' comparison still
+holds there; a header's does not. Documented, not closed: refusing remote filesystems would remove a feature.
 ```
 
 Add an `## Open work` entry with the issue from Step 1 as its leading reference, in the shape of the existing entries: the shadowing header, why the witness cannot see it, and that it was derived, not reproduced.
