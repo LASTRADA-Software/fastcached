@@ -527,6 +527,12 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
         fields.runtime.schedulerRole = WireRoles[static_cast<std::size_t>(_sources.scheduler->Role())].tag;
         fields.runtime.leaderEndpoint = _sources.scheduler->LeaderEndpoint();
     }
+    // A node that runs consensus and no scheduler still knows where the leader is: it redirects every
+    // scheduling verb there (#1641). Read from the redirect's own source, so this reply and the
+    // redirect name one leader -- or, once that leader is silent past the election timeout, both
+    // nobody. The role stays absent: this node is in no scheduler election.
+    else if (_sources.schedulingLeader != nullptr)
+        fields.runtime.leaderEndpoint = _sources.schedulingLeader->LeaderSchedulingEndpoint();
 
     // The one state in this record an operator may act on within seconds of reading it:
     // while an auto-approve window is armed, any machine that can route to this node's 0xFC

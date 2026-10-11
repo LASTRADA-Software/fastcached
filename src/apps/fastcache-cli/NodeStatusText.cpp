@@ -180,4 +180,21 @@ std::optional<std::string> DescribeConditions(
     return std::format("raised: {}", raised);
 }
 
+bool ReportsConsensus(CompileCacheWire::NodeStatusFields const* status) noexcept
+{
+    return status != nullptr
+           && ((status->components & CompileCacheWire::NodeComponentBit::Consensus) != 0
+               || status->runtime.schedulerRole.has_value());
+}
+
+std::optional<std::string> NamedLeader(CompileCacheWire::NodeStatusFields const& status)
+{
+    auto const& runtime = status.runtime;
+    if (!runtime.leaderEndpoint.empty())
+        return runtime.leaderEndpoint;
+    if (runtime.schedulerRole == CompileCacheWire::WireSchedulerRole::Leader)
+        return std::string { SelfLeader };
+    return std::nullopt;
+}
+
 } // namespace FastCache::Cli

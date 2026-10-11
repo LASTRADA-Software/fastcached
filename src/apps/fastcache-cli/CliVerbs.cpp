@@ -1158,14 +1158,27 @@ namespace
         // idle fleet. A node running no scheduler reports no role at all, which is what
         // keeps `undecided` meaning *an election is in progress*.
         if (fields.runtime.schedulerRole.has_value())
-        {
             record.push_back({ .name = "scheduler-role",
                                .value = TextCell(std::string { NameOfSchedulerRole(*fields.runtime.schedulerRole) }) });
-            // Empty is a READING here -- no leader is known -- so the field is present
-            // and ABSENT rather than missing, which would say this node could not tell.
+
+        // The leader is reported by every node running consensus, not only one running a
+        // scheduler: a learner schedules nothing and redirects every scheduling verb to the
+        // leader, and names that leader here from the same source (#1641). Asked of
+        // `ReportsConsensus`, the predicate the `node` panel's leader line asks, so the two
+        // cannot disagree -- and the component bit rather than the standing, which is absent
+        // until a learner's tier attaches. Kept right after the role, so a scheduler's
+        // record reads as it always has.
+        //
+        // Empty is a READING here -- this node names no leader -- so the field is present
+        // and ABSENT rather than missing, which would say this node could not tell. On the
+        // leader itself empty means it leads, and the row says `this node`, read through
+        // `NamedLeader`, which the panel's leader line reads too, so the two spell it alike
+        // (#1647).
+        if (ReportsConsensus(&fields))
+        {
+            auto leader = NamedLeader(fields);
             record.push_back(
-                { .name = "leader",
-                  .value = fields.runtime.leaderEndpoint.empty() ? AbsentCell() : TextCell(fields.runtime.leaderEndpoint) });
+                { .name = "leader", .value = leader.has_value() ? TextCell(std::move(*leader)) : AbsentCell() });
         }
 
         // **The window an operator needs to know they left open.** The node encodes

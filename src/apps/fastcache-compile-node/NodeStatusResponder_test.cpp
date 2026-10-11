@@ -7,6 +7,7 @@
 #include "NodeRoster.hpp"
 #include "NodeStatusResponder.hpp"
 #include "Responders.hpp"
+#include "SchedulingRedirect.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/FleetPin.hpp>
@@ -19,6 +20,7 @@
 #include <FastCache/Metrics/StatsReading.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/LeaderRedirect.hpp>
 #include <FastCache/Protocol/LiveStream.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -284,6 +286,8 @@ struct DirectSources
     NodeRoster const* roster { nullptr };
     /// The Raft endpoint the resolver publishes; null reports the configuration's.
     Cc::IAdvertisedEndpointSource const* raftEndpoint { nullptr };
+    /// Where a node that redirects scheduling names the leader; null is a node that does not.
+    ISchedulingLeaderSource const* schedulingLeader { nullptr };
 };
 
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
@@ -325,7 +329,8 @@ struct Fixture
                                       .conditions = direct.conditions,
                                       .roster = direct.roster,
                                       .sharedCache = direct.sharedCache,
-                                      .raftEndpoint = direct.raftEndpoint } }
+                                      .raftEndpoint = direct.raftEndpoint,
+                                      .schedulingLeader = direct.schedulingLeader } }
     {
     }
 
@@ -748,6 +753,57 @@ TEST_CASE("Each scheduler role crosses the wire as its own tag, with the leader 
     // Empty is the READING -- no leader is known -- and the role beside it is what says
     // this node was in a position to know.
     CHECK(undecided.runtime.leaderEndpoint.empty());
+}
+
+TEST_CASE("A learner reports the leader its redirect names and no scheduler role",
+          "[node][node-status][scheduler-role][learner]")
+{
+    // #1641. A learner runs no scheduler, so `scheduler` is null and the role is ABSENT -- yet it
+    // knows where the leader is, because it redirects every scheduling verb there. ONE holder is
+    // handed to both the status and the redirect, the way `main` wires them, so the assertion is
+    // that the two answers agree rather than that each matches a string the case wrote twice.
+    core::platform::ManualClock clock;
+    KnownSchedulingLeader leader;
+    Distributed::LoopbackMembership membership;
+    SchedulingRedirectResponder redirect { membership, leader };
+    Fixture const learner { {}, clock, {}, std::nullopt, DirectSources { .schedulingLeader = &leader } };
+
+    // Where a launcher on this machine is sent, decoded through the launcher's own predicate.
+    auto const redirectedTo = [&]() -> std::optional<std::string> {
+        auto const reply = AnswerFrom(redirect,
+                                      Wire::Detail::EncodeRequest(Wire::CurrentVersion, Wire::Op::Lease, {}),
+                                      PeerIdentity { .host = "127.0.0.1" });
+        auto const shape = ShapeOf(reply);
+        // The code is pinned here, so it is passed as itself rather than unwrapped from the optional.
+        REQUIRE(shape.code == std::optional { Wire::ErrorCode::NotLeader });
+        auto const target = LeaderRedirectTarget(Wire::ErrorCode::NotLeader, shape.detail);
+        return target.has_value() ? std::optional { std::string { Unwrap(target) } } : std::nullopt;
+    };
+
+    leader.Publish("office-a.example.com:6674");
+    auto const named = learner.status.Describe();
+    CHECK(named.runtime.leaderEndpoint == "office-a.example.com:6674");
+    CHECK(redirectedTo() == std::optional { named.runtime.leaderEndpoint });
+    // Absence is the truth: this node is in no scheduler election, and `undecided` would say it is.
+    CHECK_FALSE(named.runtime.schedulerRole.has_value());
+
+    // A leader silent past the election timeout is unpublished; both answers name nobody at once.
+    leader.Publish("");
+    auto const unnamed = learner.status.Describe();
+    CHECK(unnamed.runtime.leaderEndpoint.empty());
+    CHECK_FALSE(redirectedTo().has_value());
+    CHECK_FALSE(unnamed.runtime.schedulerRole.has_value());
+}
+
+TEST_CASE("A node that neither schedules nor redirects reports no leader and no role", "[node][node-status][scheduler-role]")
+{
+    // The control for the case above: the responder invents no leader without a source. Which
+    // sources a node is handed is decided in `main`, which no test reaches (#1646).
+    core::platform::ManualClock clock;
+    Fixture const worker { {}, clock, { .worker = true } };
+    auto const fields = worker.status.Describe();
+    CHECK(fields.runtime.leaderEndpoint.empty());
+    CHECK_FALSE(fields.runtime.schedulerRole.has_value());
 }
 
 TEST_CASE("A consensus node reports the address peers DIAL, which is not the one it bound", "[node][node-status][consensus]")

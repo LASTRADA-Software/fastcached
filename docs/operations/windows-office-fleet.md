@@ -43,8 +43,8 @@ a cluster of one, leads it, schedules for it and works for it. Check:
 fastcache-cli node
 ```
 
-`scheduler-role` reads `leader`, `consensus-standing` reads `voter`, and `node-id` and
-`public-key` name A. The service logs on as `NT SERVICE\FastCacheCompileNode` and keeps its
+`scheduler-role` reads `leader`, `leader` reads `this node`, `consensus-standing` reads `voter`,
+and `node-id` and `public-key` name A. The service logs on as `NT SERVICE\FastCacheCompileNode` and keeps its
 identity under `%ProgramData%\fastcache-node`, readable only by SYSTEM, Administrators and that
 account. The install opens the Windows Firewall, on every network profile, for the node port
 (TCP 6674), the consensus port (TCP 6680) and discovery (UDP 6681, and the reply port UDP 6682,
@@ -151,7 +151,9 @@ fastcache-compile-node --enroll-approve=<node-id>@<key>
 ```
 
 The machine becomes a learner of the fleet at its next poll; `fastcache-cli node` on it then
-reads `consensus-standing` `learner`. `--enroll-reject=<node-id>` refuses a row: that machine is
+reads `consensus-standing` `learner`, and `leader` names the leader's scheduling endpoint -- the
+one the PC's launcher is sent to -- or `-` while it has heard from no leader within the election
+timeout. `--enroll-reject=<node-id>` refuses a row: that machine is
 told so and leaves the fleet alone for an hour before it asks again. Rejecting a machine that was already approved does not remove it:
 `--cluster-forget` does (step 6). `--enroll-clear` drops every undecided row, for a list
 somebody filled. One address may hold at most four undecided rows at a time, and a machine that

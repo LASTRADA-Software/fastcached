@@ -1222,7 +1222,12 @@ struct RouteParts
                                    .sharedCache = &sharedCacheStatus,
                                    // The Raft endpoint the resolver publishes, so a roamed node
                                    // reports where peers dial it NOW rather than at the start.
-                                   .raftEndpoint = &raftAnnounced },
+                                   .raftEndpoint = &raftAnnounced,
+                                   // The redirect's own source, so `fastcache-cli node` on a
+                                   // learner names the leader its launchers are sent to (#1641);
+                                   // null on a node that schedules or runs no consensus. Declared
+                                   // well before this responder, so it outlives it.
+                                   .schedulingLeader = AddressWhen(Node::RedirectsScheduling(cfg), knownSchedulingLeader) },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore
