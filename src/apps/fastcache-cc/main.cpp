@@ -59,8 +59,9 @@
 #include "FileBytes.hpp"
 #include "HitVerification.hpp"
 #include "IProcessRunner.hpp"
+#include "InputFiles.hpp"
+#include "InputWitness.hpp"
 #include "LauncherCli.hpp"
-#include "ManifestContentTestSupport.hpp"
 #include "MarkerDiscovery.hpp"
 #include "NotePathCollapse.hpp"
 #include "ParallelFor.hpp"
@@ -89,6 +90,7 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -1990,6 +1992,52 @@ void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
     Note(record.verbose, std::format("not recording a direct-mode manifest ({})", reason));
 }
 
+/// The dependency paths a manifest is built from: the probe's, or -- when the probe came back
+/// with nothing and the reason was not unreadable notes -- the build's own depfile, which the
+/// compile has just written. Reconciled either way.
+///
+/// One function, because it runs twice and the two must agree: before the STORE, where the input
+/// witness checks every path the manifest will hash (#1650), and in `RecordManifest`.
+/// @param probed     The preprocess probe's own dependency answer.
+/// @param cmd        The parsed compile command; names the build's depfile.
+/// @param reconciler Translates a driver's spelling into this build's.
+/// @return The paths, as the compiler spelled them.
+[[nodiscard]] std::vector<std::string> ManifestDependencies(ProbedDependencies const& probed,
+                                                            Cc::ParsedCommand const& cmd,
+                                                            Cc::RootReconciler& reconciler)
+{
+    // The probe's set, taken as it stands. It is already reconciled -- `Preprocess`
+    // does that at its own boundary -- and it covers both driver families, which is
+    // why the two stream parses that used to be here are gone rather than moved.
+    auto includes = probed.paths;
+
+    // The build's OWN depfile, when the probe came back with nothing and the reason
+    // was not that its notes were unreadable.
+    //
+    // Kept rather than dropped with the parses, and the reason is asymmetric.
+    // `Preprocess` has two documented ways to yield an empty set on a depfile driver
+    // -- its scratch destination was not writable, or the driver wrote the file and
+    // put nothing in it -- and it DEGRADES rather than failing, because an empty
+    // dependency set costs the KEY only its moved-header protection. It costs the
+    // MANIFEST everything: direct mode would be off in that tree permanently and
+    // silently, on every compile. The build's own `-MF` names the same headers.
+    //
+    // Guarded on `unreadable` so it cannot paper over the localized case: an MSVC
+    // build has no depfile to read there, and the operator needs the sentence below
+    // rather than the second empty answer arrived at by a different route, which
+    // `RecordManifest` turns into its "does not read" sentence.
+    if (includes.empty() && !probed.unreadable)
+        if (auto const depText = ReadDepFile(cmd))
+        {
+            includes = Cc::ParseDepFilePaths(*depText);
+            // Reconciled here because this set came straight off disk, unlike the
+            // probe's. Resolution is memoized and idempotent, so it costs a hash
+            // lookup per path.
+            reconciler.DependencyList(includes);
+        }
+    return includes;
+}
+
 /// Record the direct-mode manifest for a compile whose object bytes are already
 /// stored, so the next compile of this TU can skip preprocessing.
 ///
@@ -2022,6 +2070,8 @@ void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
 /// @param objectKeyForPointer Key the object is already stored under; recorded in
 ///                            the manifest so the object is never stored twice.
 /// @param reconciler      Translates a driver's spelling into this build's.
+/// @param content         Where each entry's hash comes from: the input witness's T1'
+///                        snapshot, the content the key was taken from (#1650).
 void RecordManifest(InvocationRecord const& record,
                     Config const& cfg,
                     Cc::ParsedCommand const& cmd,
@@ -2031,7 +2081,8 @@ void RecordManifest(InvocationRecord const& record,
                     std::string const& toolchainStamp,
                     ProbedDependencies const& probed,
                     std::string_view objectKeyForPointer,
-                    Cc::RootReconciler& reconciler)
+                    Cc::RootReconciler& reconciler,
+                    Cc::IManifestContent const& content)
 {
     auto const workingDirectoryText = workingDirectory.string();
     auto const resolvedSource = reconciler.Directory(cmd.source);
@@ -2047,34 +2098,7 @@ void RecordManifest(InvocationRecord const& record,
         return;
     }
 
-    // The probe's set, taken as it stands. It is already reconciled -- `Preprocess`
-    // does that at its own boundary -- and it covers both driver families, which is
-    // why the two stream parses that used to be here are gone rather than moved.
-    auto includes = probed.paths;
-
-    // The build's OWN depfile, when the probe came back with nothing and the reason
-    // was not that its notes were unreadable.
-    //
-    // Kept rather than dropped with the parses, and the reason is asymmetric.
-    // `Preprocess` has two documented ways to yield an empty set on a depfile driver
-    // -- its scratch destination was not writable, or the driver wrote the file and
-    // put nothing in it -- and it DEGRADES rather than failing, because an empty
-    // dependency set costs the KEY only its moved-header protection. It costs the
-    // MANIFEST everything: direct mode would be off in that tree permanently and
-    // silently, on every compile. The build's own `-MF` names the same headers.
-    //
-    // Guarded on `unreadable` so it cannot paper over the localized case: an MSVC
-    // build has no depfile to read there, and the operator needs the sentence below
-    // rather than a second empty answer arrived at by a different route.
-    if (includes.empty() && !probed.unreadable)
-        if (auto const depText = ReadDepFile(cmd))
-        {
-            includes = Cc::ParseDepFilePaths(*depText);
-            // Reconciled here because this set came straight off disk, unlike the
-            // probe's. Resolution is memoized and idempotent, so it costs a hash
-            // lookup per path.
-            reconciler.DependencyList(includes);
-        }
+    auto includes = ManifestDependencies(probed, cmd, reconciler);
 
     // Asked here as well as on the key path, because a manifest is the direct-mode
     // half of the same promise: an entry naming a path this host could not read is
@@ -2118,7 +2142,6 @@ void RecordManifest(InvocationRecord const& record,
     // caller cannot omit it: `ReportedDependencies` has no default constructor, so
     // there is no way to leave the question unanswered.
     auto const reported = includes.size();
-    Cc::Test::HashedWhenAsked const recordTimeContent; // Replaced by the input witness in Task 5 (#1650).
     auto const manifest = Cc::BuildManifest(
         { .sourcePath = resolvedSource,
           .reportedDependencies = includes.empty() ? Cc::ReportedDependencies::NotObserved()
@@ -2126,7 +2149,7 @@ void RecordManifest(InvocationRecord const& record,
           .workingDirectory = workingDirectoryText,
           .toolchainStamp = toolchainStamp,
           .objectKey = std::string { objectKeyForPointer },
-          .content = recordTimeContent },
+          .content = content },
         layout);
     if (!manifest.has_value())
     {
@@ -2185,6 +2208,61 @@ void RecordManifest(InvocationRecord const& record,
              std::string_view { reinterpret_cast<char const*>(manifestFrame.data()), manifestFrame.size() });
     if (record.verbose)
         std::cerr << "fastcache-cc: MANIFEST stored key=" << manifestKey << " entries=" << manifest->entries.size() << '\n';
+}
+
+/// What the input witness hashes (#1650): contents only when a manifest may be recorded. With
+/// direct mode off there is no manifest, and the STORE is guarded by identity alone.
+/// @param cfg Launcher config.
+/// @return Whether the witness hashes contents.
+[[nodiscard]] Cc::ContentHashing WitnessHashing(Config const& cfg)
+{
+    return cfg.direct ? Cc::ContentHashing::Yes : Cc::ContentHashing::No;
+}
+
+/// Whether a preprocessed HIT backfills its direct-mode manifest: in direct mode, and only when the
+/// key's own snapshot (T1') was sound, since the manifest records the hashes taken there (#1650).
+/// Says so when the witness is why not; the hit itself is served either way.
+/// @param cfg     Launcher config.
+/// @param witness The invocation's input witness, after its T1' snapshot.
+/// @param verbose Whether to say so.
+/// @return True when the manifest may be recorded.
+[[nodiscard]] bool BackfillsManifest(Config const& cfg, Cc::InputWitness const& witness, bool verbose)
+{
+    if (!cfg.direct)
+        return false;
+    auto const atKey = witness.AtKey();
+    if (Cc::RowOf(atKey.stability).manifest == Cc::KeepManifest::Yes)
+        return true;
+    Note(verbose, std::format("{}; served the hit, recorded no manifest", Cc::DescribeInstability(atKey)));
+    return false;
+}
+
+/// T2's decision (#1650): whether a compiled object may be stored. When it may not, records the
+/// verdict's outcome and finding, says so, and still records the manifest where the verdict's
+/// `Cc::StabilityTable` row allows it -- from the content the key was taken from.
+/// @param record         The invocation record; takes the row's outcome and the finding as its detail.
+/// @param cfg            Launcher config; a manifest is recorded only in direct mode.
+/// @param moved          The witness's verdict after the compile.
+/// @param recordManifest Records the manifest from the keyed content.
+/// @return Whether the object may be stored.
+[[nodiscard]] Cc::StoreObject GuardStore(InvocationRecord& record,
+                                         Config const& cfg,
+                                         Cc::StabilityFinding const& moved,
+                                         std::invocable auto const& recordManifest)
+{
+    auto const& row = Cc::RowOf(moved.stability);
+    if (row.store == Cc::StoreObject::Yes)
+        return Cc::StoreObject::Yes;
+    auto const keepsManifest = cfg.direct && row.manifest == Cc::KeepManifest::Yes;
+    record.outcome = row.outcome; // INPUTS-MOVED for a moved input, UNCACHEABLE for an unobservable one (Ruling 10)
+    record.outcomeDetail = Cc::DescribeInstability(moved);
+    Note(record.verbose,
+         std::format("{}; compiled, not stored{}",
+                     Cc::DescribeInstability(moved),
+                     keepsManifest ? "; manifest recorded from the keyed content" : ""));
+    if (keepsManifest)
+        recordManifest();
+    return Cc::StoreObject::No;
 }
 
 /// DIRECT MODE. Preprocessing a translation unit to derive its key costs ~1.4 s
@@ -2837,6 +2915,24 @@ void RecordManifest(InvocationRecord const& record,
                 record, cfg, cmd, argv, layout, workingDirectory, relativizedArgs, toolchainStamp, reconciler, checkout))
             return served;
 
+    // T0 (#1650). The key, the object and the manifest are each taken from the filesystem at a
+    // different moment, and a save between them filed one content's object or manifest under
+    // another content's key -- served as a HIT, exit 0, to every checkout and machine whose
+    // files match the saved version. The witness snapshots every input here, after the key's
+    // preprocess and after the compile, and `Cc::StabilityTable` decides what of this invocation
+    // is still sound. Hashing only when a manifest may be recorded: with direct mode off the
+    // STORE is guarded by identity alone.
+    //
+    // The TU is resolved exactly as `BuildManifest` resolves `RecordManifest`'s `resolvedSource`,
+    // so the witness's entry for it is the one `KeyedHash` is asked about.
+    auto const inputFiles = Cc::MakeDiskInputFiles();
+    auto const workingDirectoryText = workingDirectory.string();
+    auto witness =
+        Cc::InputWitness::Begin(Cc::ResolveAgainst(reconciler.Directory(cmd.source), workingDirectoryText, layout),
+                                *inputFiles,
+                                WitnessHashing(cfg));
+    Cc::WitnessedManifestContent const keyedContent { witness, *inputFiles };
+
     auto const preprocessStarted = std::chrono::steady_clock::now();
     // Scoped, and the text MOVED through it rather than copied: the preprocessed
     // form of a real translation unit runs to several megabytes, and everything
@@ -2975,8 +3071,28 @@ void RecordManifest(InvocationRecord const& record,
         // manifest's is the one that runs on every build rather than only on a
         // distributed one.
         probed = { .paths = std::move(probe->dependencyPaths), .unreadable = probe->dependenciesUnreadable };
+
+        // T1': what the key was just taken from. These hashes are what a manifest records.
+        witness.Snapshot(Cc::ProjectDependencyPaths(probed.paths, workingDirectoryText, layout), *inputFiles);
     }
     record.preprocessMs = MsSince(preprocessStarted);
+
+    // Every manifest this invocation records -- the backfill on a HIT, the one kept when the
+    // object is not stored, and the one after the STORE -- is built from the content the key was
+    // taken from, never from the disk as it stands after the compile (#1650).
+    auto const recordManifest = [&] {
+        RecordManifest(record,
+                       cfg,
+                       cmd,
+                       layout,
+                       workingDirectory,
+                       relativizedArgs,
+                       toolchainStamp,
+                       probed,
+                       key,
+                       reconciler,
+                       keyedContent);
+    };
 
     auto const cacheStarted = std::chrono::steady_clock::now();
 
@@ -3122,17 +3238,12 @@ void RecordManifest(InvocationRecord const& record,
                     // in the producer's language, so parsing it made the backfill work only
                     // between machines that happened to share a locale (issue #692). The
                     // probe already ran, so this still costs no compiler invocation.
-                    if (cfg.direct)
-                        RecordManifest(record,
-                                       cfg,
-                                       cmd,
-                                       layout,
-                                       workingDirectory,
-                                       relativizedArgs,
-                                       toolchainStamp,
-                                       probed,
-                                       key,
-                                       reconciler);
+                    //
+                    // The hit is served whatever moved: its object was compiled from exactly the
+                    // text this key hashes. Only a manifest built from hashes that may not
+                    // describe that text is refused (#1650).
+                    if (BackfillsManifest(cfg, witness, record.verbose))
+                        recordManifest();
 
                     // The preprocessed-key hit, verified exactly as the direct-mode one
                     // is. Both paths, because a wrong object served through either is the
@@ -3236,6 +3347,15 @@ void RecordManifest(InvocationRecord const& record,
         Note(record.verbose, "the cache did not serve the fetch; not offering this object to it");
         return code;
     }
+
+    // T2 (#1650). The object belongs to the key only if nothing the key was taken from moved
+    // while the compile -- local or dispatched, whose second preprocess is inside this window --
+    // was reading it.
+    auto const moved = witness.AfterCompile(
+        Cc::ProjectDependencyPaths(ManifestDependencies(probed, cmd, reconciler), workingDirectoryText, layout),
+        *inputFiles);
+    if (GuardStore(record, cfg, moved, recordManifest) == Cc::StoreObject::No)
+        return code;
 
     auto const objectBytes = Cc::ReadFileBytes(cmd.objPath);
     if (!objectBytes.has_value())
@@ -3396,7 +3516,7 @@ void RecordManifest(InvocationRecord const& record,
     // lands on RAM where compression cannot help. A direct hit therefore costs one
     // extra fetch to follow the pointer — see DirectManifest::objectKey.
     if (cfg.direct)
-        RecordManifest(record, cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, probed, key, reconciler);
+        recordManifest();
     return code;
 }
 
