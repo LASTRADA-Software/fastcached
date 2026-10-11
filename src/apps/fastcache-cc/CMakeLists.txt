@@ -167,6 +167,7 @@ set(_fc_cc_sources
     DependencyProbe.cpp
     DirectManifest.cpp
     HitVerification.cpp
+    InputFiles.cpp
     MarkerDiscovery.cpp
     NotePathCollapse.cpp
     ObjectEquivalence.cpp
@@ -300,6 +301,7 @@ if(FASTCACHED_BUILD_TESTS)
         ParallelFor_test.cpp
         CacheProtocol_test.cpp
         HitVerification_test.cpp
+        InputFiles_test.cpp
         ObjectEquivalence_test.cpp
         ObjectSections_test.cpp
         CompileCorrelation_test.cpp
