@@ -260,6 +260,13 @@ TEST_CASE("Every verdict decides the STORE and the manifest exactly", "[input-wi
     CHECK(RowOf(InputStability::MovedBeforeKey).manifest == KeepManifest::No);
     CHECK(RowOf(InputStability::Unwitnessed).store == StoreObject::No);
     CHECK(RowOf(InputStability::Unwitnessed).manifest == KeepManifest::No);
+    // And what the statistics record when the object is not stored: a race with an editor is
+    // INPUTS-MOVED, while an input that could not be observed is usually a lasting condition
+    // (an unreadable file), which the next build would meet again, so it is UNCACHEABLE.
+    CHECK(RowOf(InputStability::Stable).outcome == Outcome::Miss);
+    CHECK(RowOf(InputStability::MovedDuringCompile).outcome == Outcome::InputsMoved);
+    CHECK(RowOf(InputStability::MovedBeforeKey).outcome == Outcome::InputsMoved);
+    CHECK(RowOf(InputStability::Unwitnessed).outcome == Outcome::Uncacheable);
     CHECK(DescribeInstability({ .stability = InputStability::MovedDuringCompile, .path = "/r/a.cpp" })
           == "an input changed during the compile: /r/a.cpp");
     CHECK(DescribeInstability({ .stability = InputStability::Stable, .path = "" }).empty());
@@ -403,6 +410,7 @@ TEST_CASE("A value that is not a verdict answers its own row and never the neare
     CHECK(row.store == StoreObject::No);
     CHECK(row.manifest == KeepManifest::No);
     CHECK(row.sentence == "an unknown input verdict");
+    CHECK(row.outcome == Outcome::Uncacheable);
     CHECK(DescribeInstability({ .stability = InputStability::Last, .path = "/r/a.cpp" })
           == "an unknown input verdict: /r/a.cpp");
 }

@@ -452,6 +452,31 @@ namespace
         return row != nullptr ? row->outcome : DispatchOutcome::Unknown;
     }
 
+    /// Whether the cache was ASKED for this compile's object, which is what a hit rate is rated
+    /// against: a hit, a miss, a hit `FASTCACHE_VERIFY` rejected (the cache answered, wrongly),
+    /// and a compile an input moved during (the cache was asked and did not hit). Not a compile
+    /// the launcher refused to key, nor one whose cache could not be reached.
+    ///
+    /// The one definition: the tally's `Servable()` and the trend chart's per-day bucket both ask
+    /// it, and the `switch` has no `default`, so a new outcome is decided here or does not build.
+    /// @param outcome A record's outcome.
+    /// @return True when it belongs in the hit rate's denominator.
+    [[nodiscard]] constexpr bool CountsAsServable(Outcome outcome) noexcept
+    {
+        switch (outcome)
+        {
+            case Outcome::Hit:
+            case Outcome::Miss:
+            case Outcome::VerifyMismatch:
+            case Outcome::InputsMoved:
+                return true;
+            case Outcome::Uncacheable:
+            case Outcome::Unavailable:
+                break;
+        }
+        return false;
+    }
+
     /// Per-group tallies folded from the log.
     struct Tally
     {
@@ -465,6 +490,8 @@ namespace
         std::uint64_t verifyMismatches {};
         /// Compiles an input changed during; see `Outcome::InputsMoved`.
         std::uint64_t inputsMoved {};
+        /// Records `CountsAsServable` admits; read through `Servable()`.
+        std::uint64_t servableCount {};
 
         // Full sample sets, not running sums: the point of the distribution is the
         // shape (a bimodal miss profile means something an average hides).
@@ -505,15 +532,11 @@ namespace
             return hits + misses + uncacheable + unavailable + verifyMismatches + inputsMoved;
         }
 
-        /// The compiles the cache ANSWERED, which is what a hit rate is rated against.
-        ///
-        /// A rejected hit is one of them -- the cache answered, wrongly -- so it counts
-        /// in the denominator and not in the numerator. So is a compile an input moved
-        /// during: the cache was asked and did not hit. One definition, because the text
-        /// and the HTML report both rate against it.
+        /// The compiles the cache was ASKED for, which is what a hit rate is rated against;
+        /// which outcomes those are is `CountsAsServable`'s answer, never restated here.
         [[nodiscard]] std::uint64_t Servable() const noexcept
         {
-            return hits + misses + verifyMismatches + inputsMoved;
+            return servableCount;
         }
 
         /// Sum the per-state dispatch counters whose row has @p column set.
@@ -1033,7 +1056,7 @@ namespace
                 << '\n';
         if (tally.inputsMoved > 0)
             out << "  inputs moved : " << Colorize(std::to_string(tally.inputsMoved), palette.neutral, palette.reset)
-                << "  (an input changed during the compile; nothing was stored)\n";
+                << "  (an input changed while the key was taken or during the compile; object not stored)\n";
         if (tally.unavailable > 0)
             out << "  unavailable  : " << Colorize(std::to_string(tally.unavailable), palette.bad, palette.reset) << "  ("
                 << Percent(tally.unavailable, tally.Total()) << " of all compiles -- "
@@ -1324,6 +1347,8 @@ namespace
                         ++tally->inputsMoved;
                         break;
                 }
+                if (CountsAsServable(record.outcome))
+                    ++tally->servableCount;
                 if (!record.detail.empty())
                     ++tally->reasons[record.detail];
 
@@ -1547,12 +1572,8 @@ namespace
             auto& bucket = byDay[day];
             ++bucket.volume;
             if (record.outcome == Outcome::Hit)
-            {
                 ++bucket.hits;
-                ++bucket.servable;
-            }
-            else if (record.outcome == Outcome::Miss || record.outcome == Outcome::VerifyMismatch
-                     || record.outcome == Outcome::InputsMoved)
+            if (CountsAsServable(record.outcome))
                 ++bucket.servable;
         }
         return { byDay.begin(), byDay.end() };

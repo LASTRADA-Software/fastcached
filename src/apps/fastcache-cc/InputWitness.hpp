@@ -3,6 +3,7 @@
 
 #include "DirectManifest.hpp"
 #include "InputFiles.hpp"
+#include "Stats.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
 
@@ -64,23 +65,35 @@ struct StabilityRow
     StoreObject store;         ///< Whether the object may be stored.
     KeepManifest manifest;     ///< Whether the manifest may be recorded.
     std::string_view sentence; ///< What happened, for the operator; empty for `Stable`.
+    /// What the statistics record for this verdict when the object is not stored.
+    ///
+    /// Unused for `Stable`, whose compile is stored and traced by the ordinary path; `Miss`
+    /// there names that path rather than a decision this row makes.
+    Outcome outcome;
 };
 
 /// One row per verdict, in enumerator order.
 inline constexpr EnumTable<InputStability, StabilityRow> StabilityTable { {
-    { .stability = InputStability::Stable, .store = StoreObject::Yes, .manifest = KeepManifest::Yes, .sentence = "" },
+    { .stability = InputStability::Stable,
+      .store = StoreObject::Yes,
+      .manifest = KeepManifest::Yes,
+      .sentence = "",
+      .outcome = Outcome::Miss },
     { .stability = InputStability::MovedDuringCompile,
       .store = StoreObject::No,
       .manifest = KeepManifest::Yes,
-      .sentence = "an input changed during the compile" },
+      .sentence = "an input changed during the compile",
+      .outcome = Outcome::InputsMoved },
     { .stability = InputStability::MovedBeforeKey,
       .store = StoreObject::No,
       .manifest = KeepManifest::No,
-      .sentence = "an input changed while the key was taken" },
+      .sentence = "an input changed while the key was taken",
+      .outcome = Outcome::InputsMoved },
     { .stability = InputStability::Unwitnessed,
       .store = StoreObject::No,
       .manifest = KeepManifest::No,
-      .sentence = "an input could not be observed" },
+      .sentence = "an input could not be observed",
+      .outcome = Outcome::Uncacheable },
 } };
 
 static_assert(RowsInEnumeratorOrder(StabilityTable, &StabilityRow::stability),
@@ -92,7 +105,8 @@ static_assert(RowsInEnumeratorOrder(StabilityTable, &StabilityRow::stability),
 inline constexpr StabilityRow UnknownStabilityRow { .stability = InputStability::Last,
                                                     .store = StoreObject::No,
                                                     .manifest = KeepManifest::No,
-                                                    .sentence = "an unknown input verdict" };
+                                                    .sentence = "an unknown input verdict",
+                                                    .outcome = Outcome::Uncacheable };
 
 /// @param stability A verdict.
 /// @return Its row; `UnknownStabilityRow` for a value that is not a verdict.

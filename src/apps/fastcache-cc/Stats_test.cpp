@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -156,13 +157,34 @@ void AppendRawLine(std::string_view line)
 
 } // namespace
 
-TEST_CASE("ToStringView round-trips every outcome token")
+TEST_CASE("ToStringView names every outcome by its token")
 {
     CHECK(ToStringView(Outcome::Hit) == "HIT");
     CHECK(ToStringView(Outcome::Miss) == "MISS");
     CHECK(ToStringView(Outcome::Uncacheable) == "UNCACHEABLE");
     CHECK(ToStringView(Outcome::Unavailable) == "UNAVAILABLE");
     CHECK(ToStringView(Outcome::VerifyMismatch) == "VERIFY-MISMATCH");
+    CHECK(ToStringView(Outcome::InputsMoved) == "INPUTS-MOVED");
+}
+
+TEST_CASE("Every outcome reads back from the log as itself", "[stats][1650]")
+{
+    // Listed by hand: `Outcome` has no trailing `Last`, so `Enumerators<Outcome>()` cannot walk
+    // it, and giving it one would add an arm to every exhaustive switch over it for a value no
+    // record carries. `Unavailable` is last on purpose -- it is also what an unknown token reads
+    // back as, so a token the parser lost would pass for it; every other entry cannot.
+    ScopedStateDir const scoped;
+    constexpr std::array outcomes { Outcome::Hit,         Outcome::Miss,       Outcome::Uncacheable, Outcome::VerifyMismatch,
+                                    Outcome::InputsMoved, Outcome::Unavailable };
+    for (auto const outcome: outcomes)
+        AppendRecord(MakeRecord(outcome, "main", std::string { ToStringView(outcome) } + ".cpp", 10));
+    auto const records = ParseLog("");
+    REQUIRE(records.size() == outcomes.size());
+    for (auto const index: std::views::iota(std::size_t { 0 }, outcomes.size()))
+    {
+        INFO("record " << index << " written as " << ToStringView(outcomes.at(index)));
+        CHECK(records.at(index).outcome == outcomes.at(index));
+    }
 }
 
 TEST_CASE("A hit the verifier rejected is recorded as its own outcome and never as a hit")
@@ -243,6 +265,20 @@ TEST_CASE("FormatReport counts a compile an edit raced and names its source", "[
 
     auto const html = FormatHtmlReport("");
     CHECK(html.contains("inputs moved"));
+}
+
+TEST_CASE("A day's hit rate on the trend counts a compile an edit raced as asked of the cache", "[stats][1650]")
+{
+    ScopedStateDir const scoped;
+    for (auto const outcome: { Outcome::Hit, Outcome::InputsMoved })
+    {
+        auto record = MakeRecord(outcome, "main", "a.cpp", 10);
+        record.timestampUnixSeconds = 1'700'000'000; // both on one day
+        AppendRecord(record);
+    }
+    // One point at 50%: x = the left pad, y = top pad + half the plot height. Counted as a
+    // compile the cache was not asked for, the day would read 100% (cy="14.0").
+    CHECK(FormatHtmlReport("").contains(R"(<circle class="trend-point" cx="26.0" cy="94.0" r="3"/>)"));
 }
 
 TEST_CASE("A report with no raced compile says nothing about moved inputs", "[stats][1650]")
