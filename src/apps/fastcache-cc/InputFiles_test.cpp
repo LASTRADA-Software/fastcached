@@ -108,9 +108,14 @@ TEST_CASE("Retargeting a symlink changes the identity read through it", "[input-
     std::filesystem::remove(link);
     std::filesystem::create_symlink(scratch / "b.hpp", link);
     auto const second = files->Identify(link.string());
+    auto const target = files->Identify((scratch / "b.hpp").string());
     REQUIRE(first.has_value());
     REQUIRE(second.has_value());
+    REQUIRE(target.has_value());
     CHECK(Unwrap(first) != Unwrap(second));
+    // The link is FOLLOWED: what is read through it is its target's identity, which no inode
+    // reuse can produce by accident.
+    CHECK(Unwrap(second) == Unwrap(target));
 }
 #endif
 
@@ -149,4 +154,51 @@ TEST_CASE("A non-ASCII path is identified", "[input-files]")
     auto const path = (scratch.Path().string() + "/header-\xC3\xBC.hpp");
     CHECK(files->Identify(path).has_value());
     CHECK_FALSE(files->Hash(path).empty());
+}
+
+namespace
+{
+/// Whole seconds in the seam's unit, for stamps of a known granularity.
+constexpr FileInstant Seconds(std::int64_t count)
+{
+    return count * OneSecondOfFileTime;
+}
+
+/// Milliseconds in the seam's unit.
+constexpr FileInstant Milliseconds(std::int64_t count)
+{
+    return count * 1'000'000;
+}
+} // namespace
+
+TEST_CASE("A sub-second stamp is compared with the instant as it is", "[input-files]")
+{
+    // Not a whole second, so no granularity is inferred and nothing is floored.
+    auto const instant = Seconds(5) + Milliseconds(700) + 7;
+    CHECK(ChangedAtOrAfter(instant - 1, instant) == false);
+    CHECK(ChangedAtOrAfter(instant, instant) == true);
+}
+
+TEST_CASE("A whole odd second is judged against the instant's own second", "[input-files]")
+{
+    // A 1 s filesystem stamps a change at 5.9 s as 5 s. Unfloored, 5 s < 5.7 s would say "before".
+    CHECK(ChangedAtOrAfter(Seconds(5), Seconds(5) + Milliseconds(700)) == true);
+    // The previous second: 5 s is certainly before anything that happened at or after 6.7 s.
+    CHECK(ChangedAtOrAfter(Seconds(5), Seconds(6) + Milliseconds(700)) == false);
+}
+
+TEST_CASE("A whole even second is judged against the instant's two-second window", "[input-files]")
+{
+    // FAT stamps a change at 7.9 s as 6 s. A 1 s floor (7 s) would say "before".
+    CHECK(ChangedAtOrAfter(Seconds(6), Seconds(7) + Milliseconds(700)) == true);
+    // The previous 2 s window.
+    CHECK(ChangedAtOrAfter(Seconds(4), Seconds(7) + Milliseconds(700)) == false);
+}
+
+TEST_CASE("A pre-epoch instant is floored toward negative infinity", "[input-files]")
+{
+    // -1.3 s lies in the 2 s window starting at -2 s; truncating toward zero would put it at 0 s.
+    auto const instant = -Seconds(1) - Milliseconds(300);
+    CHECK(ChangedAtOrAfter(-Seconds(2), instant) == true);
+    CHECK(ChangedAtOrAfter(-Seconds(4), instant) == false);
 }

@@ -18,6 +18,21 @@ namespace FastCache::Cc
 
 namespace
 {
+#if !defined(_WIN32)
+    /// How far a FINE clock read is moved back, where no coarse clock answers. It bounds the lag of
+    /// a kernel's tick-granular file stamping behind a fine clock: a change made just after a fine
+    /// read can be stamped up to one tick earlier than that read. 10 ms is one tick at 100 Hz, the
+    /// coarsest tick in common use.
+    constexpr FileInstant FineClockSafetyTick = 10'000'000;
+
+    /// @param value An instant on the realtime clock.
+    /// @return The same instant in `FileInstant` units.
+    [[nodiscard]] FileInstant FromTimespec(timespec const& value) noexcept
+    {
+        return (static_cast<FileInstant>(value.tv_sec) * OneSecondOfFileTime) + value.tv_nsec;
+    }
+#endif
+
 #if defined(_WIN32)
     /// 1970-01-01 in FILETIME ticks (100 ns since 1601-01-01).
     constexpr std::int64_t UnixEpochAsFileTime = 116'444'736'000'000'000;
@@ -105,7 +120,7 @@ namespace
     #else
             auto const& changed = status.st_ctim;
     #endif
-            return FileIdentity { .changeTime = (static_cast<FileInstant>(changed.tv_sec) * 1'000'000'000) + changed.tv_nsec,
+            return FileIdentity { .changeTime = FromTimespec(changed),
                                   .size = static_cast<std::uint64_t>(status.st_size),
                                   .volumeId = static_cast<std::uint64_t>(status.st_dev),
                                   .fileIdHigh = 0,
@@ -128,11 +143,14 @@ namespace
 #else
             timespec now {};
     #if defined(CLOCK_REALTIME_COARSE)
-            ::clock_gettime(CLOCK_REALTIME_COARSE, &now);
-    #else
-            ::clock_gettime(CLOCK_REALTIME, &now);
+            if (::clock_gettime(CLOCK_REALTIME_COARSE, &now) == 0)
+                return FromTimespec(now);
     #endif
-            return (static_cast<FileInstant>(now.tv_sec) * 1'000'000'000) + now.tv_nsec;
+            if (::clock_gettime(CLOCK_REALTIME, &now) == 0)
+                return FromTimespec(now) - FineClockSafetyTick;
+            // No clock answered. Zero precedes every change time, so every input reads as changed:
+            // the invocation fails closed rather than trusting a witness it cannot time.
+            return 0;
 #endif
         }
     };
