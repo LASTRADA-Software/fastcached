@@ -5114,6 +5114,7 @@ else()
                 -Node "$<TARGET_FILE:fastcache-compile-node>"
                 -Launcher "$<TARGET_FILE:fastcache-cc>"
                 ${_fc_dist_e2e_cli}
+                ${_fc_e2e_edit_stub_windows}
         )
     else()
         # The client reads the scheduler's record of a worker whose lease came back
@@ -5130,6 +5131,7 @@ else()
                 --launcher "$<TARGET_FILE:fastcache-cc>"
                 --compiler "${CMAKE_CXX_COMPILER}"
                 ${_fc_dist_e2e_cli}
+                ${_fc_e2e_edit_stub_posix}
                 --case suite
         )
     endif()

@@ -32,6 +32,13 @@
 #                            again. The client stores the worker's result, so a
 #                            break here presents as a fleet that recompiles
 #                            everything forever while looking healthy.
+#  2b. Saved mid-dispatch  — a save landing after the key was taken and before the
+#                            dispatch preprocess reads the source stores nothing:
+#                            the worker compiled the SAVED content, and its object
+#                            must never be filed under the key of the content the
+#                            save replaced (#1650). Driven by `mid-compile-edit-stub`,
+#                            which `--edit-stub` names; without it the case FAILS
+#                            rather than skips.
 #   3. Fingerprint isolate — a worker whose toolchain fingerprint differs is NEVER
 #                            dispatched to, even when it is the only worker
 #                            registered. An over-loose match does not fail, it
@@ -87,7 +94,7 @@
 # Usage:
 #   dist-compile-e2e.sh --fastcached <path> --node <path> --launcher <path>
 #                       [--compiler <cxx>] [--case suite|self-test]
-#                       [--cli <fastcache-cli>]
+#                       [--cli <fastcache-cli>] [--edit-stub <mid-compile-edit-stub>]
 #
 # Exit codes: 0 = all assertions held; 1 = a failure; 77 = a runtime prerequisite
 # was missing (skip).
@@ -101,6 +108,9 @@ compiler="${CXX:-c++}"
 # withdrawal still fails, and cannot say which limit took the slots; see
 # `fail_if_withdrawn`.
 cli=""
+# The stub compiler case 2b runs through (src/tests/MidCompileEditStub.cpp). That case
+# FAILS without it: the ctest registration passes it whenever the stub is built.
+edit_stub=""
 
 # Which body of assertions to run: `suite` is the twelve cases above, and `self-test`
 # drives the pure verdict decisions below with no binary built.
@@ -113,6 +123,7 @@ while [[ $# -gt 0 ]]; do
         --launcher)   launcher="$2";   shift 2 ;;
         --compiler)   compiler="$2";   shift 2 ;;
         --cli)        cli="$2";        shift 2 ;;
+        --edit-stub)  edit_stub="$2";  shift 2 ;;
         --case)       mode="$2";       shift 2 ;;
         --self-test)  mode="self-test"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -1028,6 +1039,112 @@ bytes="$(metric_value "$after" fastcache_worker_bytes_received_total)"
 [[ -n "$bytes" && "$bytes" -ge 1 ]] \
     || { printf '%s\n' "$after" >&2; fail "worker received a job but its byte counter did not move"; }
 echo "   worker metrics moved: ${completed} job(s), ${millis}ms, ${bytes} bytes in"
+
+# --- 2b: a save between the key and the dispatch stores nothing (#1650) ------
+# The window #1650 derived and never reproduced: the key is taken over the source as it was
+# at T1, and a dispatched compile then preprocesses the source a SECOND time, with line
+# markers, for the worker. A save landing between the two hands the worker the SAVED
+# content, and its object came back under the OLD content's key. Before the fix, the step
+# below that restores the original content and builds it again was a HIT serving the
+# worker's object of the SAVED content under the original key -- exit 0, a wrong object,
+# and every checkout holding the original content fetching it. That is what this case
+# discriminates.
+#
+# No timing can place a save there, so the compiler the launcher runs is
+# `mid-compile-edit-stub` (src/tests/MidCompileEditStub.cpp): it forwards to the real one
+# and, once, overwrites the source in place right BEFORE forwarding the dispatch
+# preprocess (`-E` without `-P`), after the key's own preprocess has run.
+echo "== case 2b: a save between the key and the dispatch preprocess stores nothing"
+[[ -n "$edit_stub" ]] || fail "case 2b needs --edit-stub: the ctest registration (src/tests/CMakeLists.txt, dist-compile-e2e) passes it whenever the stub is built, and CI runs this script only through that registration"
+[[ -x "$edit_stub" ]] || fail "case 2b: the edit stub '${edit_stub}' is not an executable"
+real_compiler="$(command -v "$compiler")" || fail "case 2b cannot resolve the compiler '${compiler}'"
+moved="${workdir}/moved"
+mkdir -p "${moved}/stub" "${moved}/v1" "${moved}/v2"
+# Under the real compiler's own file name: the launcher picks its driver grammar by it.
+stub="${moved}/stub/$(basename "$real_compiler")"
+cp "$edit_stub" "$stub"
+chmod +x "$stub"
+
+# The worker serves only a matching toolchain fingerprint. A stub that changed it could be
+# dispatched nowhere, and every assertion below would then be about a LOCAL compile -- the
+# tautology distributed-compilation.md warns about. So it is refused here, never loosened.
+stub_fingerprint="$(FC_EDIT_STUB_REAL="$real_compiler" "$launcher" --print-toolchain-fingerprint "$stub")" \
+    || fail "the launcher could not fingerprint the edit stub"
+[[ "$stub_fingerprint" == "$fingerprint" ]] \
+    || fail "the edit stub changes the toolchain fingerprint (${stub_fingerprint} vs ${fingerprint}), so no compile through it can be dispatched and this case would test a local compile"
+echo "   the edit stub keeps the toolchain fingerprint (${stub_fingerprint})"
+
+# V1 is the content the key is taken from; V2, the saved content, differs in its `// unique:`
+# line and in one LITERAL -- a comment does not survive preprocessing, the literal does.
+write_source "${moved}/v1/one-moved.cpp" "movedone"
+sed -e 's|^// unique: movedone$|// unique: movedone-saved|' \
+    -e 's|{ "movedone", { 1, 2, 3 } }|{ "movedone-saved", { 1, 2, 3 } }|' \
+    "${moved}/v1/one-moved.cpp" > "${moved}/v2/one-moved.cpp"
+grep -q '"movedone-saved"' "${moved}/v2/one-moved.cpp" \
+    || fail "case 2b: the saved content's literal was not rewritten, so V1 and V2 would build one object"
+cp "${moved}/v1/one-moved.cpp" "${proj}/one-moved.cpp"
+
+# The two references, and the control that they differ: an object equal to both would make
+# every comparison below pass whichever content the worker compiled.
+"$compiler" -std=c++17 -O1 -c "${moved}/v1/one-moved.cpp" -o "${moved}/v1-ref.o" || fail "the case 2b V1 reference compile failed"
+"$compiler" -std=c++17 -O1 -c "${moved}/v2/one-moved.cpp" -o "${moved}/v2-ref.o" || fail "the case 2b V2 reference compile failed"
+if cmp -s "${moved}/v1-ref.o" "${moved}/v2-ref.o"; then
+    fail "case 2b cannot bite: the original and the saved content compile to one object"
+fi
+
+# The environment assignments come first and there is always at least one, so `"$@"` is
+# never empty under `set -u` (bash 3.2 calls an empty one unbound).
+moved_compile() {
+    local log="$1"
+    shift
+    env "$@" FC_EDIT_STUB_REAL="$real_compiler" \
+        "$launcher" "$stub" -std=c++17 -O1 -c "${proj}/one-moved.cpp" -o "${proj}/build/one-moved.o" > "$log" 2>&1
+}
+
+: > "${moved}/trigger"
+moved_compile "${workdir}/case2b-1.log" FC_EDIT_STUB_AT=before-dispatch-preprocess \
+    FC_EDIT_STUB_TRIGGER="${moved}/trigger" FC_EDIT_STUB_FROM="${moved}/v2/one-moved.cpp" \
+    FC_EDIT_STUB_TO="${proj}/one-moved.cpp" \
+    || { cat "${workdir}/case2b-1.log" >&2; fail "case 2b: the racing compile failed"; }
+cat "${workdir}/case2b-1.log"
+grep -q "DISPATCHED to " "${workdir}/case2b-1.log" \
+    || {
+        fail_if_withdrawn "${workdir}/case2b-1.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
+        echo "--- worker log ---" >&2
+        cat "${workdir}/worker.log" >&2
+        fail "case 2b: the compile was not dispatched to a worker, so it says nothing about a dispatched compile"
+    }
+[[ ! -e "${moved}/trigger" ]] || fail "case 2b: the stub never fired, so this case tested nothing"
+cmp -s "${moved}/v2/one-moved.cpp" "${proj}/one-moved.cpp" \
+    || fail "case 2b: the stub fired but the source does not hold the saved content"
+# The save landed where it was meant to: the WORKER compiled the saved content. Byte
+# identity is case 1's property, so the comparison is exact.
+cmp -s "${moved}/v2-ref.o" "${proj}/build/one-moved.o" \
+    || fail "case 2b: the dispatched object is not the saved content's, so the save did not land between the key and the dispatch preprocess"
+grep -qE "an input changed during the compile: [^;]*/one-moved\.cpp; compiled, not stored; manifest recorded from the keyed content\$" \
+    "${workdir}/case2b-1.log" \
+    || fail "case 2b: the save between the key and the dispatch was not seen, or the line does not name the saved file and the keyed manifest"
+# `if` rather than `grep && fail`: a non-matching grep is the SUCCESS path here.
+if grep -q "STORED key=" "${workdir}/case2b-1.log"; then
+    fail "case 2b: the worker's object of the saved content was stored under the original content's key"
+fi
+logged="$(tail -n 1 "$(e2e_launcher_state_log)" | e2e_launcher_log_field outcome)"
+[[ "$logged" == "INPUTS-MOVED" ]] || fail "case 2b: recorded '${logged}', not INPUTS-MOVED"
+
+# The original content again, saved in place the way an editor would: its key is the one the
+# raced compile was keyed on, and nothing may stand behind it.
+cat "${moved}/v1/one-moved.cpp" > "${proj}/one-moved.cpp"
+rm -f "${proj}/build/one-moved.o"
+moved_compile "${workdir}/case2b-2.log" FASTCACHE_E2E_CASE=moved \
+    || { cat "${workdir}/case2b-2.log" >&2; fail "case 2b: the rebuild of the original content failed"; }
+cat "${workdir}/case2b-2.log"
+grep -q "fastcache-cc: MISS" "${workdir}/case2b-2.log" \
+    || fail "case 2b: the original content was served from the cache -- the worker's object of the saved content under the original key (the #1650 defect)"
+grep -q "STORED key=" "${workdir}/case2b-2.log" \
+    || fail "case 2b: the original content compiled but was not stored"
+cmp -s "${moved}/v1-ref.o" "${proj}/build/one-moved.o" \
+    || fail "case 2b: the rebuild's object is not the original content's"
+echo "   the saved content stored nothing, and the original content is a MISS that builds it"
 
 # --- 3: a worker for a different toolchain is never chosen -------------------
 echo "== case 3: fingerprint isolation"
