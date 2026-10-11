@@ -57,9 +57,11 @@
 #include <print>
 #include <ranges>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -223,7 +225,10 @@ constexpr std::array<SaveAtRow, 2> SaveAtSpellings {
         std::println(stderr, "mid-compile-edit-stub: cannot read {}", from->string());
         return false;
     }
-    std::string const bytes { std::istreambuf_iterator<char> { input }, std::istreambuf_iterator<char> {} };
+    // Read through the stream buffer, never `istreambuf_iterator` (#1029: GCC -O2 -Wnull-dereference).
+    std::ostringstream buffered;
+    buffered << input.rdbuf();
+    std::string const bytes = std::move(buffered).str();
     {
         // A truncating write into the SAME file, the way an editor saves: never a copy.
         std::ofstream output { *to, std::ios::binary | std::ios::trunc };
