@@ -67,9 +67,14 @@ All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-c
     differs from the destination's previous one, which is what every comparison after T1′ and
     the TU's own T0/T1′ comparison read; only the T0 clock rule for a header cannot see it
     (see Known limits).
-- **`IInputFiles`** is the one seam, with three methods: `Identify(path)` returns an
-  `optional<FileIdentity>`, `Hash(path)` returns the content hash, and `Now()` reads the clock
-  in the same units as `changeTime`. They are one seam because the witness only ever compares
+- **`IInputFiles`** is the one seam: `Identify(path)` returns an `optional<FileIdentity>`,
+  `Hash(path)` returns the content hash, `Now()` reads the clock in the same units as
+  `changeTime`, and `Fence()` (Ruling 11) waits for the clock to cross one tick and returns
+  T0. Every change made before the call is stamped strictly below T0, and every change after
+  it returns is stamped at or above, so "saved just before the launch" is never mistaken for
+  "saved during the preprocess". Measured: without the fence, 5 of 30 compiles launched right
+  after a write refused to store on a 4 ms-tick kernel. Cost: up to one tick per invocation
+  that preprocesses. They are one seam because the witness only ever compares
   their answers with each other. `MakeDiskInputFiles()` returns the disk implementation, and
   tests inject a fake that controls every boundary.
   - **Every comparison with T0 is `ChangedAtOrAfter(changeTime, T0)`, never a raw `>=`.** It
@@ -138,7 +143,8 @@ All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-c
   input changed during the invocation, so nothing was stored".
   - It is not `Miss`, which claims *compiled and stored*.
   - It is not `Uncacheable`, which claims a permanent property of the TU.
-- `outcomeDetail` names the path and the window, and the report gets a row for the token,
+- `outcomeDetail` is the verdict's fixed sentence, never the path, so `--show-stats` ranks one
+  row per cause (Ruling 12); the path is on the `FASTCACHE_VERBOSE` line. The report gets a row for the token,
   documentation included.
 
 ## Data flow in `RunCached`
@@ -179,7 +185,7 @@ All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-c
 | `Stable` | nothing | yes | yes, from the T1′ hashes | yes | `Miss` / `Hit` |
 | `MovedDuringCompile` | a witnessed file's identity differs between T1′ and T2, or an `-MF`-only path changed after T0 | no | yes | (no compile on a hit) | `InputsMoved` |
 | `MovedBeforeKey` | the TU differs between T0 and T1′, a file's change time is ≥ T0, or a file moved while it was hashed | no | no | no; the hit is still served | `InputsMoved` / `Hit` |
-| `Unwitnessed` | a project file could not be identified or hashed | no | no | no | `InputsMoved` |
+| `Unwitnessed` | a project file could not be identified or hashed | no | no | no | `Uncacheable` (Ruling 10: usually persistent, so not `INPUTS-MOVED`, whose text promises the next build caches) |
 
 Why each row is sound:
 
@@ -200,7 +206,8 @@ Why each row is sound:
   two sentences are `an input changed while the key was taken` and `an input could not be
   observed`. On a hit whose backfill was refused, the line ends `; served the hit, recorded
   no manifest`.
-- **The statistics log:** `INPUTS-MOVED`, with that sentence and the path in `detail`.
+- **The statistics log:** `INPUTS-MOVED` (or `UNCACHEABLE` for an unobservable input), with
+  the fixed sentence in `detail`; the path is on the verbose line.
   `--show-stats` reports `inputs moved : N` and names the files.
 - **No unconditional stderr line.** The build got a correct object; the cache only declined
   to keep it.
