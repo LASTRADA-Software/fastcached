@@ -87,6 +87,14 @@ socket it is handed. This moves no wire version and no stored format.
 | A literal `--raft-self` (or `raft_self:`) on a machine whose address moves | Remove it, for the same reason. |
 | A name in either | Nothing: a name is an opt-in pin and keeps working as before. |
 
+### Coming from 0.4.0: direct-mode manifests are recorded once more
+
+The launcher's manifest key moved to `manifest-v8` (#1650). A 0.4.0 launcher hashed a manifest's
+files after the compile, so a file saved during one could pair its new content with the old
+object; every such manifest is now unreachable. The first build of each translation unit after
+the upgrade preprocesses once and records a fresh manifest. Objects still hit under their
+unchanged keys, so nothing recompiles. No step.
+
 ## The supported procedure
 
 1. **Stop the builds.** Anything running `fastcache-cc` against the fleet should be

@@ -168,6 +168,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   is asked for one the way it answers: `cl` has no `--version`, and bare `cl` is its probe.
 - A root and the paths a driver emits are reconciled on both sides, or neither.
 - Bump `manifest-v*` whenever `objkey-v*` moves. The reverse is not required.
+- The key, the object and the manifest are taken at THREE moments, so a save between them files one
+  content under another's key (#1650): `Cc::InputWitness` decides by identity and a fenced T0, never mtime.
 - A compile that writes a second artefact (a BMI, a PCH, `cl`'s `/Zi` PDB) or reads a PCH (`/Yu`) is refused.
 - The compiler identity is the driver AND the target it generates for. The **key** folds
   the target, the **fingerprint** must not.
@@ -194,9 +196,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Ninja refuses a `/showIncludes` path longer than `_MAX_PATH` BEFORE it canonicalizes — a
   string-length check on a fixed buffer, which no long-path policy reaches. `Cc::CollapseNotePaths`
   collapses `..` out of every note the launcher EMITS and out of none that it STORES.
-- A compiler with debug info on records the WORKING DIRECTORY, which is on no command line,
-  so no key relativizes it; `-fdebug-prefix-map` closes it on ELF and on NEITHER COFF driver,
-  an accepted cost rather than open work.
+- A compiler with debug info on records the WORKING DIRECTORY, which is on no command line, so no key relativizes
+  it; `-fdebug-prefix-map` closes it on ELF and on NEITHER COFF driver, an accepted cost rather than open work.
   - Never `-ffile-prefix-map`, and no table row for it or `-fmacro-prefix-map` either: both
     rewrite `__FILE__` INTO the text the key hashes.
   - The key relativizes the rule's HEAD (`PathValueRole::PrefixMap`, a table COLUMN) and leaves
@@ -212,10 +213,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   worker opens; the WHOLE path is mapped and the rule goes LAST. gcc needs a SECOND pair
   (`sourceRoot`/`sourceRootReplacement`) after the directory rules; a half-filled pair is REFUSED,
   every other failure is NO RULE, and the worker's skip is `ScratchRootMappingWarnings` at STARTUP.
-- An object file is not a byte string. Every MSVC driver stamps the clock into the COFF
-  `TimeDateStamp`, so `FASTCACHE_VERIFY` cannot `memcmp` there; ELF keeps the byte comparison.
-  Parsing never grants an excuse, it only says WHERE: a FRESH object that will not lay out is
-  `Unsupported`, a SERVED one `Mismatched`. Never `/Brepro`.
+- An object file is not a byte string. Every MSVC driver stamps the clock into the COFF `TimeDateStamp`, so
+  `FASTCACHE_VERIFY` cannot `memcmp` there; ELF keeps the byte comparison. Parsing never grants an excuse, it only
+  says WHERE: a FRESH object that will not lay out is `Unsupported`, a SERVED one `Mismatched`. Never `/Brepro`.
 
 **[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md)**
 — dispatch, workers, the scheduler, the node's tiers. Before `Distributed/`,

@@ -2395,6 +2395,63 @@ misses the rest in silence.
   stamps 6 on text it rewrites the old way, and the frozen-row check says so in as many
   words. "It never shipped" is not an argument the version byte can hear.
 
+## The key, the object and the manifest describe ONE moment
+
+<!-- agent-tripwire: The key, the object and the manifest are taken at THREE moments -->
+
+The launcher reads its inputs three times: the key's preprocess (T1), the compile (T2, and a
+dispatched compile's second preprocess), and the manifest. Before
+[#1650](https://github.com/LASTRADA-Software/fastcached/issues/1650) the manifest hashed the
+files AFTER the compile, so a save during it paired the new content with the old object; every
+later build of the new content was a direct HIT on the old object, exit 0, in every checkout and
+on every machine whose files matched -- and the manifest key is portable, so it spread.
+
+`Cc::InputWitness` snapshots every input at T0 (before the key), T1′ (after it) and T2 (after
+the compile), and `Cc::StabilityTable` decides; `main.cpp` reads the row and writes no `switch`.
+A manifest's hashes are the T1′ hashes -- `BuildManifest` takes them from its REQUIRED
+`IManifestContent` and never reads a file -- an object is stored only when nothing moved, and the
+hit a racing backfill would have spoiled is still served. Five rules make it hold, and the first
+four were each wrong in a draft of #1650 before they were right:
+
+- **Identity, not the clock, after T1′.** An entry is compared by change time, size, volume and
+  file id, never by last-write time: `copy`, robocopy and `utimensat` keep a file's mtime, and on
+  NTFS `CopyFileW` copies the SOURCE's change time as well (measured during #1650, on two
+  volumes). So an older file copied over a newer one is seen by its IDENTITY; a rewrite in the
+  same clock tick is seen the same way, since every T1′ stamp lies below the floored T0.
+- **T0 is FENCED.** `IInputFiles::Fence()` waits for the coarse clock to cross one tick and
+  returns that reading, so a save made before the launch is stamped strictly below T0 and one
+  made after it at or above. Without the fence, 5 of 30 compiles launched right after a write
+  refused to store (WSL, 4 ms ticks; measured, and 30 of 30 stored with it). Read the clock
+  COARSELY, too: a finer clock can read later than the stamp of a change that follows it.
+- **Every comparison with T0 is `Cc::ChangedAtOrAfter`, never a raw `>=`.** It floors T0 to the
+  grid the stamp itself shows -- the largest of 2 s, then each decimal unit from 1 s down to
+  10 ns, that divides it -- because exFAT stamps at 10 ms and HFS+ at 1 s, and a change in T0's
+  own slot is stamped BELOW T0. A blanket floor (ccache's "include file too new") is not the
+  answer: it would stop caching every consumer of a header generated in the same second.
+- **An input that cannot be observed is `UNCACHEABLE`, never `INPUTS-MOVED`**, whose text
+  promises the next build caches; an unreadable input usually stays unreadable. The statistics
+  `detail` is the row's FIXED sentence, so `--show-stats` ranks one row per cause, and the path
+  is on the `FASTCACHE_VERBOSE` line -- which, for a save during the compile in direct mode, is
+  written AFTER the manifest was recorded and says whether it was.
+- **Nothing the witness holds travels.** No identity, instant or verdict reaches a key, a
+  manifest, a `CompileValue` or the wire, or two checkouts stop sharing;
+  `InputWitness_test`'s two-checkout case pins the bytes. `manifest-v8` retired every manifest
+  recorded before the fix, and `objkey-v*` deliberately did not move.
+
+**Known limits, each failing OPEN, and only inside the key's preprocess (T0 to T1′):**
+
+- A header REPLACED there by a copy that keeps an older change time (`CopyFileW` on NTFS) reads
+  as older than T0, and nothing earlier snapshots it, because the header set is unknown until the
+  preprocess has run; a copy after T1′ changes the identity and is caught.
+  [#1653](https://github.com/LASTRADA-Software/fastcached/issues/1653).
+- A header CREATED during the invocation in an include directory searched before the one the
+  preprocess resolved is in no snapshot (ccache has the same gap).
+  [#1654](https://github.com/LASTRADA-Software/fastcached/issues/1654).
+- A stamp from ANOTHER machine's clock that lags this one (a network share, a WSL `/mnt/<drive>`
+  the Windows host stamps), and a stamp grid that is neither 2 s nor a decimal unit. The TU's
+  own T0/T1′ comparison still holds there; a header's does not. Documented, not filed: refusing
+  remote filesystems would remove a feature.
+
 ## Accepted trade-offs
 
 <!-- agent-tripwire: none: trades argued in place above and deliberately not rules; AGENT.md tripwires the rules they trade against -->
@@ -2749,6 +2806,22 @@ nobody can account for.
 ## Open work
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
+
+- **[#1653](https://github.com/LASTRADA-Software/fastcached/issues/1653)** — a header
+  replaced during the key's preprocess by a copy that keeps an older change time is not seen by
+  the input witness. On NTFS `CopyFileW` copies the SOURCE's change time onto the destination
+  (measured on two volumes while implementing #1650), so such a header reads as older than T0
+  and the T0 clock rule passes it, and no earlier snapshot of it exists, because the header set
+  is unknown until the preprocess runs. A copy after T1′ changes the identity and is caught, so
+  the window is the preprocess alone. Not reproduced end to end: derived from the measurement
+  and the witness's construction. See *The key, the object and the manifest describe ONE moment*.
+
+- **[#1654](https://github.com/LASTRADA-Software/fastcached/issues/1654)** — a header CREATED
+  during a compile, in an include directory searched EARLIER than the one the key's preprocess
+  resolved, is in no input witness: the witness snapshots what the preprocess REPORTED, so a
+  compile that reads the new header stores its object under a key taken from the shadowed one.
+  ccache has the same gap. Not reproduced: derived from the witness's construction (#1650's
+  design, Known limits).
 
 - **[#1567](https://github.com/LASTRADA-Software/fastcached/issues/1567)** — `## The digest` has no `AGENT.md`
   tripwire, so the object key being MurmurHash3 x64_128 rather than four CRC32C lanes
