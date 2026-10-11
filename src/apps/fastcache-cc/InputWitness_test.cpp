@@ -320,9 +320,10 @@ TEST_CASE("Two checkouts with equal content record byte-identical manifests and 
     FastCache::Testing::ScratchDirectory const scratchB { "fc-witness-share-b-deeper" };
     std::array<std::string, 2> encoded;
     std::array<std::string, 2> manifestKeys;
-    for (auto const index: { 0, 1 })
+    for (auto const index: { std::size_t { 0 }, std::size_t { 1 } })
     {
         auto const& scratch = index == 0 ? scratchA : scratchB;
+        auto const shift = static_cast<FileInstant>(index); // a change time is signed
         scratch.Write("src/h.hpp", "#pragma once\nint h();\n");
         scratch.Write("src/a.cpp", "#include \"h.hpp\"\nint a() { return h(); }\n");
         auto const& root = scratch.Path();
@@ -335,10 +336,10 @@ TEST_CASE("Two checkouts with equal content record byte-identical manifests and 
         FakeInputFiles files;
         auto const disk = MakeDiskInputFiles();
         files.identities[resolvedSource] = FileIdentity {
-            .changeTime = 10 + index, .size = 1, .volumeId = 100U + index, .fileIdHigh = 0, .fileIdLow = 1U + index
+            .changeTime = 10 + shift, .size = 1, .volumeId = 100U + index, .fileIdHigh = 0, .fileIdLow = 1U + index
         };
         files.identities[resolvedHeader] = FileIdentity {
-            .changeTime = 20 + index, .size = 2, .volumeId = 100U + index, .fileIdHigh = 0, .fileIdLow = 3U + index
+            .changeTime = 20 + shift, .size = 2, .volumeId = 100U + index, .fileIdHigh = 0, .fileIdLow = 3U + index
         };
         files.hashes[resolvedSource] = disk->Hash(resolvedSource);
         files.hashes[resolvedHeader] = disk->Hash(resolvedHeader);
