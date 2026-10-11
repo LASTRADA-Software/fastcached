@@ -213,6 +213,46 @@ TEST_CASE("A report with no rejected hit says nothing about wrong objects")
     CHECK_FALSE(FormatHtmlReport("").contains("wrong objects"));
 }
 
+TEST_CASE("A compile an edit raced is recorded under its own token and reads back as itself", "[stats][1650]")
+{
+    CHECK(ToStringView(Outcome::InputsMoved) == "INPUTS-MOVED");
+
+    // An unknown token reads back as `Unavailable`, so a parser that never learnt this one
+    // would turn an editor's save into an outage on the report.
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::InputsMoved, "main", "moved.cpp", 300));
+    auto const records = ParseLog("");
+    REQUIRE(records.size() == 1);
+    CHECK(records.front().outcome == Outcome::InputsMoved);
+}
+
+TEST_CASE("FormatReport counts a compile an edit raced and names its source", "[stats][1650]")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::InputsMoved, "main", "moved.cpp", 300));
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("compiles     : 2"));
+    CHECK(report.contains("inputs moved : 1"));
+    // Asked of the cache and not a hit, so it is in the denominator: one of two.
+    CHECK(report.contains("50.0% of 2 cacheable"));
+    CHECK_FALSE(report.contains("unavailable"));
+    CHECK(report.contains("never cached"));
+    CHECK(report.contains("moved.cpp"));
+
+    auto const html = FormatHtmlReport("");
+    CHECK(html.contains("inputs moved"));
+}
+
+TEST_CASE("A report with no raced compile says nothing about moved inputs", "[stats][1650]")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    CHECK_FALSE(FormatReport("").contains("inputs moved"));
+    CHECK_FALSE(FormatHtmlReport("").contains("inputs moved"));
+}
+
 TEST_CASE("RecordingFor names what an operator reads for each dispatch status")
 {
     // The bridge between the two enumerations, asserted rather than assumed.

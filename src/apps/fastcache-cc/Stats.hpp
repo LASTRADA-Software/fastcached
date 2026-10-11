@@ -38,6 +38,12 @@ enum class Outcome : std::uint8_t
     /// hit rate by the number of wrong objects served, and the one line an operator reads
     /// to judge the cache would read best when the cache was at its worst.
     VerifyMismatch,
+    /// Compiled, and an input changed while it was compiling, so nothing was stored (#1650).
+    ///
+    /// Its own outcome because both neighbours would be false: `Miss` claims compiled AND
+    /// stored, and `Uncacheable` claims a permanent property of the translation unit, where
+    /// this is one invocation's race with an editor. The detail names the path and the moment.
+    InputsMoved,
 };
 
 /// @param outcome The outcome to name.

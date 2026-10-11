@@ -696,6 +696,11 @@ than being read by position and misread. The report counts failed compiles only 
 records that carry an exit code, which is what tells a compiler killed from outside
 apart from a cache that broke the build.
 
+`INPUTS-MOVED` is a compile during which one of its inputs changed — an editor's save, a
+`git checkout` in another terminal — so the launcher kept nothing from it; the `detail`
+column names the file and whether it moved while the key was taken or during the
+compile, and the next build caches as usual.
+
 The two dispatch columns are the distribution axis: the
 fixed reason tallied under `why distribution did not help`, and then what to act on
 about it when the reason alone does not say — the argument a worker would not take,

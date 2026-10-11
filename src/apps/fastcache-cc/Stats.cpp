@@ -463,6 +463,8 @@ namespace
         std::uint64_t compilesFailed {}; ///< Of those, a non-zero one.
         /// Hits `FASTCACHE_VERIFY` rejected; see `Outcome::VerifyMismatch`.
         std::uint64_t verifyMismatches {};
+        /// Compiles an input changed during; see `Outcome::InputsMoved`.
+        std::uint64_t inputsMoved {};
 
         // Full sample sets, not running sums: the point of the distribution is the
         // shape (a bimodal miss profile means something an average hides).
@@ -500,17 +502,18 @@ namespace
 
         [[nodiscard]] std::uint64_t Total() const noexcept
         {
-            return hits + misses + uncacheable + unavailable + verifyMismatches;
+            return hits + misses + uncacheable + unavailable + verifyMismatches + inputsMoved;
         }
 
         /// The compiles the cache ANSWERED, which is what a hit rate is rated against.
         ///
         /// A rejected hit is one of them -- the cache answered, wrongly -- so it counts
-        /// in the denominator and not in the numerator. One definition, because the text
+        /// in the denominator and not in the numerator. So is a compile an input moved
+        /// during: the cache was asked and did not hit. One definition, because the text
         /// and the HTML report both rate against it.
         [[nodiscard]] std::uint64_t Servable() const noexcept
         {
-            return hits + misses + verifyMismatches;
+            return hits + misses + verifyMismatches + inputsMoved;
         }
 
         /// Sum the per-state dispatch counters whose row has @p column set.
@@ -596,6 +599,8 @@ namespace
             return Outcome::Uncacheable;
         if (token == "VERIFY-MISMATCH")
             return Outcome::VerifyMismatch;
+        if (token == "INPUTS-MOVED")
+            return Outcome::InputsMoved;
         return Outcome::Unavailable;
     }
 
@@ -1026,6 +1031,9 @@ namespace
         if (tally.uncacheable > 0)
             out << "  uncacheable  : " << Colorize(std::to_string(tally.uncacheable), palette.neutral, palette.reset)
                 << '\n';
+        if (tally.inputsMoved > 0)
+            out << "  inputs moved : " << Colorize(std::to_string(tally.inputsMoved), palette.neutral, palette.reset)
+                << "  (an input changed during the compile; nothing was stored)\n";
         if (tally.unavailable > 0)
             out << "  unavailable  : " << Colorize(std::to_string(tally.unavailable), palette.bad, palette.reset) << "  ("
                 << Percent(tally.unavailable, tally.Total()) << " of all compiles -- "
@@ -1082,6 +1090,8 @@ std::string_view ToStringView(Outcome outcome) noexcept
             return "UNCACHEABLE";
         case Outcome::VerifyMismatch:
             return "VERIFY-MISMATCH";
+        case Outcome::InputsMoved:
+            return "INPUTS-MOVED";
         case Outcome::Unavailable:
             break;
     }
@@ -1310,6 +1320,9 @@ namespace
                     case Outcome::VerifyMismatch:
                         ++tally->verifyMismatches;
                         break;
+                    case Outcome::InputsMoved:
+                        ++tally->inputsMoved;
+                        break;
                 }
                 if (!record.detail.empty())
                     ++tally->reasons[record.detail];
@@ -1333,8 +1346,11 @@ namespace
             }
 
             // Attribute the never-cached translation units so a permanently
-            // uncacheable file is visible rather than hidden in a percentage.
-            if ((record.outcome == Outcome::Uncacheable || record.outcome == Outcome::Unavailable) && !record.source.empty())
+            // uncacheable file is visible rather than hidden in a percentage, and so
+            // is a file an edit raced, which names the source an editor touched.
+            if ((record.outcome == Outcome::Uncacheable || record.outcome == Outcome::Unavailable
+                 || record.outcome == Outcome::InputsMoved)
+                && !record.source.empty())
                 ++folded.neverCached[record.source];
         }
         return folded;
@@ -1535,7 +1551,8 @@ namespace
                 ++bucket.hits;
                 ++bucket.servable;
             }
-            else if (record.outcome == Outcome::Miss || record.outcome == Outcome::VerifyMismatch)
+            else if (record.outcome == Outcome::Miss || record.outcome == Outcome::VerifyMismatch
+                     || record.outcome == Outcome::InputsMoved)
                 ++bucket.servable;
         }
         return { byDay.begin(), byDay.end() };
@@ -1836,6 +1853,9 @@ std::string FormatHtmlReport(std::string_view groupFilter)
     // dashboard of a machine that never verifies would teach a reader to skip it.
     if (overall.verifyMismatches > 0)
         AppendTallyCard(out, "wrong objects", overall.verifyMismatches, "bad");
+    // Conditional for the same reason: most dashboards have no editor racing a build.
+    if (overall.inputsMoved > 0)
+        AppendTallyCard(out, "inputs moved", overall.inputsMoved, "uncache");
     out << "</div>";
 
     out << R"(<div class="panel"><div class="panel-title">hit rate over time</div>)" << RenderTrendSvg(records) << "</div>";
