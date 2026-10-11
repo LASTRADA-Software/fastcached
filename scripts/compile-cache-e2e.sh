@@ -42,6 +42,12 @@
 #                           path still is, the first checkout still hits its own
 #                           copy, and a hit FASTCACHE_VERIFY rejects is logged
 #                           VERIFY-MISMATCH rather than HIT.
+#  11. Mid-compile save — a save DURING a compile records nothing unsound
+#                           (#1650): the compile that raced an editor's save stores
+#                           nothing and is logged INPUTS-MOVED, and the saved content
+#                           is a MISS that builds what was saved, in this checkout and
+#                           in another. Through the same stub with no save, a compile
+#                           still stores, direct-hits, and shares across checkouts.
 #   2c. Dropped object    — the operator's repair after 2b names a wrong object: the
 #                           key is dropped over CACHE-DROP while its direct-mode
 #                           manifest stands. The next compile must MISS, recompile
@@ -60,7 +66,7 @@
 # Usage:
 #   compile-cache-e2e.sh --fastcached <path> --launcher <path>
 #                        [--port <n>] [--compiler <cxx>]
-#                        [--testclient <path>]
+#                        [--testclient <path>] [--edit-stub <path>]
 #
 # Exit codes: 0 = all assertions held; 1 = a failure; 77 = a runtime
 # prerequisite was missing (skip).
@@ -69,6 +75,7 @@ set -euo pipefail
 fastcached=""
 launcher=""
 testclient=""
+edit_stub=""
 port=""
 compiler="${CXX:-c++}"
 
@@ -79,6 +86,7 @@ while [[ $# -gt 0 ]]; do
         --port)       port="$2";       shift 2 ;;
         --compiler)   compiler="$2";   shift 2 ;;
         --testclient) testclient="$2"; shift 2 ;;
+        --edit-stub)  edit_stub="$2";  shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -1582,6 +1590,124 @@ for debug in off on; do
     echo "   debug info ${debug}: logged ${logged}, WRONG OBJECT line=${wrong}"
 done
 
+# --- 11: a save DURING a compile records nothing unsound (#1650) -------------
+# The launcher used to hash its manifest AFTER the compile, so a save landing during it
+# paired the new content with the old object: every later build of the new content was a
+# direct HIT on the old object, exit 0, in every checkout whose files matched. No timing
+# can place a save inside that window, so the compiler the launcher runs is
+# `mid-compile-edit-stub` (src/tests/MidCompileEditStub.cpp): it forwards to the real one
+# and, once, overwrites a file in place the moment the real compile has exited.
+#
+# Two legs -- the translation unit saved, and a header it includes saved -- then a third
+# checkout already holding the saved content, which the defect served the raced object
+# into. And two CONTROLS through the same stub with no save, because a witness that refused
+# every store would pass every leg above: a quiet compile still stores and records a
+# manifest, its rebuild is a direct hit, and a second checkout of the same content
+# direct-hits the first one's manifest.
+[[ -n "$edit_stub" ]] || fail "case 11 needs --edit-stub; the ctest registration passes it whenever the stub is built"
+[[ -x "$edit_stub" ]] || fail "case 11: the edit stub '${edit_stub}' is not an executable"
+real_compiler="$(command -v "$compiler")" || fail "case 11 cannot resolve the compiler '${compiler}'"
+moved="${workdir}/moved"
+mkdir -p "${moved}/stub"
+# Under the real compiler's own file name: the launcher picks its driver grammar by it.
+stub="${moved}/stub/$(basename "$real_compiler")"
+cp "$edit_stub" "$stub"
+chmod +x "$stub"
+
+# One tree per leg, and CONTENT per leg (the messages carry the leg's name): the key is
+# portable across checkouts, so two legs starting from the same bytes share a key, and once
+# one leg's raced object is stored the next leg's racing compile is a HIT that never runs the
+# stub -- measured, with the witness neutered, as the header leg reporting "never fired".
+write_moved_tree() {
+    local root="$1" message="$2" header_message="$3"
+    mkdir -p "${root}/src" "${root}/build"
+    printf '#pragma once\n#define HEADER_MESSAGE "%s"\n' "$header_message" > "${root}/src/m.hpp"
+    printf '#include "m.hpp"\nchar const* Message() { return "%s"; }\nchar const* HeaderMessage() { return HEADER_MESSAGE; }\n' \
+        "$message" > "${root}/src/m.cpp"
+}
+# The environment assignments come first and there is always at least one, so `"$@"` is
+# never empty under `set -u` (bash 3.2 calls an empty one unbound).
+moved_compile() {
+    local root="$1" log="$2"
+    shift 2
+    env "$@" FC_EDIT_STUB_REAL="$real_compiler" FASTCACHE_SOURCE_DIR="$root" FASTCACHE_BINARY_DIR="${root}/build" \
+        "$launcher" "$stub" -std=c++20 -MD -MF "${root}/build/m.d" -c "${root}/src/m.cpp" -o "${root}/build/m.o" 2> "$log"
+}
+# `LC_ALL=C`, or macOS's grep matches nothing on an object's non-UTF-8 bytes.
+object_says() { LC_ALL=C grep -aq "$2" "$1"; }
+
+for leg in tu header; do
+    root="${moved}/${leg}"
+    write_moved_tree "$root" "MESSAGE_V1_OLD_${leg}" "HEADER_V1_OLD_${leg}"
+    if [[ "$leg" == tu ]]; then
+        write_moved_tree "${moved}/${leg}-v2" "MESSAGE_V2_NEW_${leg}" "HEADER_V1_OLD_${leg}"
+        from="${moved}/${leg}-v2/src/m.cpp" to="${root}/src/m.cpp" want="MESSAGE_V2_NEW_${leg}"
+    else
+        write_moved_tree "${moved}/${leg}-v2" "MESSAGE_V1_OLD_${leg}" "HEADER_V2_NEW_${leg}"
+        from="${moved}/${leg}-v2/src/m.hpp" to="${root}/src/m.hpp" want="HEADER_V2_NEW_${leg}"
+    fi
+    : > "${moved}/${leg}.trigger"
+    echo "== mid-compile save (${leg}): the compile that raced it stores nothing =="
+    moved_compile "$root" "${moved}/${leg}-1.log" FC_EDIT_STUB_AT=after-compile \
+        FC_EDIT_STUB_TRIGGER="${moved}/${leg}.trigger" FC_EDIT_STUB_FROM="$from" FC_EDIT_STUB_TO="$to" \
+        || { cat "${moved}/${leg}-1.log" >&2; fail "mid-compile ${leg}: the racing compile failed"; }
+    cat "${moved}/${leg}-1.log"
+    [[ ! -e "${moved}/${leg}.trigger" ]] || fail "mid-compile ${leg}: the stub never fired, so this leg tested nothing"
+    cmp -s "$from" "$to" || fail "mid-compile ${leg}: the stub fired but ${to} does not hold the saved content"
+    grep -q "an input changed during the compile: " "${moved}/${leg}-1.log" \
+        || fail "mid-compile ${leg}: the save during the compile was not seen"
+    # `if` rather than `grep && fail`: a non-matching grep is the SUCCESS path here.
+    if grep -q "STORED key=" "${moved}/${leg}-1.log"; then
+        fail "mid-compile ${leg}: the raced object was stored"
+    fi
+    logged="$(tail -n 1 "$(e2e_launcher_state_log)" | e2e_launcher_log_field outcome)"
+    [[ "$logged" == "INPUTS-MOVED" ]] || fail "mid-compile ${leg}: recorded '${logged}', not INPUTS-MOVED"
+
+    echo "== mid-compile save (${leg}): the saved content is a MISS and builds what was saved =="
+    rm -f "${root}/build/m.o"
+    moved_compile "$root" "${moved}/${leg}-2.log" FASTCACHE_E2E_CASE=moved \
+        || { cat "${moved}/${leg}-2.log" >&2; fail "mid-compile ${leg}: the rebuild failed"; }
+    cat "${moved}/${leg}-2.log"
+    grep -q "fastcache-cc: MISS" "${moved}/${leg}-2.log" \
+        || fail "mid-compile ${leg}: the saved content was served from the cache (the #1650 defect)"
+    object_says "${root}/build/m.o" "$want" || fail "mid-compile ${leg}: the object does not say ${want}"
+
+    # Inside the loop, before the next leg: every tree here spells the same relative source and
+    # arguments, so they share ONE manifest key and the next leg's manifest replaces this one's
+    # -- measured, with the fix reverted, as this check passing after the header leg had run.
+    echo "== mid-compile save (${leg}): another checkout holding the saved content is not served the raced object =="
+    other="${moved}/${leg}-other"
+    cp -R "${moved}/${leg}-v2" "$other"
+    moved_compile "$other" "${moved}/${leg}-other.log" FASTCACHE_E2E_CASE=moved \
+        || { cat "${moved}/${leg}-other.log" >&2; fail "mid-compile ${leg}: the other checkout failed"; }
+    object_says "${other}/build/m.o" "$want" || fail "mid-compile ${leg}: another checkout was served the raced object"
+done
+
+echo "== control: the same stub with no save stores, records a manifest, then direct-hits =="
+control="${moved}/control"
+write_moved_tree "$control" MESSAGE_CONTROL HEADER_CONTROL
+moved_compile "$control" "${moved}/control-1.log" FASTCACHE_E2E_CASE=moved \
+    || { cat "${moved}/control-1.log" >&2; fail "control: the compile failed"; }
+grep -q "STORED key=" "${moved}/control-1.log" \
+    || { cat "${moved}/control-1.log"; fail "control: a quiet compile through the stub did not store"; }
+grep -q "MANIFEST stored key=" "${moved}/control-1.log" \
+    || { cat "${moved}/control-1.log"; fail "control: a quiet compile did not record a manifest"; }
+rm -f "${control}/build/m.o"
+moved_compile "$control" "${moved}/control-2.log" FASTCACHE_E2E_CASE=moved \
+    || { cat "${moved}/control-2.log" >&2; fail "control: the rebuild failed"; }
+grep -q "direct mode: the manifest validated" "${moved}/control-2.log" \
+    || { cat "${moved}/control-2.log"; fail "control: the rebuild was not a direct hit"; }
+
+echo "== control: a second checkout of the same content direct-hits the first one's manifest =="
+twin="${moved}/control-twin-deeper/tree"
+write_moved_tree "$twin" MESSAGE_CONTROL HEADER_CONTROL
+moved_compile "$twin" "${moved}/twin.log" FASTCACHE_E2E_CASE=moved \
+    || { cat "${moved}/twin.log" >&2; fail "control: the twin checkout failed"; }
+grep -q "direct mode: the manifest validated" "${moved}/twin.log" \
+    || { cat "${moved}/twin.log"; fail "control: cross-checkout sharing did not survive the witness"; }
+object_says "${twin}/build/m.o" MESSAGE_CONTROL || fail "control: the twin checkout's object does not say MESSAGE_CONTROL"
+echo "   a save during a compile stores nothing unsound, and sharing is unchanged"
+
 # --- authentication ---------------------------------------------------------
 # The compile-cache protocol was the only one in the tree that never checked
 # SessionContext::CurrentAuth(), so a daemon started with --requirepass gated
@@ -1698,5 +1824,6 @@ e2e_launcher_state_assert_caller_untouched
 
 echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, store ceiling, cross-depth, nested roots," \
      "moved-header convergence (both layouts keyed apart), an edit re-keying, root-bound objects keyed apart," \
+     "a save during a compile storing nothing unsound," \
      "authentication (refused without a credential, cached with one), and safe fallback"
 exit 0
