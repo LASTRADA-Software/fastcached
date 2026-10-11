@@ -93,7 +93,8 @@ The launcher's manifest key moved to `manifest-v8` (#1650). A 0.4.0 launcher has
 files after the compile, so a file saved during one could pair its new content with the old
 object; every such manifest is now unreachable. The first build of each translation unit after
 the upgrade preprocesses once and records a fresh manifest. Objects still hit under their
-unchanged keys, so nothing recompiles. No step.
+unchanged keys, so nothing recompiles: `objkey-v7` is 0.4.0's own, so *every cached object misses
+once* above applies only to a build older than 0.4.0. No step.
 
 ## The supported procedure
 

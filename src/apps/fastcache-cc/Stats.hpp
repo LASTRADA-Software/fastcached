@@ -44,7 +44,8 @@ enum class Outcome : std::uint8_t
     ///
     /// Its own outcome because both neighbours would be false: `Miss` claims compiled AND
     /// stored, and `Uncacheable` claims a lasting property of the translation unit, where
-    /// this is one invocation's race with an editor. The detail names the path and the moment.
+    /// this is one invocation's race with an editor. The detail is the verdict's fixed sentence;
+    /// the path is on the `FASTCACHE_VERBOSE` line.
     /// An input that could not be OBSERVED at all is `Uncacheable`, not this.
     InputsMoved,
 };

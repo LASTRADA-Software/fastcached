@@ -2406,20 +2406,24 @@ files AFTER the compile, so a save during it paired the new content with the old
 later build of the new content was a direct HIT on the old object, exit 0, in every checkout and
 on every machine whose files matched -- and the manifest key is portable, so it spread.
 
-`Cc::InputWitness` snapshots every input at T0 (before the key), T1′ (after it) and T2 (after
-the compile), and `Cc::StabilityTable` decides; `main.cpp` reads the row and writes no `switch`.
+`Cc::InputWitness` fences T0 and identifies the TU before the key, snapshots every project input
+(identity and content hash) at T1′, after it, and re-identifies them at T2, after the compile;
+`Cc::StabilityTable` decides, and `main.cpp` reads the row and writes no `switch`.
 A manifest's hashes are the T1′ hashes -- `BuildManifest` takes them from its REQUIRED
 `IManifestContent` and never reads a file -- an object is stored only when nothing moved, and the
 hit a racing backfill would have spoiled is still served. Five rules make it hold, and the first
 four were each wrong in a draft of #1650 before they were right:
 
-- **Identity, not the clock, after T1′.** An entry is compared by change time, size, volume and
-  file id, never by last-write time: `copy`, robocopy and `utimensat` keep a file's mtime, and on
+- **Identity, not the clock, for every input snapshotted at T1′.** An entry is compared by change
+  time, size, volume and file id, never by last-write time alone (FAT and exFAT keep no change
+  time, so theirs stands in): `copy` and robocopy keep a file's mtime, `utimensat` sets it, and on
   NTFS `CopyFileW` copies the SOURCE's change time as well (measured during #1650, on two
   volumes). So an older file copied over a newer one is seen by its IDENTITY; a rewrite in the
-  same clock tick is seen the same way, since every T1′ stamp lies below the floored T0.
+  same clock tick is seen the same way, since every T1′ stamp lies below the floored T0. A path
+  named ONLY by the build's own `-MF` (read when the probe reported nothing) has no T1′ snapshot
+  and is judged by the clock alone, at T2 and when its manifest entry is hashed.
 - **T0 is FENCED.** `IInputFiles::Fence()` waits for the coarse clock to cross one tick and
-  returns that reading, so a save made before the launch is stamped strictly below T0 and one
+  returns that reading, so a save made before the fence is stamped strictly below T0 and one
   made after it at or above. Without the fence, 5 of 30 compiles launched right after a write
   refused to store (WSL, 4 ms ticks; measured, and 30 of 30 stored with it). Read the clock
   COARSELY, too: a finer clock can read later than the stamp of a change that follows it.
@@ -2438,19 +2442,25 @@ four were each wrong in a draft of #1650 before they were right:
   `InputWitness_test`'s two-checkout case pins the bytes. `manifest-v8` retired every manifest
   recorded before the fix, and `objkey-v*` deliberately did not move.
 
-**Known limits, each failing OPEN, and only inside the key's preprocess (T0 to T1′):**
+**Known limits, each failing OPEN.** Every one of them is a place where only the CLOCK answers:
 
-- A header REPLACED there by a copy that keeps an older change time (`CopyFileW` on NTFS) reads
-  as older than T0, and nothing earlier snapshots it, because the header set is unknown until the
-  preprocess has run; a copy after T1′ changes the identity and is caught.
-  [#1653](https://github.com/LASTRADA-Software/fastcached/issues/1653).
-- A header CREATED during the invocation in an include directory searched before the one the
-  preprocess resolved is in no snapshot (ccache has the same gap).
-  [#1654](https://github.com/LASTRADA-Software/fastcached/issues/1654).
+- A header REPLACED during the key's preprocess (T0 to T1′) by a copy that keeps an older change
+  time (`CopyFileW` on NTFS) reads as older than T0, and nothing earlier snapshots it, because the
+  header set is unknown until the preprocess has run. For a snapshotted header, a copy after T1′
+  changes the identity and is caught; for an `-MF`-only path, which has no T1′ identity, the
+  window runs to T2. [#1653](https://github.com/LASTRADA-Software/fastcached/issues/1653).
+- A header CREATED at any point of the invocation, the compile included, in an include
+  directory searched before the one the preprocess resolved is in no snapshot and checked by
+  nothing: at T2 the late paths are the probe's own set, all already entries (ccache has the
+  same gap). [#1654](https://github.com/LASTRADA-Software/fastcached/issues/1654).
 - A stamp from ANOTHER machine's clock that lags this one (a network share, a WSL `/mnt/<drive>`
   the Windows host stamps), and a stamp grid that is neither 2 s nor a decimal unit. The TU's
-  own T0/T1′ comparison still holds there; a header's does not. Documented, not filed: refusing
-  remote filesystems would remove a feature.
+  own T0/T1′ comparison still holds there; a header's T0 comparison does not, and for an
+  `-MF`-only path the window runs to T2. Documented, not filed: refusing remote filesystems would
+  remove a feature.
+- FAT and exFAT keep no change time, so their last-write time stands in, and `CopyFile` keeps a
+  last-write time (FAT's is 2 s granular): the T0 rule is weaker there. The TU's T0/T1′
+  comparison and the identity comparison after T1′ still hold.
 
 ## Accepted trade-offs
 
@@ -2812,12 +2822,13 @@ nobody can account for.
   the input witness. On NTFS `CopyFileW` copies the SOURCE's change time onto the destination
   (measured on two volumes while implementing #1650), so such a header reads as older than T0
   and the T0 clock rule passes it, and no earlier snapshot of it exists, because the header set
-  is unknown until the preprocess runs. A copy after T1′ changes the identity and is caught, so
-  the window is the preprocess alone. Not reproduced end to end: derived from the measurement
-  and the witness's construction. See *The key, the object and the manifest describe ONE moment*.
+  is unknown until the preprocess runs. A copy after T1′ changes a snapshotted header's identity
+  and is caught, so for those the window is the preprocess; a path named only by the build's own
+  `-MF` has no T1′ identity and is judged by the clock alone, so for it the window runs to T2.
+  Not reproduced end to end: derived from the measurement and the witness's construction. See *The key, the object and the manifest describe ONE moment*.
 
 - **[#1654](https://github.com/LASTRADA-Software/fastcached/issues/1654)** — a header CREATED
-  during a compile, in an include directory searched EARLIER than the one the key's preprocess
+  at any point of the invocation, the compile included, in an include directory searched EARLIER than the one the key's preprocess
   resolved, is in no input witness: the witness snapshots what the preprocess REPORTED, so a
   compile that reads the new header stores its object under a key taken from the shadowed one.
   ccache has the same gap. Not reproduced: derived from the witness's construction (#1650's

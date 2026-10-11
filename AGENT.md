@@ -169,7 +169,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A root and the paths a driver emits are reconciled on both sides, or neither.
 - Bump `manifest-v*` whenever `objkey-v*` moves. The reverse is not required.
 - The key, the object and the manifest are taken at THREE moments, so a save between them files one
-  content under another's key (#1650): `Cc::InputWitness` decides by identity and a fenced T0, never mtime.
+  content under another's key (#1650): `Cc::InputWitness` decides by identity and a fenced T0, never mtime alone.
 - A compile that writes a second artefact (a BMI, a PCH, `cl`'s `/Zi` PDB) or reads a PCH (`/Yu`) is refused.
 - The compiler identity is the driver AND the target it generates for. The **key** folds
   the target, the **fingerprint** must not.
