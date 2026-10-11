@@ -281,6 +281,21 @@ TEST_CASE("A day's hit rate on the trend counts a compile an edit raced as asked
     CHECK(FormatHtmlReport("").contains(R"(<circle class="trend-point" cx="26.0" cy="94.0" r="3"/>)"));
 }
 
+TEST_CASE("A group's hit rate on the HTML report counts a compile an edit raced as asked of the cache", "[stats][1650]")
+{
+    // The per-group row reads the same denominator as the headline (`Tally::Servable`): one HIT
+    // and one INPUTS-MOVED is 50%. Hits over hits-plus-misses -- a second definition -- read 100%.
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "alpha", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::InputsMoved, "alpha", "moved.cpp", 300));
+    AppendRecord(MakeRecord(Outcome::Hit, "beta", "b.cpp", 10)); // a second group shows the table
+
+    auto const html = FormatHtmlReport("");
+    CHECK(html.contains(R"html(alpha</td><td>2</td><td style="color:var(--hit)">50.0%</td>)html"));
+    CHECK(html.contains(R"(<div class="bar-fill" style="width:50.0%">)"));
+    CHECK_FALSE(html.contains(R"html(alpha</td><td>2</td><td style="color:var(--hit)">100.0%</td>)html"));
+}
+
 TEST_CASE("A report with no raced compile says nothing about moved inputs", "[stats][1650]")
 {
     ScopedStateDir const scoped;

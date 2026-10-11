@@ -1901,7 +1901,7 @@ std::string FormatHtmlReport(std::string_view groupFilter)
                "</tr></thead><tbody>";
         for (auto const& [prefetchGroup, tally]: byGroup)
         {
-            auto const groupServable = tally.hits + tally.misses;
+            auto const groupServable = tally.Servable();
             auto const groupRate = Percent(tally.hits, groupServable);
             auto const ratePct =
                 groupServable == 0 ? 0.0 : (100.0 * static_cast<double>(tally.hits)) / static_cast<double>(groupServable);
