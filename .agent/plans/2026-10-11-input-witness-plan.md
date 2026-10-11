@@ -1379,7 +1379,7 @@ Directly after the `if (!Cc::CacheIsServing(fetchKind)) { ... return code; }` bl
     if (auto const& row = Cc::RowOf(moved.stability); row.store == Cc::StoreObject::No)
     {
         auto const keepsManifest = cfg.direct && row.manifest == Cc::KeepManifest::Yes;
-        record.outcome = Cc::Outcome::InputsMoved;
+        record.outcome = row.outcome; // INPUTS-MOVED for a moved input, UNCACHEABLE for an unobservable one (Ruling 10)
         record.outcomeDetail = Cc::DescribeInstability(moved);
         Note(record.verbose,
              std::format("{}; compiled, not stored{}",
