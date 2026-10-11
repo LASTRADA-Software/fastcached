@@ -1650,6 +1650,14 @@ git commit -s -m "tests: a save between the key and a dispatched compile stores 
 - Modify: `AGENT.md`: one tripwire bullet in the compile-cache list. `AGENT.md`'s `total-lines` budget is an equality, so the bullet's lines are reclaimed in the same list (below).
 - Modify: `docs/operations/upgrading-a-fleet.md`: a subsection after `### Coming from 0.4.0: nodes follow their own address` (`:75`).
 
+- [ ] **Step 1a: File the copy-replaced-header issue (Ruling 13)**
+
+```bash
+gh issue create --title "cc: a header replaced during the key's preprocess by a copy that keeps an older change time is not seen by the input witness"   --label type/bug --label area/launcher --label area/compile-cache   --body "Found while implementing #1650. On NTFS, CopyFileW copies the SOURCE's ChangeTime onto the destination (measured on two volumes). A header replaced that way between T0 and T1' (during the key's preprocess) carries a change time older than T0, so the witness's T0 clock rule cannot see it, and no earlier snapshot of that header exists because the header set is unknown until the preprocess runs. A copy after T1' changes the identity and is caught. Not reproduced end to end; derived from the measurement and the witness's construction."
+```
+
+Record the issue number; it gets its own `## Open work` entry beside the shadowing one.
+
 - [ ] **Step 1: File the shadowing-header issue**
 
 ```bash
@@ -1680,8 +1688,10 @@ compile), and `Cc::StabilityTable` decides. A manifest's hashes are the T1' hash
 after the compile; an object is stored only when nothing moved; and the hit a racing backfill
 would have spoiled is still served. Three rules make it hold, and each has already been wrong:
 
-- **Change time, never last-write time.** `copy`, `CopyFileW`, robocopy and `utimensat` keep a
-  file's mtime; #1650's own reproduction used `CopyFileW`, which an mtime check cannot see.
+- **Change time and identity, never last-write time alone.** `copy`, robocopy and `utimensat`
+  keep a file's mtime, and on NTFS `CopyFileW` copies the source's CHANGE time as well (measured
+  during #1650) -- so an older file copied over a newer one is seen by its identity, not by
+  the clock; #1650's own reproduction used `CopyFileW` after the compile, which identity catches.
 - **The clock at T0, identity after T1'.** A file whose change time is at or after T0 moved
   while the key was taken, compared through `Cc::ChangedAtOrAfter`, never a raw `>=`: it floors
   T0 to the grid the stamp itself shows (the largest of 2 s down to 10 ns that divides it),

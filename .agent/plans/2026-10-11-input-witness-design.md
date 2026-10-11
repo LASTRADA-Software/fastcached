@@ -60,8 +60,13 @@ All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-c
   - **POSIX:** `stat`, giving `st_ctim`, `st_size`, `st_ino` and `st_dev`.
   - **A filesystem with no change time** (FAT, exFAT report zero) falls back to the
     last-write time instead of reporting zero.
-  - Change time and file id, not last-write time, are the point. `copy`, `CopyFileW` and
-    robocopy keep `LastWriteTime` (measured in #1650), and a rename-over changes the id.
+  - Change time and file id, not last-write time, are the point: a rename-over changes the
+    id, and an in-place write moves the change time. **`CopyFileW` is the exception, measured
+    while implementing:** on NTFS it copies the SOURCE's change time onto the destination, so
+    an older file copied over a newer one carries an older change time. The identity still
+    differs from the destination's previous one, which is what every comparison after T1′ and
+    the TU's own T0/T1′ comparison read; only the T0 clock rule for a header cannot see it
+    (see Known limits).
 - **`IInputFiles`** is the one seam, with three methods: `Identify(path)` returns an
   `optional<FileIdentity>`, `Hash(path)` returns the content hash, and `Now()` reads the clock
   in the same units as `changeTime`. They are one seam because the witness only ever compares
@@ -221,6 +226,11 @@ Why each row is sound:
 - **FAT and exFAT keep no change time,** so their last-write time stands in for it. That
   weakens the T0 rule there: `CopyFile` keeps a last-write time, and FAT's is 2-second
   granular. The T0/T1′ comparison of the TU and the identity comparison after T1′ still hold.
+- **A header replaced DURING THE KEY'S PREPROCESS by a copy that keeps an older change time**
+  (`CopyFileW` on NTFS copies the source's change time) reads as older than T0, so the T0
+  rule cannot see it, and nothing earlier snapshots that header: the set of headers is
+  unknown until the preprocess has run. The window is the preprocess alone; a copy after
+  T1′ changes the identity and is caught. Its own issue, linked from `## Open work`.
 - **A header *created* during the invocation,** at an include path that shadows the one the
   preprocess resolved, is in no witness. ccache has the same gap. It gets its own issue,
   linked from `.agent/rules/compile-cache.md`'s `## Open work`.
