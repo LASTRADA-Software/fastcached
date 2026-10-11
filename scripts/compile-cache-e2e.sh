@@ -45,9 +45,12 @@
 #  11. Mid-compile save — a save DURING a compile records nothing unsound
 #                           (#1650): the compile that raced an editor's save stores
 #                           nothing and is logged INPUTS-MOVED, and the saved content
-#                           is a MISS that builds what was saved, in this checkout and
-#                           in another. Through the same stub with no save, a compile
-#                           still stores, direct-hits, and shares across checkouts.
+#                           is a MISS that builds what was saved and stores it, in this
+#                           checkout and in another. The raced manifest names the KEYED
+#                           content, so an object another checkout stores under that key
+#                           is never served to the saved content. Through the same stub
+#                           with no save, a compile still stores, direct-hits, and
+#                           shares across checkouts.
 #   2c. Dropped object    — the operator's repair after 2b names a wrong object: the
 #                           key is dropped over CACHE-DROP while its direct-mode
 #                           manifest stands. The next compile must MISS, recompile
@@ -1604,7 +1607,7 @@ done
 # every store would pass every leg above: a quiet compile still stores and records a
 # manifest, its rebuild is a direct hit, and a second checkout of the same content
 # direct-hits the first one's manifest.
-[[ -n "$edit_stub" ]] || fail "case 11 needs --edit-stub; the ctest registration passes it whenever the stub is built"
+[[ -n "$edit_stub" ]] || fail "case 11 needs --edit-stub: the ctest registration passes it whenever the stub is built, and so do CI's direct runs of this script (.github/workflows/build.yml, fastcache-cc-smoke and compile-cache-e2e-linux)"
 [[ -x "$edit_stub" ]] || fail "case 11: the edit stub '${edit_stub}' is not an executable"
 real_compiler="$(command -v "$compiler")" || fail "case 11 cannot resolve the compiler '${compiler}'"
 moved="${workdir}/moved"
@@ -1641,10 +1644,10 @@ for leg in tu header; do
     write_moved_tree "$root" "MESSAGE_V1_OLD_${leg}" "HEADER_V1_OLD_${leg}"
     if [[ "$leg" == tu ]]; then
         write_moved_tree "${moved}/${leg}-v2" "MESSAGE_V2_NEW_${leg}" "HEADER_V1_OLD_${leg}"
-        from="${moved}/${leg}-v2/src/m.cpp" to="${root}/src/m.cpp" want="MESSAGE_V2_NEW_${leg}"
+        from="${moved}/${leg}-v2/src/m.cpp" to="${root}/src/m.cpp" want="MESSAGE_V2_NEW_${leg}" saved_name='m\.cpp'
     else
         write_moved_tree "${moved}/${leg}-v2" "MESSAGE_V1_OLD_${leg}" "HEADER_V2_NEW_${leg}"
-        from="${moved}/${leg}-v2/src/m.hpp" to="${root}/src/m.hpp" want="HEADER_V2_NEW_${leg}"
+        from="${moved}/${leg}-v2/src/m.hpp" to="${root}/src/m.hpp" want="HEADER_V2_NEW_${leg}" saved_name='m\.hpp'
     fi
     : > "${moved}/${leg}.trigger"
     echo "== mid-compile save (${leg}): the compile that raced it stores nothing =="
@@ -1656,6 +1659,11 @@ for leg in tu header; do
     cmp -s "$from" "$to" || fail "mid-compile ${leg}: the stub fired but ${to} does not hold the saved content"
     grep -q "an input changed during the compile: " "${moved}/${leg}-1.log" \
         || fail "mid-compile ${leg}: the save during the compile was not seen"
+    # The whole line: the file it names is the one that was SAVED, and the manifest was still
+    # recorded -- from the content the key was taken from.
+    grep -qE "an input changed during the compile: [^;]*/${saved_name}; compiled, not stored; manifest recorded from the keyed content\$" \
+        "${moved}/${leg}-1.log" \
+        || fail "mid-compile ${leg}: the line does not name the saved file and the keyed manifest"
     # `if` rather than `grep && fail`: a non-matching grep is the SUCCESS path here.
     if grep -q "STORED key=" "${moved}/${leg}-1.log"; then
         fail "mid-compile ${leg}: the raced object was stored"
@@ -1670,6 +1678,9 @@ for leg in tu header; do
     cat "${moved}/${leg}-2.log"
     grep -q "fastcache-cc: MISS" "${moved}/${leg}-2.log" \
         || fail "mid-compile ${leg}: the saved content was served from the cache (the #1650 defect)"
+    # And it STORES: refusing the raced object must not cost the next invocation its store.
+    grep -q "STORED key=" "${moved}/${leg}-2.log" \
+        || fail "mid-compile ${leg}: the saved content compiled but was not stored"
     object_says "${root}/build/m.o" "$want" || fail "mid-compile ${leg}: the object does not say ${want}"
 
     # Inside the loop, before the next leg: every tree here spells the same relative source and
@@ -1682,6 +1693,39 @@ for leg in tu header; do
         || { cat "${moved}/${leg}-other.log" >&2; fail "mid-compile ${leg}: the other checkout failed"; }
     object_says "${other}/build/m.o" "$want" || fail "mid-compile ${leg}: another checkout was served the raced object"
 done
+
+# The manifest guard ALONE. The raced compile records a manifest from the content its key
+# was taken from (v1) and stores nothing; a second checkout of v1 with direct mode OFF then
+# stores key(v1) without touching that manifest. So the object behind the manifest's key now
+# EXISTS, and only the manifest's own hashes decide what the saved content (v2) gets: a
+# manifest hashed from the disk after the save would name v2 and serve it v1's object. The
+# store guard cannot help here -- the object it refused was stored anyway, by the twin.
+echo "== mid-compile save: the manifest is hashed from the keyed content, not from the disk after the save =="
+keyed="${moved}/keyed"
+write_moved_tree "$keyed" MESSAGE_V1_OLD_keyed HEADER_V1_OLD_keyed
+write_moved_tree "${moved}/keyed-v2" MESSAGE_V2_NEW_keyed HEADER_V1_OLD_keyed
+write_moved_tree "${moved}/keyed-v1-twin" MESSAGE_V1_OLD_keyed HEADER_V1_OLD_keyed
+: > "${moved}/keyed.trigger"
+moved_compile "$keyed" "${moved}/keyed-1.log" FC_EDIT_STUB_AT=after-compile \
+    FC_EDIT_STUB_TRIGGER="${moved}/keyed.trigger" FC_EDIT_STUB_FROM="${moved}/keyed-v2/src/m.cpp" \
+    FC_EDIT_STUB_TO="${keyed}/src/m.cpp" \
+    || { cat "${moved}/keyed-1.log" >&2; fail "keyed manifest: the racing compile failed"; }
+[[ ! -e "${moved}/keyed.trigger" ]] || fail "keyed manifest: the stub never fired, so this case tested nothing"
+grep -q "manifest recorded from the keyed content" "${moved}/keyed-1.log" \
+    || { cat "${moved}/keyed-1.log"; fail "keyed manifest: the raced compile recorded no manifest, so this case tests nothing"; }
+keyed_key="$(sed -n 's/^fastcache-cc: MISS key=\([^ ]*\).*/\1/p' "${moved}/keyed-1.log")"
+[[ -n "$keyed_key" ]] || { cat "${moved}/keyed-1.log"; fail "keyed manifest: the raced compile traced no MISS key"; }
+moved_compile "${moved}/keyed-v1-twin" "${moved}/keyed-twin.log" FASTCACHE_NO_DIRECT=1 \
+    || { cat "${moved}/keyed-twin.log" >&2; fail "keyed manifest: the v1 twin failed"; }
+grep -q "STORED key=${keyed_key} " "${moved}/keyed-twin.log" \
+    || { cat "${moved}/keyed-twin.log"; fail "keyed manifest: the v1 twin did not store key(v1)=${keyed_key}, so nothing stands behind the manifest"; }
+rm -f "${keyed}/build/m.o"
+moved_compile "$keyed" "${moved}/keyed-2.log" FASTCACHE_E2E_CASE=moved \
+    || { cat "${moved}/keyed-2.log" >&2; fail "keyed manifest: the saved content's build failed"; }
+cat "${moved}/keyed-2.log"
+grep -q "fastcache-cc: MISS" "${moved}/keyed-2.log" \
+    || fail "keyed manifest: the saved content was served key(v1)'s object through the raced manifest"
+object_says "${keyed}/build/m.o" MESSAGE_V2_NEW_keyed || fail "keyed manifest: the object does not say MESSAGE_V2_NEW_keyed"
 
 echo "== control: the same stub with no save stores, records a manifest, then direct-hits =="
 control="${moved}/control"

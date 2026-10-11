@@ -685,9 +685,13 @@ jobs:
           FASTCACHED_EXPECT_SHA256_ENGINE: ${{ matrix.sha256Engine }}
         run: ctest --preset ${{ matrix.preset }}
 
-      # Both binaries the smoke jobs drive: the daemon every job starts, and the
-      # launcher the compile-cache smoke job points at it. They share a parent
-      # directory, so the artifact keeps them side by side at its root.
+      # The binaries the smoke jobs drive: the daemon every job starts, the launcher
+      # the compile-cache smoke job points at it, and `mid-compile-edit-stub`, the
+      # compiler that saves a file during one launcher invocation for that job's
+      # case 11 (#1650) -- which FAILS without it rather than skipping. They share a
+      # parent directory, so the artifact keeps them side by side at its root. The
+      # stub rides here rather than being built in the smoke job because this job
+      # already builds every target, and the smoke job has no build tree to build in.
       - name: "Upload Linux binaries for the smoke jobs"
         if: ${{ needs.changes.outputs.code != 'false' && (matrix.preset == 'clang-release') }}
         uses: actions/upload-artifact@v4
@@ -696,6 +700,7 @@ jobs:
           path: |
             out/build/clang-release/target/fastcached
             out/build/clang-release/target/fastcache-cc
+            out/build/clang-release/target/mid-compile-edit-stub
           retention-days: 1
           if-no-files-found: error
 
@@ -1903,7 +1908,7 @@ jobs:
           name: fastcached-linux
           path: bin
       - name: "Make the binaries executable"
-        run: chmod +x bin/fastcached bin/fastcache-cc
+        run: chmod +x bin/fastcached bin/fastcache-cc bin/mid-compile-edit-stub
       - name: "Install a C++ compiler + libyaml-cpp runtime"
         run: |
           bash scripts/ci-apt-update.sh
@@ -1916,6 +1921,7 @@ jobs:
             --fastcached ./bin/fastcached \
             --launcher ./bin/fastcache-cc \
             --compiler g++-14 \
+            --edit-stub ./bin/mid-compile-edit-stub \
             --port 11611 || { c=$?; [ "$c" = 77 ] && echo "::error::smoke skipped, nothing verified"; exit "$c"; }
 
   # The `-arm64` row is the Linux job's, for the same reason (#1432), and `msvcArch`
@@ -2281,8 +2287,10 @@ jobs:
       - name: "Configure"
         run: cmake --preset gcc-release
 
+      # `mid-compile-edit-stub` is the compiler case 11 runs through (#1650); the harness
+      # FAILS without it rather than skipping, so it is built with the two binaries.
       - name: "Build"
-        run: cmake --build --preset gcc-release --target fastcached fastcache-cc
+        run: cmake --build --preset gcc-release --target fastcached fastcache-cc mid-compile-edit-stub
 
       # Run the harness directly rather than through ctest so any failure output
       # lands in this job. Exit 77 means a prerequisite was missing and nothing
@@ -2293,6 +2301,7 @@ jobs:
             --fastcached out/build/gcc-release/target/fastcached \
             --launcher out/build/gcc-release/target/fastcache-cc \
             --compiler g++-14 \
+            --edit-stub out/build/gcc-release/target/mid-compile-edit-stub \
             --port 21713 || { c=$?; [ "$c" = 77 ] && echo "::error::E2E skipped, nothing verified"; exit "$c"; }
 
       # The launcher must work with the clang driver too, not just gcc.
@@ -2302,6 +2311,7 @@ jobs:
             --fastcached out/build/gcc-release/target/fastcached \
             --launcher out/build/gcc-release/target/fastcache-cc \
             --compiler clang++ \
+            --edit-stub out/build/gcc-release/target/mid-compile-edit-stub \
             --port 21715 || { c=$?; [ "$c" = 77 ] && echo "::error::E2E skipped, nothing verified"; exit "$c"; }
 
       # The only shape that catches a WRONG object: build a real target through
@@ -2370,8 +2380,10 @@ jobs:
       - name: "Configure"
         run: cmake --preset cl-release -DALLOW_SCCACHE_FALLBACK=ON
 
+      # `mid-compile-edit-stub` is the compiler the mid-compile-save case runs through
+      # (#1650); the harness FAILS without it rather than skipping.
       - name: "Build"
-        run: cmake --build --preset cl-release --target fastcached fastcache-cc
+        run: cmake --build --preset cl-release --target fastcached fastcache-cc mid-compile-edit-stub
 
       # Same assertion as the `windows` job, where the reasoning is written out.
       # Repeated rather than pointed at, because a cache enabled in three jobs and
@@ -2409,6 +2421,7 @@ jobs:
           & pwsh -NoProfile -File src/apps/fastcache-cc/run-launcher-e2e.ps1 `
             -Fastcached out/build/cl-release/target/fastcached.exe `
             -Launcher out/build/cl-release/target/fastcache-cc.exe `
+            -EditStub out/build/cl-release/target/mid-compile-edit-stub.exe `
             -Port 21714
           $code = $LASTEXITCODE
           if ($code -eq 77) {

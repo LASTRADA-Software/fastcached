@@ -89,6 +89,7 @@ enum class Invocation : std::uint8_t
     RealCompile,
     DispatchPreprocess,
     Other,
+    Last, ///< The enumerator count; never an invocation.
 };
 
 /// Where in the invocation the save is placed (`FC_EDIT_STUB_AT`). Private.
@@ -97,6 +98,7 @@ enum class SaveAt : std::uint8_t
     Never,
     AfterCompile,
     BeforeDispatchPreprocess,
+    Last, ///< The enumerator count; never a placement.
 };
 
 /// One row of the classification: an invocation kind, the switches one of which it needs,

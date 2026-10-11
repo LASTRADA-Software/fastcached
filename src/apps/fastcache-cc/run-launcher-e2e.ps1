@@ -55,7 +55,9 @@
 #      `mid-compile-edit-stub`, which forwards to the real driver and overwrites a file
 #      in place once the compile has exited, the raced compile stores nothing and is
 #      logged INPUTS-MOVED, and the saved content -- the TU's or a header's -- is a MISS
-#      that builds what was saved, here and in another checkout. With no save, the same
+#      that builds what was saved and stores it, here and in another checkout; the raced
+#      manifest names the KEYED content, so an object another checkout stores under that
+#      key is never served to the saved content. With no save, the same
 #      stub still stores, direct-hits, and shares across checkouts.
 #   8. Replayed diagnostics: two checkouts sharing a key LEGITIMATELY (nothing in
 #      the preprocessed text names a path, direct mode off) -- the second HITs,
@@ -198,7 +200,9 @@ if (-not $SelfTestPorts) {
 if (-not $SelfTestPorts) {
     $Fastcached = (Resolve-Path $Fastcached).Path
     $Launcher   = (Resolve-Path $Launcher).Path
-    if ($EditStub) { $EditStub = (Resolve-Path $EditStub).Path }
+    # Only when it EXISTS: `Resolve-Path` on a missing path is a terminating error that would end
+    # the whole run here, before the mid-compile-save case can report the failure itself.
+    if ($EditStub -and (Test-Path -LiteralPath $EditStub -PathType Leaf)) { $EditStub = (Resolve-Path -LiteralPath $EditStub).Path }
 }
 
 # AFTER the resolution above, and that ordering is the whole point: both callers
@@ -1509,7 +1513,7 @@ try {
         $msFail = [System.Collections.Generic.List[string]]::new()
         $msLogs = [System.Collections.Generic.List[string]]::new()
         if (-not $EditStub -or -not (Test-Path -LiteralPath $EditStub -PathType Leaf)) {
-            Write-Host "  MID-COMPILE SAVE FAIL ($cc): no -EditStub ('$EditStub'); the ctest registration passes it whenever the stub is built" -ForegroundColor Red
+            Write-Host "  MID-COMPILE SAVE FAIL ($cc): -EditStub names no file ('$EditStub'); the ctest registration passes it whenever the stub is built, and so does CI's direct run of this script (.github/workflows/build.yml, compile-cache-e2e-windows)" -ForegroundColor Red
             $exit = 1
         } else {
             $msCase = Join-Path $MoveTemp "midsave-$cc"
@@ -1526,10 +1530,10 @@ try {
                     New-MovedInputTree $msRoot "MESSAGE_V1_OLD_$leg" "HEADER_V1_OLD_$leg" | Out-Null
                     if ($leg -eq 'tu') {
                         New-MovedInputTree $msV2 "MESSAGE_V2_NEW_$leg" "HEADER_V1_OLD_$leg" | Out-Null
-                        $from = Join-Path $msV2 "src\m.cpp"; $to = Join-Path $msRoot "src\m.cpp"; $want = "MESSAGE_V2_NEW_$leg"
+                        $from = Join-Path $msV2 "src\m.cpp"; $to = Join-Path $msRoot "src\m.cpp"; $want = "MESSAGE_V2_NEW_$leg"; $savedName = 'm\.cpp'
                     } else {
                         New-MovedInputTree $msV2 "MESSAGE_V1_OLD_$leg" "HEADER_V2_NEW_$leg" | Out-Null
-                        $from = Join-Path $msV2 "src\m.hpp"; $to = Join-Path $msRoot "src\m.hpp"; $want = "HEADER_V2_NEW_$leg"
+                        $from = Join-Path $msV2 "src\m.hpp"; $to = Join-Path $msRoot "src\m.hpp"; $want = "HEADER_V2_NEW_$leg"; $savedName = 'm\.hpp'
                     }
                     $trigger = Join-Path $msCase "$leg.trigger"
                     New-Item -ItemType File -Force $trigger | Out-Null
@@ -1543,6 +1547,11 @@ try {
                     if (Test-Path -LiteralPath $trigger) { $msFail.Add("$leg`: the stub never fired, so this leg tested nothing") }
                     elseif ((Get-FileHash $from).Hash -ne (Get-FileHash $to).Hash) { $msFail.Add("$leg`: the stub fired but $to does not hold the saved content") }
                     if (-not $rRaced.stderr.Contains("an input changed during the compile: ")) { $msFail.Add("$leg`: the save during the compile was not seen") }
+                    # The whole line: the file it names is the one that was SAVED, and the manifest
+                    # was still recorded -- from the content the key was taken from.
+                    if ($rRaced.stderr -notmatch "an input changed during the compile: [^;\r\n]*[\\/]$savedName; compiled, not stored; manifest recorded from the keyed content\r?(\n|$)") {
+                        $msFail.Add("$leg`: the line does not name the saved file and the keyed manifest")
+                    }
                     if ($rRaced.stderr.Contains("STORED key=")) { $msFail.Add("$leg`: the raced object was stored") }
                     if ($logged -ne "INPUTS-MOVED") { $msFail.Add("$leg`: recorded '$logged', not INPUTS-MOVED") }
 
@@ -1551,6 +1560,8 @@ try {
                     $msLogs.Add("--- $leg, the saved content rebuilt ---`n$($rSaved.stderr)")
                     if ($rSaved.code -ne 0) { $msFail.Add("$leg`: the rebuild failed (exit $($rSaved.code))") }
                     if ((Get-Outcome $rSaved.stderr) -ne "MISS") { $msFail.Add("$leg`: the saved content was served from the cache (the #1650 defect)") }
+                    # And it STORES: refusing the raced object must not cost the next invocation its store.
+                    if (-not $rSaved.stderr.Contains("STORED key=")) { $msFail.Add("$leg`: the saved content compiled but was not stored") }
                     if (-not (Test-ObjectNames $rSaved.obj $want)) { $msFail.Add("$leg`: the object does not say $want") }
 
                     # Inside the loop, before the next leg: every tree here spells the same
@@ -1564,6 +1575,42 @@ try {
                     if ($rOther.code -ne 0) { $msFail.Add("$leg`: the other checkout failed (exit $($rOther.code))") }
                     if (-not (Test-ObjectNames $rOther.obj $want)) { $msFail.Add("$leg`: another checkout was served the raced object") }
                 }
+
+                # The manifest guard ALONE. The raced compile records a manifest from the content
+                # its key was taken from (v1) and stores nothing; a second checkout of v1 with
+                # direct mode OFF then stores key(v1) without touching that manifest. So the
+                # object behind the manifest's key EXISTS, and only the manifest's own hashes
+                # decide what the saved content (v2) gets: a manifest hashed from the disk after
+                # the save would name v2 and serve it v1's object.
+                $msKeyed = Join-Path $msCase "keyed"
+                $msKeyedV2 = Join-Path $msCase "keyed-v2"
+                $msKeyedTwin = Join-Path $msCase "keyed-v1-twin"
+                New-MovedInputTree $msKeyed "MESSAGE_V1_OLD_keyed" "HEADER_V1_OLD_keyed" | Out-Null
+                New-MovedInputTree $msKeyedV2 "MESSAGE_V2_NEW_keyed" "HEADER_V1_OLD_keyed" | Out-Null
+                New-MovedInputTree $msKeyedTwin "MESSAGE_V1_OLD_keyed" "HEADER_V1_OLD_keyed" | Out-Null
+                $trigger = Join-Path $msCase "keyed.trigger"
+                New-Item -ItemType File -Force $trigger | Out-Null
+                $rKeyed = Invoke-LauncherThroughStub $msStub $msKeyed @{
+                    FC_EDIT_STUB_AT = "after-compile"; FC_EDIT_STUB_TRIGGER = $trigger
+                    FC_EDIT_STUB_FROM = (Join-Path $msKeyedV2 "src\m.cpp"); FC_EDIT_STUB_TO = (Join-Path $msKeyed "src\m.cpp")
+                }
+                $msLogs.Add("--- keyed manifest, the raced compile ---`n$($rKeyed.stderr)")
+                $keyedKey = [regex]::Match($rKeyed.stderr, 'fastcache-cc: MISS key=(\S+)').Groups[1].Value
+                if ($rKeyed.code -ne 0) { $msFail.Add("keyed manifest: the racing compile failed (exit $($rKeyed.code))") }
+                if (Test-Path -LiteralPath $trigger) { $msFail.Add("keyed manifest: the stub never fired, so this case tested nothing") }
+                if (-not $rKeyed.stderr.Contains("manifest recorded from the keyed content")) { $msFail.Add("keyed manifest: the raced compile recorded no manifest, so this case tests nothing") }
+                if (-not $keyedKey) { $msFail.Add("keyed manifest: the raced compile traced no MISS key") }
+                $rKeyedTwin = Invoke-LauncherThroughStub $msStub $msKeyedTwin @{ FASTCACHE_NO_DIRECT = "1" }
+                $msLogs.Add("--- keyed manifest, the v1 twin (direct mode off) ---`n$($rKeyedTwin.stderr)")
+                if (-not $keyedKey -or -not $rKeyedTwin.stderr.Contains("STORED key=$keyedKey ")) {
+                    $msFail.Add("keyed manifest: the v1 twin did not store key(v1)='$keyedKey', so nothing stands behind the manifest")
+                }
+                Remove-Item -LiteralPath $rKeyed.obj -Force -ErrorAction SilentlyContinue
+                $rKeyedSaved = Invoke-LauncherThroughStub $msStub $msKeyed @{}
+                $msLogs.Add("--- keyed manifest, the saved content ---`n$($rKeyedSaved.stderr)")
+                if ($rKeyedSaved.code -ne 0) { $msFail.Add("keyed manifest: the saved content's build failed (exit $($rKeyedSaved.code))") }
+                if ((Get-Outcome $rKeyedSaved.stderr) -ne "MISS") { $msFail.Add("keyed manifest: the saved content was served key(v1)'s object through the raced manifest") }
+                if (-not (Test-ObjectNames $rKeyedSaved.obj "MESSAGE_V2_NEW_keyed")) { $msFail.Add("keyed manifest: the object does not say MESSAGE_V2_NEW_keyed") }
 
                 $msControl = Join-Path $msCase "control"
                 New-MovedInputTree $msControl "MESSAGE_CONTROL" "HEADER_CONTROL" | Out-Null
@@ -1589,7 +1636,7 @@ try {
                 Remove-Item Env:\FC_EDIT_STUB_REAL -ErrorAction SilentlyContinue
             }
             if ($msFail.Count -eq 0) {
-                Write-Host "  tu and header saved mid-compile: nothing stored, INPUTS-MOVED, the saved content a MISS here and in another checkout; quiet compiles store, direct-hit and share: OK ($cc)" -ForegroundColor Green
+                Write-Host "  tu and header saved mid-compile: nothing stored, INPUTS-MOVED, the saved content a MISS that stores, here and in another checkout; the manifest names the keyed content; quiet compiles store, direct-hit and share: OK ($cc)" -ForegroundColor Green
             } else {
                 foreach ($line in $msFail) { Write-Host "  MID-COMPILE SAVE FAIL ($cc): $line" -ForegroundColor Red }
                 foreach ($log in $msLogs) { Write-Host $log }
