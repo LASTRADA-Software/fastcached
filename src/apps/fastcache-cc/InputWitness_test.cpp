@@ -63,6 +63,12 @@ class FakeInputFiles final: public IInputFiles
     {
         return now;
     }
+    /// `now` as well: a scripted clock has no tick to cross, so the fenced instant IS the reading,
+    /// and every change time a case sets is ordered against it exactly as written.
+    [[nodiscard]] FileInstant Fence() const override
+    {
+        return now;
+    }
 
     /// Put @p path at content @p hash, changed at @p changeTime, with id @p id.
     void Set(std::string const& path, std::string hash, FileInstant changeTime, std::uint64_t id)

@@ -29,7 +29,7 @@ std::string DescribeInstability(StabilityFinding const& finding)
 InputWitness InputWitness::Begin(std::string resolvedSource, IInputFiles const& files, ContentHashing hashing)
 {
     auto witness = InputWitness {};
-    witness._started = files.Now();
+    witness._started = files.Fence();
     witness._hashing = hashing;
     witness._sourceAtStart = files.Identify(resolvedSource);
     if (hashing == ContentHashing::Yes)

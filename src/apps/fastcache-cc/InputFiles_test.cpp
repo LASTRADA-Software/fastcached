@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
+#include <format>
+#include <ranges>
 #include <string>
 
 #include <tests/ScratchPath.hpp>
@@ -55,6 +57,44 @@ TEST_CASE("A file written after an instant has a change time at or after it", "[
     auto const identity = files->Identify((scratch / "a.hpp").string());
     REQUIRE(identity.has_value());
     CHECK(Unwrap(identity).changeTime >= before);
+}
+
+TEST_CASE("A fence orders a change made just before it below it and one made after it at or above", "[input-files]")
+{
+    // #1650, Ruling 11. A T0 read INSIDE the current coarse tick shares that tick with a change
+    // saved a moment before the invocation started, so `ChangedAtOrAfter` had to call that change
+    // "at or after" and the compile refused its store -- about 1 in 6 launches right after a write
+    // on WSL's 4 ms tick. One pass can pass by luck, so the property is asked many times in a row:
+    // `Iterations` writes each landing as close before the fence as this process can put them.
+    constexpr auto Iterations = 60;
+    FastCache::Testing::ScratchDirectory const scratch { "fc-input-files-fence" };
+    auto const path = (scratch / "a.hpp").string();
+    auto const files = MakeDiskInputFiles();
+
+    auto beforeReadAsAfter = 0;
+    auto afterReadAsBefore = 0;
+    auto unreadable = 0;
+    for (auto const iteration: std::views::iota(0, Iterations))
+    {
+        scratch.Write("a.hpp", std::format("before {}\n", iteration));
+        auto const fence = files->Fence();
+        auto const before = files->Identify(path);
+        scratch.Write("a.hpp", std::format("after {}\n", iteration));
+        auto const after = files->Identify(path);
+        if (!before || !after)
+        {
+            ++unreadable;
+            continue;
+        }
+        if (ChangedAtOrAfter(before->changeTime, fence))
+            ++beforeReadAsAfter;
+        if (!ChangedAtOrAfter(after->changeTime, fence))
+            ++afterReadAsBefore;
+    }
+    INFO("of " << Iterations << " iterations");
+    CHECK(unreadable == 0);
+    CHECK(beforeReadAsAfter == 0);
+    CHECK(afterReadAsBefore == 0);
 }
 
 #if defined(_WIN32)

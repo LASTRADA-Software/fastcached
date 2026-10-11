@@ -141,7 +141,8 @@ struct StabilityFinding
 class InputWitness
 {
   public:
-    /// Take T0.
+    /// Take T0, through `IInputFiles::Fence`, so a change saved just before the invocation reads as
+    /// before it rather than sharing its tick (#1650).
     /// @param resolvedSource The translation unit, resolved.
     /// @param files The input files.
     /// @param hashing Whether contents are hashed as well.

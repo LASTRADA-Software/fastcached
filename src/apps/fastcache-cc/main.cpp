@@ -2255,7 +2255,10 @@ void RecordManifest(InvocationRecord const& record,
         return Cc::StoreObject::Yes;
     auto const keepsManifest = cfg.direct && row.manifest == Cc::KeepManifest::Yes;
     record.outcome = row.outcome; // INPUTS-MOVED for a moved input, UNCACHEABLE for an unobservable one (Ruling 10)
-    record.outcomeDetail = Cc::DescribeInstability(moved);
+    // The row's FIXED sentence, never the path: `--show-stats` tallies this detail, and a path in it
+    // ranks one row per file rather than one per cause (`RecordFallback`'s rule). The path is on
+    // the verbose line below.
+    record.outcomeDetail = row.sentence;
     Note(record.verbose,
          std::format("{}; compiled, not stored{}",
                      Cc::DescribeInstability(moved),

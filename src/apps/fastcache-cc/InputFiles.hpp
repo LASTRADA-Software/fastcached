@@ -73,7 +73,7 @@ static_assert(std::ranges::adjacent_find(StampGrids, std::less_equal {}) == Stam
 /// BEFORE it can read as at-or-after it. That costs one invocation its cache store and never
 /// serves a wrong object.
 /// @param changeTime A file's change time (`FileIdentity::changeTime`).
-/// @param instant An instant read from `IInputFiles::Now`.
+/// @param instant An instant read from `IInputFiles::Now` or `IInputFiles::Fence`.
 /// @return False when the change is before @p instant, which within the conditions above means
 ///         certainly before it; true when it may be at or after it.
 [[nodiscard]] constexpr bool ChangedAtOrAfter(FileInstant changeTime, FileInstant instant) noexcept
@@ -133,6 +133,22 @@ class IInputFiles
     ///         coarse realtime clock, otherwise the fine clock minus `FineClockSafetyTick` (see
     ///         `FileInstant`).
     [[nodiscard]] virtual FileInstant Now() const = 0;
+
+    /// An instant that ORDERS every change against it: one made before this call is stamped
+    /// strictly below the result, and one made after it returns is stamped at or above it. Blocks
+    /// until the clock change times are stamped with has crossed one tick to get there.
+    ///
+    /// Why not `Now`: an instant read INSIDE the current coarse tick shares that tick with every
+    /// change stamped in it, before the read or after, so a change saved a moment before an
+    /// invocation started cannot be told from one saved after -- `ChangedAtOrAfter` must call it
+    /// "at or after", and the invocation refuses its store. Measured on WSL (4 ms ticks): 5 of 30
+    /// compiles launched right after a write refused to store (#1650). Waiting for the next tick
+    /// removes the ambiguity rather than failing closed on it, at the cost of at most one tick.
+    ///
+    /// Holds under the condition `ChangedAtOrAfter` states: a filesystem stamping from THIS
+    /// machine's clock on a decimal or 2 s grid.
+    /// @return The fenced instant, on the clock `Now` reads.
+    [[nodiscard]] virtual FileInstant Fence() const = 0;
 
   protected:
     /// Protected rather than deleted, so a test fake deriving from this can be returned by value
