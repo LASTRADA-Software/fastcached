@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -133,6 +134,11 @@ enum class ManifestFault : std::uint8_t
     /// of them is fixed by editing the build's flags.
     DepsNotObserved,
 
+    /// The file changed after this invocation began, so its content now is not the content the
+    /// key was taken from (#1650). Reached only by the one path the input witness did not
+    /// snapshot: the build's own depfile, read after the compile when the probe reported nothing.
+    ChangedDuringInvocation,
+
     Last, ///< Not a fault, and has no row: the table's length.
 };
 
@@ -166,6 +172,7 @@ inline constexpr EnumTable<ManifestFault, FaultRow> FaultTable { {
     { .fault = ManifestFault::Unreadable, .label = "unreadable" },
     { .fault = ManifestFault::NoProjectDeps, .label = "every reported dependency was dropped as toolchain" },
     { .fault = ManifestFault::DepsNotObserved, .label = "the compile produced no dependency record" },
+    { .fault = ManifestFault::ChangedDuringInvocation, .label = "changed during this compile" },
 } };
 
 static_assert(RowsInEnumeratorOrder(FaultTable, &FaultRow::fault),
@@ -520,6 +527,31 @@ class ReportedDependencies
     bool _observed;
 };
 
+/// Where `BuildManifest` takes each entry's content hash from.
+///
+/// A manifest asserts "these hashes reach that object", so its hashes must be the content the
+/// object's KEY was derived from. Hashing at record time, after the compile, asserted whatever a
+/// save during the compile had left on disk instead (#1650). In production this is the input
+/// witness, which hashed every file right after the key's preprocess.
+class IManifestContent
+{
+  public:
+    virtual ~IManifestContent() = default;
+
+    /// @param resolvedPath A path as `ResolveAgainst` resolved it.
+    /// @return Its content hash as of the key, or why that cannot be known.
+    [[nodiscard]] virtual std::expected<std::string, ManifestFault> HashAsKeyed(std::string_view resolvedPath) const = 0;
+
+  protected:
+    /// Protected rather than deleted, so an implementation can be returned by value while
+    /// nothing slice-copies through the interface -- `IInputFiles`' choice, for its reason.
+    IManifestContent() = default;
+    IManifestContent(IManifestContent const&) = default;
+    IManifestContent& operator=(IManifestContent const&) = default;
+    IManifestContent(IManifestContent&&) = default;
+    IManifestContent& operator=(IManifestContent&&) = default;
+};
+
 /// Everything one compile contributes to its manifest.
 ///
 /// A struct rather than six positional arguments, for the reason `Cc::KeyInputs`
@@ -563,6 +595,10 @@ struct ManifestInputs
     /// Key the compiled object is already stored under; recorded by value so the
     /// object is never stored twice.
     std::string objectKey;
+
+    /// Where each entry's hash comes from. A reference with no default, so a caller cannot
+    /// leave the question unanswered and fall back to reading the disk at record time (#1650).
+    IManifestContent const& content;
 };
 
 /// Resolve a compiler-reported path to this machine's absolute, normalized form.
@@ -598,6 +634,20 @@ struct ManifestInputs
 [[nodiscard]] std::string ResolveAgainst(std::string_view rawPath,
                                          std::string_view workingDirectory,
                                          PathCanon::Layout const& layout);
+
+/// The reported dependencies a manifest would hash, resolved exactly as `BuildManifest` resolves
+/// them and kept only where `BuildManifest` keeps them (project paths).
+///
+/// One function for both sides, so an input witness taken over this list answers every lookup
+/// `BuildManifest` makes. Paths `BuildManifest` would REFUSE (unanchored, a near-miss root) are
+/// dropped here rather than refused: the refusal is still `BuildManifest`'s to make, by name.
+/// @param reportedPaths    Dependencies as the compiler spelled them.
+/// @param workingDirectory The compile's working directory.
+/// @param layout           This build's roots.
+/// @return The resolved project paths, in reported order, duplicates removed.
+[[nodiscard]] std::vector<std::string> ProjectDependencyPaths(std::span<std::string const> reportedPaths,
+                                                              std::string_view workingDirectory,
+                                                              PathCanon::Layout const& layout);
 
 /// Re-spell a directory in the vocabulary the layout's roots use.
 ///

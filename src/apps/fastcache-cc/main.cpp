@@ -60,6 +60,7 @@
 #include "HitVerification.hpp"
 #include "IProcessRunner.hpp"
 #include "LauncherCli.hpp"
+#include "ManifestContentTestSupport.hpp"
 #include "MarkerDiscovery.hpp"
 #include "NotePathCollapse.hpp"
 #include "ParallelFor.hpp"
@@ -2117,13 +2118,15 @@ void RecordManifest(InvocationRecord const& record,
     // caller cannot omit it: `ReportedDependencies` has no default constructor, so
     // there is no way to leave the question unanswered.
     auto const reported = includes.size();
+    Cc::Test::HashedWhenAsked const recordTimeContent; // Replaced by the input witness in Task 5 (#1650).
     auto const manifest = Cc::BuildManifest(
         { .sourcePath = resolvedSource,
           .reportedDependencies = includes.empty() ? Cc::ReportedDependencies::NotObserved()
                                                    : Cc::ReportedDependencies::Observed(std::move(includes)),
           .workingDirectory = workingDirectoryText,
           .toolchainStamp = toolchainStamp,
-          .objectKey = std::string { objectKeyForPointer } },
+          .objectKey = std::string { objectKeyForPointer },
+          .content = recordTimeContent },
         layout);
     if (!manifest.has_value())
     {

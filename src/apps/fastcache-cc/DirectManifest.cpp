@@ -757,6 +757,20 @@ std::expected<std::string, ManifestFailure> CanonicalSourceToken(std::string_vie
     return *std::move(token);
 }
 
+std::vector<std::string> ProjectDependencyPaths(std::span<std::string const> reportedPaths,
+                                                std::string_view workingDirectory,
+                                                PathCanon::Layout const& layout)
+{
+    std::vector<std::string> kept;
+    for (auto const& rawPath: reportedPaths)
+    {
+        auto resolved = ResolveAgainst(rawPath, workingDirectory, layout);
+        if (ClassifyResolved(resolved, layout) == PathRole::Project && !std::ranges::contains(kept, resolved))
+            kept.push_back(std::move(resolved));
+    }
+    return kept;
+}
+
 std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs const& inputs, PathCanon::Layout const& layout)
 {
     // Asked FIRST, before the TU is even resolved, because it is the one refusal
@@ -787,11 +801,17 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
     if (!sourceToken.has_value())
         return std::unexpected(sourceToken.error());
 
-    auto const record = [&manifest](std::string token, std::string const& resolved) -> std::expected<void, ManifestFailure> {
-        auto hash = HashFileContents(resolved);
-        if (hash.empty())
-            return std::unexpected(ManifestFailure { .fault = ManifestFault::Unreadable, .path = resolved });
-        manifest.entries.push_back({ .canonicalPath = std::move(token), .contentHash = std::move(hash) });
+    // Each entry's hash is the content as of the KEY, taken from `inputs.content`, never the
+    // content as of now. A manifest asserts "these hashes reach that object", and this runs
+    // after the compile: hashing the disk here recorded whatever a save during the compile had
+    // left behind, paired with the object the old content produced -- a stale object served on
+    // every later hit (#1650). The content source's own refusal is reported with this path.
+    auto const record = [&manifest, &inputs](std::string token,
+                                             std::string const& resolved) -> std::expected<void, ManifestFailure> {
+        auto hash = inputs.content.HashAsKeyed(resolved);
+        if (!hash.has_value())
+            return std::unexpected(ManifestFailure { .fault = hash.error(), .path = resolved });
+        manifest.entries.push_back({ .canonicalPath = std::move(token), .contentHash = *std::move(hash) });
         return {};
     };
 
@@ -992,7 +1012,12 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
     // producer's object -- the direct-mode half of the defect, and the default path.
     // Only a re-key makes those manifests unreachable; a v7 manifest points at a
     // portable key, which a root-bound object answers with a marker.
-    KeyDigest digest { "manifest-v7" };
+    //
+    // v8 is #1650 and moved alone: it retires every manifest recorded before #1650, whose
+    // hashes were read after the compile, so an edit saved during it paired the new content
+    // with the old object. `objkey` did not move, because the objects under their keys were
+    // never the defect.
+    KeyDigest digest { "manifest-v8" };
     digest.Field(toolchainStamp);
     digest.Field(canonicalSource);
     for (auto const& arg: relativizedArgs)
