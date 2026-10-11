@@ -98,9 +98,19 @@ static_assert(std::ranges::adjacent_find(StampGrids, std::less_equal {}) == Stam
 /// machine and this checkout, and a manifest carrying one would stop being shared (#1650). It is
 /// compared only with another identity of the same path taken by the same process.
 ///
-/// The change time, NOT the last-write time, is the point: `copy`, `CopyFileW` and robocopy keep
-/// a file's last-write time, and so does `utimensat`, while every one of them moves the change
-/// time. The file id catches a rename over the path.
+/// What moves which field, as measured (#1650):
+/// - A rename over the path changes the file id.
+/// - An in-place write moves the change time. So does `utimensat`, which sets the last-write time
+///   back -- the change time, NOT the last-write time, is why a backdated save is still seen.
+/// - `CopyFileW` over an existing file on NTFS does NOT stamp a new change time: it copies the
+///   SOURCE's change time (and last-write time) onto the destination. Measured: a source written,
+///   200 ms waited, then copied -- the destination's change time equalled the source's, 200 ms
+///   before an instant read just before the copy.
+///
+/// So an older file copied over a newer one is seen by its IDENTITY changing -- in every comparison
+/// after T1', and in the TU's T0/T1' comparison -- and never by the clock. The T0 clock rule
+/// (`ChangedAtOrAfter` against T0) cannot see such a copy of a HEADER made during the key's
+/// preprocess, between T0 and T1': a documented limit of the witness.
 struct FileIdentity
 {
     FileInstant changeTime {};   ///< NTFS `ChangeTime` or POSIX `st_ctim`; the last-write time

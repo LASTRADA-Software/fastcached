@@ -98,26 +98,37 @@ TEST_CASE("A fence orders a change made just before it below it and one made aft
 }
 
 #if defined(_WIN32)
-TEST_CASE("CopyFileW keeps the last-write time and still moves the change time", "[input-files]")
+TEST_CASE("CopyFileW over a file changes its identity while carrying the source's last-write time", "[input-files]")
 {
     // #1650's deterministic variant: an mtime-only identity cannot see this copy at all.
+    //
+    // What this does NOT assert is that the change time moved. It does not: measured on NTFS,
+    // `CopyFileW` copies the SOURCE's change time onto the destination rather than stamping a new
+    // one, so an older file copied over a newer one carries an older change time than the file it
+    // replaced. Nor does it assert the copied value equals the source's, which may differ between
+    // Windows builds. What catches the copy is the IDENTITY, not the clock: it differs from the one
+    // taken before the copy, which is the comparison the witness makes after T1'.
     FastCache::Testing::ScratchDirectory const scratch { "fc-input-files-copy" };
-    scratch.Write("old.hpp", "MESSAGE_V1_OLD\n");
     scratch.Write("new.hpp", "MESSAGE_V2_NEW\n");
     auto const oldPath = scratch / "old.hpp";
     auto const newPath = scratch / "new.hpp";
     auto const anHourAgo = std::filesystem::file_time_type::clock::now() - std::chrono::hours { 1 };
     std::filesystem::last_write_time(newPath, anHourAgo);
 
+    // The fence puts the next write in a later tick than every change to `new.hpp`, so the
+    // destination's own change time cannot coincide with the one the copy brings.
     auto const files = MakeDiskInputFiles();
-    auto const before = files->Now();
+    static_cast<void>(files->Fence());
+    scratch.Write("old.hpp", "MESSAGE_V1_OLD\n"); // Same length as new.hpp's content.
+    auto const before = files->Identify(oldPath.string());
+    REQUIRE(before.has_value());
     REQUIRE(CopyFileW(newPath.c_str(), oldPath.c_str(), FALSE) != 0);
+    auto const after = files->Identify(oldPath.string());
+    REQUIRE(after.has_value());
 
     // The trap is real on this machine: the copy carried the hour-old last-write time.
     CHECK(std::filesystem::last_write_time(oldPath) < anHourAgo + std::chrono::minutes { 1 });
-    auto const identity = files->Identify(oldPath.string());
-    REQUIRE(identity.has_value());
-    CHECK(Unwrap(identity).changeTime >= before);
+    CHECK(Unwrap(before) != Unwrap(after));
 }
 #else
 TEST_CASE("Setting a file's modification time back still moves its change time", "[input-files]")
