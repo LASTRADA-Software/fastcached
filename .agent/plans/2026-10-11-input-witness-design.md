@@ -68,7 +68,10 @@ All of it lives in the launcher's own `_fc_cc_sources`, so it is in `fastcache-c
   their answers with each other. `MakeDiskInputFiles()` returns the disk implementation, and
   tests inject a fake that controls every boundary.
   - **Every comparison with T0 is `ChangedAtOrAfter(changeTime, T0)`, never a raw `>=`.** It
-    floors T0 to the granularity the stamp itself shows: a whole 2 s, a whole second, or none.
+    floors T0 to the granularity the stamp itself shows: the largest of 2 s, 1 s, 100 ms,
+    10 ms, 1 ms, 100 µs, 10 µs, 1 µs, 100 ns and 10 ns that divides the stamp exactly, or none.
+    The trailing decimal zeros are the only evidence of a stamp's grid, and exFAT and vfat stamp
+    at 10 ms. The cost is a fail-closed window no wider than the inferred unit.
     A filesystem that stamps whole seconds (HFS+, ext4 with 128-byte inodes) stamps an edit at
     5.9 s as 5.0 s, which a raw comparison with T0 = 5.7 s would call older than the
     invocation. A blanket floor (ccache's "include file too new") is rejected: it would stop
