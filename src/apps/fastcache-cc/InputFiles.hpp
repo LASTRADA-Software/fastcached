@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -14,54 +16,74 @@ namespace FastCache::Cc
 /// An instant on the clock a filesystem stamps change times with: nanoseconds since the Unix
 /// epoch.
 ///
-/// Read COARSELY on purpose (`IInputFiles::Now`). A filesystem stamps a change with the kernel's
-/// tick-granular time, so an instant read with a finer clock can lie AFTER the stamp of a change
-/// that happened after it, and the T0 rule (#1650) would call that change older than the
-/// invocation. A coarse read is never later than the stamp of anything that happens after it
-/// **only where the filesystem stamps at least as finely as the kernel tick**. HFS+ and ext4 with
-/// 128-byte inodes stamp whole seconds and FAT every two seconds, so there a change made after the
-/// instant can carry a stamp BEFORE it. A caller therefore never compares a change time with an
-/// instant by a raw `>=`: `ChangedAtOrAfter` is the comparison.
+/// Read by `IInputFiles::Now` on a COARSE realtime clock where the platform has one, and
+/// otherwise on the fine clock moved back by `FineClockSafetyTick`. A filesystem stamps a change
+/// with the kernel's tick-granular time, so an instant read with a finer clock can lie AFTER the
+/// stamp of a change that happened after it, and the T0 rule (#1650) would call that change older
+/// than the invocation. Many filesystems also stamp on a coarser grid of their own -- FAT every
+/// 2 s, HFS+ and ext4 with 128-byte inodes every second, Linux's exFAT and vfat every 10 ms, NTFS
+/// every 100 ns -- so a change made after the instant can carry a stamp BEFORE it. A caller
+/// therefore never compares a change time with an instant by a raw `>=`: `ChangedAtOrAfter` is
+/// the comparison, and its comment says where it is exact.
 using FileInstant = std::int64_t;
 
 /// One second in `FileInstant` units.
 inline constexpr FileInstant OneSecondOfFileTime = 1'000'000'000;
 
-/// The coarse stamp granularities `ChangedAtOrAfter` recognises, COARSEST FIRST: FAT's two
-/// seconds, then the whole second of HFS+ and of ext4 with 128-byte inodes. A stamp is read as
-/// having the first granularity it is a whole multiple of.
-inline constexpr std::array<FileInstant, 2> CoarseStampGranularities { 2 * OneSecondOfFileTime, OneSecondOfFileTime };
+/// The stamp grids `ChangedAtOrAfter` recognises, COARSEST FIRST: FAT's 2 s, then every decimal
+/// unit from 1 s down to 10 ns -- among them HFS+'s and 128-byte-inode ext4's 1 s, Linux exFAT's
+/// and vfat's 10 ms, and NTFS's and ReFS's 100 ns. A stamp is read as lying on the first grid that
+/// divides it exactly; one that none divides is on the 1 ns grid, and nothing is floored.
+///
+/// The 1 s row is subsumed for comparisons: for a stamp on an odd second, flooring the instant to
+/// 1 s or to 2 s gives the same answer, so no input tells it from the 2 s row. It stays because it
+/// is a real grid (HFS+, ext4 with 128-byte inodes), and without it an odd whole second would be
+/// read as the 100 ms grid instead.
+inline constexpr std::array StampGrids { 2 * OneSecondOfFileTime,    OneSecondOfFileTime,       FileInstant { 100'000'000 },
+                                         FileInstant { 10'000'000 }, FileInstant { 1'000'000 }, FileInstant { 100'000 },
+                                         FileInstant { 10'000 },     FileInstant { 1'000 },     FileInstant { 100 },
+                                         FileInstant { 10 } };
+
+/// Every row is positive, so no row divides by zero.
+static_assert(std::ranges::all_of(StampGrids, [](FileInstant grid) { return grid > 0; }));
+
+/// The rows are strictly decreasing, so the FIRST grid that divides a stamp is its coarsest.
+static_assert(std::ranges::adjacent_find(StampGrids, std::less_equal {}) == StampGrids.end());
 
 /// Whether a change stamped @p changeTime may have happened at or after @p instant.
 ///
 /// A filesystem stamps a change made at real time `t` with `floor_g(t)`, where `g` is its stamp
-/// granularity, so a change at `t >= instant` carries a stamp `>= floor_g(instant)`. Comparing
-/// against @p instant floored to that granularity is therefore the weakest comparison that still
-/// never calls such a change older than @p instant. A blanket floor -- ccache's "include file too
-/// new", which distrusts everything inside a fixed window -- would stop caching every consumer of a
-/// header generated in the same build second, which #1650's design rules out.
+/// grid, so a change at `t >= instant` carries a stamp `>= floor_g(instant)`. Comparing against
+/// @p instant floored to that grid is therefore the weakest comparison that still never calls
+/// such a change older than @p instant. A blanket floor -- ccache's "include file too new", which
+/// distrusts everything inside a fixed window -- would stop caching every consumer of a header
+/// generated in the same build second, which #1650's design rules out.
 ///
-/// The granularity is inferred from the STAMP ITSELF, since nothing else on hand knows the
-/// filesystem: a whole multiple of two seconds reads as FAT's 2 s, any other whole second as 1 s,
-/// and anything finer as a filesystem stamping below a second, where `IInputFiles::Now` is
-/// already coarse and nothing is floored. The floor rounds toward negative infinity, so a
-/// pre-epoch instant is floored correctly as well.
+/// The grid is inferred from the STAMP ITSELF (`StampGrids`): its trailing decimal zeros are the
+/// only evidence of the grid it lies on, since nothing else on hand knows the filesystem. The floor
+/// rounds toward negative infinity, so a pre-epoch instant is floored correctly as well.
 ///
-/// Residual, failing CLOSED: a fine-grained stamp that happens to land on a whole second is
-/// floored as though its filesystem were coarse, so a change shortly BEFORE @p instant can read as
-/// at-or-after it. That costs one invocation its cache store and never serves a wrong object. A
-/// 1 s filesystem's even-second stamp is judged against a 2 s window for the same reason.
+/// **Exact where** the filesystem's grid is a decimal unit or 2 s, AND the stamp comes from THIS
+/// machine's clock. A non-decimal grid, or a stamp another machine's clock wrote -- a network
+/// share, or a WSL `/mnt` drive stamped by the Windows host -- is outside it, and there a change
+/// after @p instant can still read as before it.
+///
+/// Residual, failing CLOSED: a fine-grained stamp that happens to end in zeros is read as lying on
+/// a coarser grid, so @p instant is floored by at most that unit and a change at most that long
+/// BEFORE it can read as at-or-after it. That costs one invocation its cache store and never
+/// serves a wrong object.
 /// @param changeTime A file's change time (`FileIdentity::changeTime`).
 /// @param instant An instant read from `IInputFiles::Now`.
-/// @return False only when the change is certainly before @p instant.
+/// @return False when the change is before @p instant, which within the conditions above means
+///         certainly before it; true when it may be at or after it.
 [[nodiscard]] constexpr bool ChangedAtOrAfter(FileInstant changeTime, FileInstant instant) noexcept
 {
     auto granularity = FileInstant { 1 };
-    for (auto const candidate: CoarseStampGranularities)
+    for (auto const grid: StampGrids)
     {
-        if (changeTime % candidate == 0)
+        if (changeTime % grid == 0)
         {
-            granularity = candidate;
+            granularity = grid;
             break;
         }
     }
@@ -107,7 +129,9 @@ class IInputFiles
     /// @return The content hash `HashFileContents` computes; empty when unreadable.
     [[nodiscard]] virtual std::string Hash(std::string_view path) const = 0;
 
-    /// @return Now, on the coarse clock change times are stamped with (see `FileInstant`).
+    /// @return Now, on the clock change times are stamped with: coarse where the platform has a
+    ///         coarse realtime clock, otherwise the fine clock minus `FineClockSafetyTick` (see
+    ///         `FileInstant`).
     [[nodiscard]] virtual FileInstant Now() const = 0;
 
   protected:

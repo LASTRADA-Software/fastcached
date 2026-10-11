@@ -164,6 +164,12 @@ constexpr FileInstant Seconds(std::int64_t count)
     return count * OneSecondOfFileTime;
 }
 
+/// Nanoseconds since the epoch, spelled as a FileInstant.
+constexpr FileInstant Nanoseconds(std::int64_t count)
+{
+    return count;
+}
+
 /// Milliseconds in the seam's unit.
 constexpr FileInstant Milliseconds(std::int64_t count)
 {
@@ -179,9 +185,11 @@ TEST_CASE("A sub-second stamp is compared with the instant as it is", "[input-fi
     CHECK(ChangedAtOrAfter(instant, instant) == true);
 }
 
-TEST_CASE("A whole odd second is judged against the instant's own second", "[input-files]")
+TEST_CASE("A stamp on a whole odd second floors the instant to at least the second", "[input-files]")
 {
-    // A 1 s filesystem stamps a change at 5.9 s as 5 s. Unfloored, 5 s < 5.7 s would say "before".
+    // A 1 s filesystem stamps a change at 5.9 s as 5 s. Unfloored, or floored only to 100 ms,
+    // 5 s < 5.7 s would say "before". (A 2 s floor gives the same answers here as a 1 s one: for an
+    // odd second no input tells the two rows apart.)
     CHECK(ChangedAtOrAfter(Seconds(5), Seconds(5) + Milliseconds(700)) == true);
     // The previous second: 5 s is certainly before anything that happened at or after 6.7 s.
     CHECK(ChangedAtOrAfter(Seconds(5), Seconds(6) + Milliseconds(700)) == false);
@@ -201,4 +209,22 @@ TEST_CASE("A pre-epoch instant is floored toward negative infinity", "[input-fil
     auto const instant = -Seconds(1) - Milliseconds(300);
     CHECK(ChangedAtOrAfter(-Seconds(2), instant) == true);
     CHECK(ChangedAtOrAfter(-Seconds(4), instant) == false);
+}
+
+TEST_CASE("A stamp on the 10 ms grid is judged against the instant's own 10 ms slot", "[input-files]")
+{
+    // Linux exFAT and vfat stamp every 10 ms: a change at 5.1239 s is stamped 5.120 s. 5.120 s is a
+    // whole 10 ms and not a whole 100 ms, so its grid is 10 ms.
+    auto const instant = Seconds(5) + Milliseconds(123);
+    CHECK(ChangedAtOrAfter(Seconds(5) + Milliseconds(120), instant) == true);
+    // The previous 10 ms slot.
+    CHECK(ChangedAtOrAfter(Seconds(5) + Milliseconds(110), instant) == false);
+}
+
+TEST_CASE("A stamp on the 100 ns grid is compared with a 100 ns instant as it is", "[input-files]")
+{
+    // NTFS-shaped: both on the 100 ns grid and on no coarser one, so flooring changes nothing.
+    auto const instant = Seconds(5) + Nanoseconds(123'456'700);
+    CHECK(ChangedAtOrAfter(instant - Nanoseconds(100), instant) == false);
+    CHECK(ChangedAtOrAfter(instant, instant) == true);
 }
