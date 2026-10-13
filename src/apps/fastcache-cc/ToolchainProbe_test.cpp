@@ -811,9 +811,10 @@ TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[tool
     // `cl` on every MSVC toolset in existence. Two nodes on different toolsets were
     // interchangeable to the scheduler, which is the false match the fingerprint
     // exists to prevent and the one that yields a silently wrong object. The banner
-    // names the toolset now, and the fingerprint folds none of these roots (#1656);
-    // they still feed the fingerprint cache's stamp and the node's evidence, which a
-    // service and a prompt must agree on for the same reason.
+    // names the toolset now, and the fingerprint folds none of these roots (#1656).
+    // Discovery is kept for the fingerprint cache's stamp and to notice a toolset or
+    // SDK update; those are local checks, so a service and a prompt disagreeing here
+    // would cost a recompute and no longer a match. The agreement is still pinned.
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
 
     ScriptedToolchainHost service;
@@ -839,9 +840,10 @@ TEST_CASE("INCLUDE is the fallback when no toolset layout can be determined", "[
     // which is the whole point of the case. `WindowsKitIncludeRoots` answers from
     // the registry alone and knows nothing about which compiler is being
     // identified, so gating the fallback on the MERGED roots would leave such a
-    // compiler with SDK roots only: no VC headers in its identity, and two
-    // different wrapped toolsets digesting identically. That is the false match the
-    // whole mechanism exists to prevent, reached by the fix for it.
+    // compiler with SDK roots only: no VC headers in what its stamp watches. Before
+    // #1656 that was two different wrapped toolsets digesting identically; since then
+    // no `cl` fingerprint folds these roots, and the gate decides only what the stamp
+    // and the node's re-survey watch.
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
     ScriptedToolchainHost host;
     DescribeWindowsMachine(host);
@@ -978,13 +980,13 @@ TEST_CASE("A clang-cl service and a developer prompt derive the same roots", "[t
 TEST_CASE("An undiscoverable clang-cl layout does not fall back to INCLUDE", "[toolchain-probe]")
 {
     // Where this mechanism deliberately parts company with `MsvcLayout`. That one
-    // falls back to `INCLUDE` because a `cl` outside the VC layout would otherwise
-    // be left with a `NoEvidence` identity -- its banner is the constant `cl`, so the
-    // headers are the only identity it has. `clang-cl` announces a genuine version,
-    // so a driver that cannot answer degrades to a banner-only fingerprint, which is
-    // weaker but still tells one clang from another. Reading `INCLUDE` here would
-    // buy that wrapper nothing and reintroduce the very asymmetry this fixes: a
-    // service and a developer prompt disagreeing about a compiler neither can place.
+    // falls back to `INCLUDE` for what its stamp watches; it no longer reaches `cl`'s
+    // fingerprint at all (#1656), whose banner names its toolset. `clang-cl`
+    // announces a genuine version, so a driver that cannot answer degrades to a
+    // banner-only fingerprint, which is weaker but still tells one clang from
+    // another. Reading `INCLUDE` here would buy that wrapper nothing and reintroduce
+    // the very asymmetry this fixes: a service and a developer prompt disagreeing
+    // about a compiler neither can place.
     ScriptedRunner runner { CompileRun { .exitCode = 1, .out = {}, .err = {} } };
     ScriptedToolchainHost host;
     DescribeWindowsMachine(host);
@@ -2938,4 +2940,95 @@ TEST_CASE("cl, clang-cl and an MSVC-targeting clang++ stay three toolchains",
     // difference between them, not one of several.
     CHECK(gnuRunner.ResourceProbes() == 1);
     CHECK(resourceRunner.Calls() == 1);
+}
+
+TEST_CASE("A stamp names the fingerprint schema it validates", "[toolchain-probe][fingerprint-tree]")
+{
+    // Everything else held equal, so the schema is the only thing that can move it.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-stamp-schema" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+    std::vector<std::string> const roots { (tree / "inc").string() };
+
+    auto const current = ComputeToolchainStamp("cc 1.0", compiler, roots);
+    REQUIRE_FALSE(current.empty());
+    CHECK(current == ComputeToolchainStamp("cc 1.0", compiler, roots, FingerprintSchema));
+    CHECK(current != ComputeToolchainStamp("cc 1.0", compiler, roots, "toolchain-v2"));
+}
+
+TEST_CASE("A cache entry another fingerprint schema wrote is recomputed, not served", "[toolchain-probe][fingerprint-tree]")
+{
+    // The bump to `toolchain-v3` (#1656) is only a bump if a v2 entry stops being
+    // served: before the stamp named the schema, a launcher kept handing out the v2
+    // value under a stamp that still validated, against a worker that had restarted
+    // onto v3. Planted rather than produced, because the old build is not here.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-schema-plant" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
+
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-schema-plant-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    CountingRunner runner { VerboseNaming(root) };
+    ScriptedToolchainHost host;
+    constexpr std::string_view banner = "cc 1.0";
+    auto const real = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    REQUIRE(real.Usable());
+    REQUIRE(real.evidence.has_value());
+
+    // The one entry that call wrote, overwritten with a fingerprint nothing computes.
+    auto const entry = [&] {
+        std::error_code ec;
+        for (auto const& candidate: std::filesystem::directory_iterator { CacheDirectory(state), ec })
+            if (candidate.path().extension() == ".fingerprint")
+                return candidate.path();
+        return std::filesystem::path {};
+    }();
+    REQUIRE_FALSE(entry.empty());
+    auto const plant = [&](std::string_view schema) {
+        auto const stamp = ComputeToolchainStamp(banner, real.evidence->compiler, real.evidence->roots, schema);
+        REQUIRE_FALSE(stamp.empty());
+        std::ofstream { entry, std::ios::binary | std::ios::trunc } << stamp << "\nbogus-fingerprint\n";
+    };
+
+    // The control: planted under THIS schema it is served, so the planting reaches
+    // the reader and the case below is not passing by a missed file.
+    plant(FingerprintSchema);
+    CHECK(CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang)).fingerprint
+          == "bogus-fingerprint");
+
+    // Planted under another schema it is a miss: recomputed, and written back.
+    plant("toolchain-v2");
+    auto const recomputed = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    CHECK(recomputed.fingerprint == real.fingerprint);
+    CHECK(StoredFingerprint(state) == real.fingerprint);
+}
+
+TEST_CASE("One MSVC-targeting clang fingerprints alike under the gcc and the clang row",
+          "[toolchain-probe][fingerprint-tree]")
+{
+    // A `cc` or `c++` stem classifies as `Gcc` until a banner corrects it, and the node
+    // and `--print-toolchain-fingerprint` classify by stem while the launcher's
+    // dispatch is banner-corrected -- so one binary reaches both rows, through one
+    // cache file per grammar. The two rows must therefore answer alike for it, or a
+    // worker and its clients split on which row they happened to read.
+    FastCache::Testing::ScratchDirectory machine { "fc-tcp-gcc-clang-row" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-gcc-clang-row-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost host;
+    auto const clang = WriteClangInstall(machine, host, "// clang 22\n", "msvc/include", "// STL\n");
+    ClangProbeRunner viaGcc { ClangVerbose(MsvcTriple, MsvcTargetHeader, clang.roots), clang.resourceDir };
+    ClangProbeRunner viaClang { ClangVerbose(MsvcTriple, MsvcTargetHeader, clang.roots), clang.resourceDir };
+
+    auto const asGcc =
+        CachedFingerprintSerially(viaGcc, host, clang.compiler, Clang22Banner, DriverOf(Flavor::Gcc), /*forceRefresh=*/true);
+    auto const asClang = ClangIdentity(viaClang, host, clang);
+
+    CHECK(asGcc.Usable());
+    CHECK(asGcc.fingerprint == asClang.fingerprint);
+    CHECK(viaGcc.ResourceProbes() == 1);
 }

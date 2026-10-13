@@ -671,13 +671,19 @@ struct IncludeSearchRoots
 /// makes the warm case warm, so quoting the warm cost as the price of missing it
 /// was circular as well as wrong.
 ///
+/// The fingerprint's SCHEMA is stamped too (#1656), so a cache entry written under
+/// other fingerprint rules is a miss rather than a value those rules would not give.
+///
 /// @param banner The compiler's version line.
 /// @param compiler Path to the compiler binary.
 /// @param roots Its include search roots.
+/// @param schema The fingerprint schema the cached value was computed under; a
+///        parameter only so a test can stamp an entry as another build would.
 /// @return A hex digest, or empty when the compiler cannot be stat'd at all.
 [[nodiscard]] std::string ComputeToolchainStamp(std::string_view banner,
                                                 std::string const& compiler,
-                                                std::span<std::string const> roots);
+                                                std::span<std::string const> roots,
+                                                std::string_view schema = FingerprintSchema);
 
 /// Why a computed fingerprint must not be served as a toolchain's identity.
 ///
@@ -788,10 +794,15 @@ static_assert(RowsInEnumeratorOrder(IdentityDefectTable, &IdentityDefectRow::def
     return IdentityDefectTable[static_cast<std::size_t>(defect)];
 }
 
-/// What a fingerprint was computed FROM, handed back rather than left to be re-derived.
+/// What a fingerprint's cache entry was validated AGAINST, handed back rather than left
+/// to be re-derived.
 ///
-/// The digest is a hash of exactly these, so anything that wants to notice the
-/// toolchain moving underneath it needs them and nothing else. They were previously
+/// The STAMP is a hash of exactly these, so anything that wants to notice the
+/// toolchain moving underneath it needs them and nothing else. `roots` is the
+/// DISCOVERED set, which since #1656 is wider than the tree the digest folds (`cl`
+/// folds none of it, an MSVC-targeting clang only its resource directory): watching
+/// the wider set costs at most a re-survey that reaches the same fingerprint, while
+/// watching a narrower one would miss a change the digest does fold. They were previously
 /// recomputed by the caller, which cost one extra driver spawn per toolchain per
 /// survey -- on every node in the fleet, on every start, warm ones included, since
 /// the second derivation ran whether or not the first hit the cache (#259).
@@ -800,7 +811,7 @@ static_assert(RowsInEnumeratorOrder(IdentityDefectTable, &IdentityDefectRow::def
 /// few milliseconds apart can disagree: a package manager replacing a compiler
 /// between them leaves a witness describing an include tree the digest does not
 /// cover, and such a toolchain then never reports itself stale. Returning what was
-/// actually folded makes "the same" a property of the code rather than of the
+/// actually stamped makes "the same" a property of the code rather than of the
 /// machine holding still.
 struct ToolchainEvidence
 {
@@ -812,7 +823,7 @@ struct ToolchainEvidence
     std::string compiler;
 
     std::string banner;             ///< The version line folded into the digest and the stamp.
-    std::vector<std::string> roots; ///< The include search roots the digest covers, in probe order.
+    std::vector<std::string> roots; ///< The DISCOVERED include search roots the stamp covers, in probe order.
 
     /// What those three hashed to, or empty when this toolchain cannot be stamped.
     ///

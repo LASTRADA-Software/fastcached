@@ -325,8 +325,9 @@ namespace
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false,
           // Layout rather than environment, because a Windows SERVICE inherits no
-          // `INCLUDE`, and a worker started that way would otherwise carry no
-          // toolchain content in its fingerprint at all. See the enumerator.
+          // `INCLUDE`. The roots feed the fingerprint cache's stamp and the node's
+          // re-survey, never the fingerprint (`fingerprintTree` below). See the
+          // enumerator.
           .includeDiscovery = IncludeDiscovery::MsvcLayout,
           // Nothing to ask and nothing to state: `cl` has no `-###` and no
           // `--target`. Which code generator runs is decided by WHICH `cl.exe` is
@@ -387,7 +388,10 @@ namespace
           // version string covers x86_64 and aarch64 alike, and an arch-independent
           // translation unit keys the same on both.
           .targetDiscovery = TargetDiscovery::GnuTargetLine,
-          .fingerprintTree = FingerprintTree::DiscoveredRoots,
+          // No gcc targets MSVC, so this keeps every root for gcc itself. It is the
+          // Clang row's answer because a `cc`/`c++` that IS an MSVC-targeting clang
+          // reaches this row by its stem, and must fingerprint as the Clang row does.
+          .fingerprintTree = FingerprintTree::OwnTreeWhenTargetingMsvc,
           .includeProbeFlags = GnuIncludeProbe,
           .targetProbeFlags = GnuTargetProbe,
           .versionFlags = VersionProbe },

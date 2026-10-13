@@ -84,9 +84,11 @@ enum class IncludeDiscovery : std::uint8_t
     /// than a stale path a replay guard can probe. The banner now names the toolset
     /// and the target, and since #1656 the fingerprint folds NONE of these roots
     /// (`FingerprintTree::None`) -- they are the toolset `cl` lives in and an SDK it
-    /// borrows, and a worker opens neither for a preprocessed compile. What still
-    /// reads them is the fingerprint cache's stamp and the node's evidence of a
-    /// toolchain moving, which is why the layout-first rule below still matters.
+    /// borrows, and a worker opens neither for a preprocessed compile. Discovery is
+    /// kept for the fingerprint cache's stamp and so a node notices a toolset or SDK
+    /// update and re-surveys. Both are local checks that never cross a machine, so a
+    /// service and a prompt disagreeing about these roots now costs a recompute, never
+    /// a match; the layout-first rule below was written when it cost the match.
     ///
     /// The layout is tried FIRST and the environment only as a fallback, which is
     /// the whole of why this is not merely "read INCLUDE, then guess". Preferring
@@ -199,9 +201,8 @@ enum class TargetDiscovery : std::uint8_t
 /// value is pinned.
 enum class FingerprintTree : std::uint8_t
 {
-    /// Every root `IncludeDiscovery` found. A GNU driver's search list is the tree it
-    /// ships with or was built against (libstdc++, an Xcode SDK), and `clang-cl`'s
-    /// discovery already names only its own resource directory.
+    /// Every root `IncludeDiscovery` found. `clang-cl`'s discovery already names only
+    /// its own resource directory.
     DiscoveredRoots,
     /// No include tree at all: the identity is the banner and the grammar. `cl`'s
     /// banner names its toolset version and its target (#195), and every tree its
@@ -214,6 +215,12 @@ enum class FingerprintTree : std::uint8_t
     /// Linux it lists libstdc++, which it does read, and that stays folded. Decided by
     /// the target the include probe's own output names, so it costs no spawn on a
     /// driver that targets anything else.
+    ///
+    /// The `gcc` row carries it too, although no gcc targets MSVC. One binary reaches
+    /// both rows -- the node and `--print-toolchain-fingerprint` classify a driver by
+    /// its STEM, the launcher corrects that by its banner, and both share one cache
+    /// file per grammar -- so a `cc` that is really an MSVC-targeting clang must
+    /// fingerprint alike under either row, or a worker and its clients split.
     OwnTreeWhenTargetingMsvc,
 };
 

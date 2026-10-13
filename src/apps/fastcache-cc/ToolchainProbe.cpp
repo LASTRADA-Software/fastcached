@@ -1239,9 +1239,10 @@ IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
             // nothing about which compiler is being identified -- on any machine with
             // an SDK installed, a `cl.exe` outside the `VC\Tools\MSVC\<version>`
             // layout (a shim, a wrapper, a VS2015-era `<vs>\VC\bin\cl.exe`) would come
-            // back with SDK roots only, never reach the fallback, and drop the VC
-            // headers from its identity. Two such toolchains then digest IDENTICALLY,
-            // which is exactly the false match this mechanism exists to prevent.
+            // back with SDK roots only, never reach the fallback, and stamp without
+            // the VC headers. Since #1656 no `cl` fingerprint folds these roots, so this
+            // gate decides only what the stamp watches and what the node re-surveys on,
+            // never whether two toolchains match.
             if (roots.empty())
                 return IncludeSearchRoots { .roots = IncludeEnvironmentRoots(host), .targetTriple = {}, .answered = true };
 
@@ -1267,7 +1268,10 @@ IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
     return {};
 }
 
-std::string ComputeToolchainStamp(std::string_view banner, std::string const& compiler, std::span<std::string const> roots)
+std::string ComputeToolchainStamp(std::string_view banner,
+                                  std::string const& compiler,
+                                  std::span<std::string const> roots,
+                                  std::string_view schema)
 {
     auto const binary = PathFromNarrowText(compiler);
     if (!binary.has_value())
@@ -1286,7 +1290,7 @@ std::string ComputeToolchainStamp(std::string_view banner, std::string const& co
     KeyDigest digest { StampSchema };
     // The rules the cached value was computed under: a schema bump then misses every
     // entry written before it, rather than serving one the new rules would not give.
-    digest.Field(FingerprintSchema);
+    digest.Field(schema);
     digest.Field(banner);
     digest.Path(compiler);
     digest.Field(std::to_string(size));
@@ -1334,10 +1338,17 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     auto const probeDefect = [&] {
         if (!discovered.answered)
             return IdentityDefect::UnrunProbe;
-        // "No roots" is asked of the tree the FINGERPRINT folds, not of discovery's:
-        // `cl` discovers its toolset and folds none of it (#1656), so a `cl` that
-        // could not be asked its version digests the string `cl` and its grammar,
-        // whatever its layout -- the #195 identity of every MSVC ever installed.
+        // A row that folds no tree BY CONSTRUCTION is judged as having none: `cl`
+        // discovers its toolset and folds none of it (#1656), so a `cl` that could not
+        // be asked its version digests the string `cl` and its grammar, whatever its
+        // layout -- the #195 identity of every MSVC ever installed.
+        //
+        // Every other row is judged on DISCOVERY's roots, because this runs before the
+        // cache read and the folded tree of `OwnTreeWhenTargetingMsvc` is only known on
+        // the walk. The residual, stated: a GNU clang targeting MSVC whose banner fell
+        // back, whose `-v` list is not empty and whose `-print-resource-dir` answers
+        // with no directory folds nothing and is served on its banner alone. Reaching
+        // it takes both identity probes failing on a driver that still answers `-v`.
         auto const foldsNoTree = spec.fingerprintTree == FingerprintTree::None || roots.empty();
         if (spec.includeDiscovery != IncludeDiscovery::None && foldsNoTree && banner == NormalizedCompilerName(compiler))
             return IdentityDefect::NoEvidence;
