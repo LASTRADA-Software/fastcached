@@ -190,7 +190,9 @@ same on both — the same defect with no MSVC anywhere near it.
       binary and the roots, which are identical — and returns a fingerprint computed for
       the other grammar. A false MATCH, which is the one error direction this mechanism
       exists to prevent, so it is closed regardless of what `ResolveCompiler` does on any
-      platform. `toolchain-v2` and `toolchain-cache-name-v2` move together.
+      platform. `toolchain-v2` and `toolchain-cache-name-v2` moved together. `toolchain-v3`
+      (#1656, which trees are folded) moved alone, because the stamp folds the schema
+      since then, so a bump misses every older cache entry without renaming the file.
     - A test staging two different include trees would pass under the bug. The banner and
       the file list are held EQUAL and the grammar is the only difference, with the
       same-grammar case asserted beside it — a digest that separated everything would pass

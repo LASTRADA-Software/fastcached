@@ -245,7 +245,7 @@ target while the other deliberately does not.
 | | Decides | Made of | Carries the target? |
 |---|---|---|---|
 | **Cache key** | which *object* may be served | compiler banner + target + preprocessed text + args + dependency paths | **yes** |
-| **Toolchain fingerprint** | which *worker* may compile for you | compiler banner + a content hash of its whole include tree | **no** |
+| **Toolchain fingerprint** | which *worker* may compile for you | compiler banner + driver grammar + a content hash of the include tree the compiler owns | **no** |
 
 ### The cache key
 
@@ -264,11 +264,11 @@ relativization in step 4.
 
 ### The toolchain fingerprint
 
-A fingerprint is a digest of the compiler's version banner **and the contents of
-the include tree that belongs to it** — paths taken *relative to their include
-root*, so the same toolchain at `/usr/lib/gcc/...` and `/opt/toolchains/gcc-13/...`
-fingerprints identically. Contents, never modification times, which differ on
-every machine.
+A fingerprint is a digest of the compiler's version banner, its argument grammar
+**and the contents of the include tree that belongs to it** — paths taken
+*relative to their include root*, so the same toolchain at `/usr/lib/gcc/...` and
+`/opt/toolchains/gcc-13/...` fingerprints identically. Contents, never
+modification times, which differ on every machine.
 
 Matching is **byte-identical**, and it cannot be loosened. The two errors are not
 symmetric: an over-strict match costs one local compile, while an over-loose one
@@ -277,21 +277,27 @@ machine fetches.
 
 *"The include tree that belongs to it"* does real work on Windows:
 
-- **`cl`** carries the `VC\Tools\MSVC\<version>` toolset it lives inside, plus the
-  newest Windows SDK.
-- **`clang-cl`** carries only the resource directory it names when asked
-  (`-print-resource-dir`). It *borrows* the VC toolset and the SDK rather than
-  owning them, so two `clang-cl` machines with different SDKs installed still
-  match.
+- **`cl`** carries **no** tree: its banner names its toolset version and target,
+  and the toolset and SDK headers are ones a worker never opens — it compiles text
+  the client already preprocessed. Folding them in split two machines with the same
+  toolset and SDK on nothing but an installed Visual Studio language pack, whose
+  IntelliSense XML lands in the toolset's `include` directory (#1656).
+- **`clang-cl`**, and **`clang`/`clang++` targeting `*-windows-msvc*`**, carry only
+  the resource directory the driver names when asked (`-print-resource-dir`). They
+  *borrow* the VC toolset and the SDK rather than owning them, so two machines with
+  different SDKs or VS languages installed still match. A clang targeting anything
+  else carries every directory its `-v` search list names, as GCC does.
 
-Neither reads `INCLUDE`. That variable is set by a developer command prompt and is
-never inherited by a Windows service — so a worker installed as a service produces
-the same fingerprint as the launchers talking to it. That symmetry is the point.
+None of them reads `INCLUDE` for its fingerprint. That variable is set by a
+developer command prompt and is never inherited by a Windows service — so a worker
+installed as a service produces the same fingerprint as the launchers talking to
+it. That symmetry is the point.
 
-Computing a fingerprint walks the include tree, which takes a couple of seconds
-the first time a machine sees a toolchain. It is then cached per compiler under
-your user state directory, keyed on the compiler's size, mtime and include-root
-timestamps, so a toolchain upgrade invalidates it automatically.
+Computing a fingerprint walks that tree, which takes a couple of seconds the first
+time a machine sees a toolchain. It is then cached per compiler under your user
+state directory, keyed on the fingerprint's schema version and the compiler's size,
+mtime and include-root timestamps, so a toolchain upgrade — or a launcher whose
+fingerprint rules changed — invalidates it automatically.
 
 ### Diagnosing a mismatch
 
