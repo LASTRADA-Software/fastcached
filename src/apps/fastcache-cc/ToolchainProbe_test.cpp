@@ -679,7 +679,8 @@ TEST_CASE("A directory absent from the layout is not offered as a root", "[toolc
 {
     // A toolchain without ATL/MFC installed is ordinary. `ProbeToolchainFiles`
     // would skip the root anyway; emitting it only makes the list harder to read
-    // beside an operator's own INCLUDE when a fingerprint disagrees.
+    // beside an operator's own INCLUDE. (These roots no longer reach a `cl`
+    // fingerprint, #1656, so it is the stamp's list being read.)
     ScriptedToolchainHost host;
     constexpr std::string_view toolset = "C:/VS/VC/Tools/MSVC/14.0.0";
     host.AddExecutable(std::string { toolset } + "/bin/Hostx64/x64/cl.exe");
@@ -2753,7 +2754,7 @@ TEST_CASE("cl is identified without its toolset's and SDK's header contents", "[
     auto const discovered = DiscoverIncludePaths(reference, twoHost, twoCl, DriverOf(Flavor::Cl)).roots;
     REQUIRE(discovered.size() == 4);
     REQUIRE(b.evidence.has_value());
-    CHECK(b.evidence->roots == discovered);
+    CHECK(FastCache::Testing::Unwrap(b.evidence).roots == discovered);
 }
 
 TEST_CASE("Two cl toolsets are told apart by their banners", "[toolchain-probe][fingerprint-tree]")
@@ -2848,7 +2849,7 @@ TEST_CASE("A clang targeting MSVC is identified by its own tree, not the MSVC it
     // The search list is still the evidence, borrowed roots included: only the digest
     // narrowed.
     REQUIRE(second.evidence.has_value());
-    CHECK(second.evidence->roots == b.roots);
+    CHECK(FastCache::Testing::Unwrap(second.evidence).roots == b.roots);
 }
 
 TEST_CASE("A clang targeting anything else still folds every tree it searches", "[toolchain-probe][fingerprint-tree]")
@@ -2959,10 +2960,12 @@ TEST_CASE("A stamp names the fingerprint schema it validates", "[toolchain-probe
 
 TEST_CASE("A cache entry another fingerprint schema wrote is recomputed, not served", "[toolchain-probe][fingerprint-tree]")
 {
-    // The bump to `toolchain-v3` (#1656) is only a bump if a v2 entry stops being
-    // served: before the stamp named the schema, a launcher kept handing out the v2
-    // value under a stamp that still validated, against a worker that had restarted
-    // onto v3. Planted rather than produced, because the old build is not here.
+    // Stands for the NEXT fingerprint-schema bump made without a stamp bump. This one
+    // (#1656) also moved `StampSchema`, so a v2 entry misses here regardless; what the
+    // case pins is that a schema bump ALONE is enough, because before the stamp named
+    // the schema a launcher kept handing out the old value under a stamp that still
+    // validated, against a worker that had restarted onto the new rules. Planted rather
+    // than produced, because the old build is not here.
     FastCache::Testing::ScratchDirectory tree { "fc-tcp-schema-plant" };
     tree.Write("inc/a.hpp", "content");
     tree.Write("cc", "#!/bin/sh\n");
@@ -2978,6 +2981,7 @@ TEST_CASE("A cache entry another fingerprint schema wrote is recomputed, not ser
     auto const real = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
     REQUIRE(real.Usable());
     REQUIRE(real.evidence.has_value());
+    auto const& evidence = FastCache::Testing::Unwrap(real.evidence);
 
     // The one entry that call wrote, overwritten with a fingerprint nothing computes.
     auto const entry = [&] {
@@ -2989,7 +2993,7 @@ TEST_CASE("A cache entry another fingerprint schema wrote is recomputed, not ser
     }();
     REQUIRE_FALSE(entry.empty());
     auto const plant = [&](std::string_view schema) {
-        auto const stamp = ComputeToolchainStamp(banner, real.evidence->compiler, real.evidence->roots, schema);
+        auto const stamp = ComputeToolchainStamp(banner, evidence.compiler, evidence.roots, schema);
         REQUIRE_FALSE(stamp.empty());
         std::ofstream { entry, std::ios::binary | std::ios::trunc } << stamp << "\nbogus-fingerprint\n";
     };
@@ -3031,4 +3035,38 @@ TEST_CASE("One MSVC-targeting clang fingerprints alike under the gcc and the cla
     CHECK(asGcc.Usable());
     CHECK(asGcc.fingerprint == asClang.fingerprint);
     CHECK(viaGcc.ResourceProbes() == 1);
+}
+
+TEST_CASE("An MSVC-targeting clang that folds no tree and cannot name itself is no identity",
+          "[toolchain-probe][fingerprint-tree]")
+{
+    // Discovery found roots, so the check made before the cache read passes it; the
+    // walk then selects the resource directory, and the driver named none. A fallback
+    // banner over no tree is the driver's NAME and its grammar -- every install alike,
+    // which is `NoEvidence` asked of the tree the digest actually folded. Not cached
+    // either, because a later hit asks only discovery's roots and would serve it.
+    FastCache::Testing::ScratchDirectory machine { "fc-tcp-clang-folded-nothing" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-clang-folded-nothing-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost host;
+    auto const clang = WriteClangInstall(machine, host, "// clang 22\n", "msvc/include", "// STL\n");
+    machine.Write("llvm/bin/clang++.exe", "stand-in");
+    ClangProbeRunner runner { ClangVerbose(MsvcTriple, MsvcTargetHeader, clang.roots), /*resourceDir=*/ {} };
+    auto const fallback = NormalizedCompilerName(clang.compiler);
+
+    auto const first = CachedFingerprintSerially(runner, host, clang.compiler, fallback, DriverOf(Flavor::Clang));
+    CHECK(first.defect == IdentityDefect::NoEvidence);
+    CHECK(StoredFingerprint(state).empty());
+
+    // Asked again with no refresh: still refused, because nothing was cached to hit.
+    auto const second = CachedFingerprintSerially(runner, host, clang.compiler, fallback, DriverOf(Flavor::Clang));
+    CHECK(second.defect == IdentityDefect::NoEvidence);
+    CHECK(runner.ResourceProbes() == 2);
+
+    // The control: a real banner over the same empty resource answer is a banner-only
+    // identity that still tells one clang from another, and is served.
+    auto const named = CachedFingerprintSerially(
+        runner, host, clang.compiler, Clang22Banner, DriverOf(Flavor::Clang), /*forceRefresh=*/true);
+    CHECK(named.Usable());
 }

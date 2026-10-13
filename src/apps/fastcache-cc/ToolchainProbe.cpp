@@ -369,9 +369,10 @@ namespace
     /// The include directories a Windows SDK kit is made of, in the order
     /// `vcvarsall` lists them in `INCLUDE`.
     ///
-    /// A table so the next one the SDK grows is a row. The order does not reach the
-    /// fingerprint -- that sorts -- but it is what an operator compares against
-    /// their own `INCLUDE` when a fingerprint disagrees.
+    /// A table so the next one the SDK grows is a row. The order reaches no
+    /// fingerprint -- no `cl` fingerprint folds these roots since #1656 -- but it is
+    /// what an operator compares against their own `INCLUDE` when the stamp's roots
+    /// are in question.
     constexpr std::array<std::string_view, 5> WindowsKitIncludeSubdirectories {
         "ucrt", "um", "shared", "winrt", "cppwinrt"
     };
@@ -982,7 +983,7 @@ std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host)
     // answer `RegistryString` can give and the easy one to miss: a zero-length
     // value comes back as an empty string rather than as `nullopt`. Testing only
     // `has_value()` skipped the native read on a machine whose 32-bit value had
-    // been emptied, and dropped the SDK half of its identity in silence.
+    // been emptied, and dropped the SDK half of what its stamp watches in silence.
     if (!kitsRoot.has_value() || kitsRoot->empty())
         kitsRoot = host.RegistryString(RegistryHive::LocalMachine, InstalledRootsKey, KitsRootValue, RegistryView::Native);
     if (!kitsRoot.has_value() || kitsRoot->empty())
@@ -1343,12 +1344,11 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
         // be asked its version digests the string `cl` and its grammar, whatever its
         // layout -- the #195 identity of every MSVC ever installed.
         //
-        // Every other row is judged on DISCOVERY's roots, because this runs before the
-        // cache read and the folded tree of `OwnTreeWhenTargetingMsvc` is only known on
-        // the walk. The residual, stated: a GNU clang targeting MSVC whose banner fell
-        // back, whose `-v` list is not empty and whose `-print-resource-dir` answers
-        // with no directory folds nothing and is served on its banner alone. Reaching
-        // it takes both identity probes failing on a driver that still answers `-v`.
+        // Every other row is judged here on DISCOVERY's roots, because this runs before
+        // the cache read and the folded tree of `OwnTreeWhenTargetingMsvc` is only known
+        // on the walk. The walk asks the question again of the tree it folded -- see
+        // `foldedNothing` below -- so an MSVC-targeting clang whose banner fell back and
+        // whose resource probe named no directory is refused there, never served.
         auto const foldsNoTree = spec.fingerprintTree == FingerprintTree::None || roots.empty();
         if (spec.includeDiscovery != IncludeDiscovery::None && foldsNoTree && banner == NormalizedCompilerName(compiler))
             return IdentityDefect::NoEvidence;
@@ -1433,6 +1433,16 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     auto const complete = scan.complete;
     auto const fingerprint = ComputeToolchainFingerprint(banner, grammar, std::move(scan.files));
 
+    // `NoEvidence` asked again, of the tree the digest FOLDED, which only the walk
+    // knows. It differs from `probeDefect` only where the walk selected fewer roots
+    // than discovery found -- an MSVC-targeting clang whose resource probe named no
+    // directory -- and there a fallback banner over no tree is the string `clang++`
+    // and its grammar, every such install alike. Not cached, for the reason it was
+    // not caught above: a later HIT asks only discovery's roots, and would serve it.
+    auto const foldedNothing = probeDefect == IdentityDefect::None && walked.answered
+                               && spec.includeDiscovery != IncludeDiscovery::None && walked.roots.empty()
+                               && banner == NormalizedCompilerName(compiler);
+
     // A short walk is excluded from the cache for a HARSHER reason than an unrun
     // probe is, and this is the line that matters most in this function. An unrun
     // probe empties the root list, so it moves the stamp and a later good run
@@ -1440,7 +1450,7 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     // stamped input identical -- the path and the mtime of each root, never their
     // contents -- so the short digest would validate against its own stamp forever,
     // and no later run would ever walk again to notice.
-    if (discovered.answered && walked.answered && complete && !stamp.empty() && !cachePath.empty())
+    if (discovered.answered && walked.answered && !foldedNothing && complete && !stamp.empty() && !cachePath.empty())
         WriteCacheAtomically(cachePath, stamp, fingerprint);
 
     // Mutually exclusive in practice -- every probe-level defect leaves the root list
@@ -1451,6 +1461,8 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
             return probeDefect;
         if (!walked.answered)
             return IdentityDefect::UnrunProbe;
+        if (foldedNothing)
+            return IdentityDefect::NoEvidence;
         return complete ? IdentityDefect::None : IdentityDefect::PartialTree;
     }();
     return ToolchainIdentity { .fingerprint = fingerprint, .defect = defect, .evidence = std::move(evidence) };
