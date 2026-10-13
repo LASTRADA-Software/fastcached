@@ -5,12 +5,16 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
@@ -46,6 +50,58 @@ std::string KernelRelease()
     return std::format("{} {}", static_cast<char const*>(name.sysname), static_cast<char const*>(name.release));
 #endif
 }
+
+/// Realtime clocks whose readings are a script, so the fence's ordering decision can be driven
+/// against readings no local kernel produces. Each `Coarse()` answers the next scripted reading
+/// and then repeats the last one, so a clock scripted to stop moving stays stopped; `Pause`
+/// advances the monotonic reading by exactly what it was asked, so the fence's bound is reached
+/// without waiting for it.
+class ScriptedClocks final: public IRealtimeClocks
+{
+  public:
+    /// @param fine What every `Fine()` answers.
+    /// @param coarse What successive `Coarse()` calls answer; must not be empty.
+    ScriptedClocks(std::optional<FileInstant> fine, std::vector<std::optional<FileInstant>> coarse):
+        _fine { fine },
+        _coarse { std::move(coarse) }
+    {
+    }
+
+    [[nodiscard]] std::optional<FileInstant> Coarse() const override
+    {
+        auto const reading = _coarse.at(_next);
+        if (_next + 1 < _coarse.size())
+            ++_next;
+        return reading;
+    }
+
+    [[nodiscard]] std::optional<FileInstant> Fine() const override
+    {
+        return _fine;
+    }
+
+    void Pause(std::chrono::nanoseconds duration) const override
+    {
+        _monotonic += duration;
+    }
+
+    [[nodiscard]] std::chrono::nanoseconds Monotonic() const override
+    {
+        return _monotonic;
+    }
+
+  private:
+    std::optional<FileInstant> _fine;
+    std::vector<std::optional<FileInstant>> _coarse;
+    mutable std::size_t _next = 0;
+    mutable std::chrono::nanoseconds _monotonic {};
+};
+
+/// An instant in 2025, for scripted clocks to read near.
+constexpr FileInstant ScriptBase = std::int64_t { 1'760'000'000 } * OneSecondOfFileTime;
+
+/// One 4 ms tick (250 Hz), the tick the scripted coarse clock advances by.
+constexpr FileInstant ScriptTick = 4'000'000;
 } // namespace
 
 TEST_CASE("A change time is on the seam's own clock, in its own unit", "[input-files]")
@@ -86,7 +142,8 @@ TEST_CASE("A fence orders a change made just before it below it and one made aft
     // (multigrain timestamps) stamp it with a FINE time; a fence that waited only for the COARSE
     // clock to change returned an instant below such a stamp in 57 of 60 iterations on a CI arm64
     // runner. No kernel available locally stamps multigrain times, so a local pass cannot tell
-    // the fine-clock floor from that wait -- the kernel is in the failure message for that reason.
+    // the fine-clock floor from that wait -- the kernel is in the failure message for that reason,
+    // and "A fence passes a fine stamp the coarse clock's next tick still lags" scripts the readings.
     constexpr auto Iterations = 60;
     FastCache::Testing::ScratchDirectory const scratch { "fc-input-files-fence" };
     auto const path = (scratch / "a.hpp").string();
@@ -116,6 +173,64 @@ TEST_CASE("A fence orders a change made just before it below it and one made aft
     CHECK(unreadable == 0);
     CHECK(beforeReadAsAfter == 0);
     CHECK(afterReadAsBefore == 0);
+}
+
+TEST_CASE("A fence passes a fine stamp the coarse clock's next tick still lags", "[input-files]")
+{
+    // #1650's CI failure as readings, which no local kernel produces: a multigrain kernel stamped
+    // the save just before the fence with a FINE time, and the coarse clock -- which lags real time
+    // by up to a tick -- moved once and still read BELOW that stamp. A fence returning the first
+    // coarse reading that merely DIFFERS from its first reads the save as at-or-after itself.
+    auto const fineStamp = ScriptBase + ScriptTick + 1'234'567;
+    auto const fineAtCall = fineStamp + 65'432;
+    auto const laggingTick = ScriptBase + ScriptTick;
+    auto const nextTick = ScriptBase + (2 * ScriptTick);
+    ScriptedClocks const clocks { fineAtCall, { ScriptBase, ScriptBase, laggingTick, laggingTick, nextTick } };
+
+    auto const fence = FenceOn(clocks);
+
+    CHECK(fence == nextTick);
+    CHECK_FALSE(ChangedAtOrAfter(fineStamp, fence));
+    // The control: a change after the fence is stamped at or above the coarse clock, which read
+    // `fence`, and must read as at-or-after it.
+    CHECK(ChangedAtOrAfter(nextTick, fence));
+}
+
+TEST_CASE("A fence whose coarse clock never passes the floor answers a safety tick below it", "[input-files]")
+{
+    ScriptedClocks const clocks { ScriptBase + 9, { ScriptBase } };
+
+    CHECK(FenceOn(clocks) == ScriptBase - FineClockSafetyTick);
+    CHECK(clocks.Monotonic() >= std::chrono::milliseconds { 100 });
+}
+
+TEST_CASE("A fence whose coarse clock stops answering answers a safety tick below its last reading", "[input-files]")
+{
+    ScriptedClocks const clocks { ScriptBase + 9, { ScriptBase, ScriptBase, std::nullopt } };
+
+    CHECK(FenceOn(clocks) == ScriptBase - FineClockSafetyTick);
+}
+
+TEST_CASE("A fence with no coarse clock waits a safety tick and answers the fine clock moved back by it", "[input-files]")
+{
+    ScriptedClocks const clocks { ScriptBase, { std::nullopt } };
+
+    CHECK(FenceOn(clocks) == ScriptBase - FineClockSafetyTick);
+    CHECK(clocks.Monotonic() == std::chrono::nanoseconds { FineClockSafetyTick });
+}
+
+TEST_CASE("A fence with no clock at all answers zero so every input reads as changed", "[input-files]")
+{
+    ScriptedClocks const clocks { std::nullopt, { std::nullopt } };
+
+    CHECK(FenceOn(clocks) == 0);
+}
+
+TEST_CASE("Now reads the coarse clock and falls back to the fine clock moved back and then to zero", "[input-files]")
+{
+    CHECK(NowOn(ScriptedClocks { ScriptBase + 7, { ScriptBase } }) == ScriptBase);
+    CHECK(NowOn(ScriptedClocks { ScriptBase, { std::nullopt } }) == ScriptBase - FineClockSafetyTick);
+    CHECK(NowOn(ScriptedClocks { std::nullopt, { std::nullopt } }) == 0);
 }
 
 #if defined(_WIN32)

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -29,6 +30,13 @@ using FileInstant = std::int64_t;
 
 /// One second in `FileInstant` units.
 inline constexpr FileInstant OneSecondOfFileTime = 1'000'000'000;
+
+/// How far a FINE clock read is moved back, where no coarse clock answers, and how far `Fence`'s
+/// fail-closed answer lies below its last coarse reading. It bounds the lag of a kernel's
+/// tick-granular file stamping behind a fine clock: a change made just after a fine read can be
+/// stamped up to one tick earlier than that read. 10 ms is one tick at 100 Hz, the coarsest tick in
+/// common use.
+inline constexpr FileInstant FineClockSafetyTick = 10'000'000;
 
 /// The stamp grids `ChangedAtOrAfter` recognises, COARSEST FIRST: FAT's 2 s, then every decimal
 /// unit from 1 s down to 10 ns -- among them HFS+'s and 128-byte-inode ext4's 1 s, Linux exFAT's
@@ -155,7 +163,8 @@ class IInputFiles
     /// new reading can still lie BELOW a fine stamp written just before this call. MEASURED in CI:
     /// with a fence that waited only for the coarse clock to change, 57 of 60 changes made just
     /// before it read as at-or-after it on a `Linux-gcc-release-arm64` runner (#1650). That
-    /// multigrain stamping is the cause is INFERRED; no local kernel here reproduces it.
+    /// multigrain stamping is the cause is INFERRED; no local kernel here reproduces it, so the
+    /// readings it produces are SCRIPTED through `IRealtimeClocks` instead (`FenceOn`'s cases).
     ///
     /// The ordering is a property of the clocks, so it holds only where they behave as assumed --
     /// a later stamp is never below the coarse clock, an earlier one never above the fine clock --
@@ -186,6 +195,54 @@ class IInputFiles
     IInputFiles(IInputFiles&&) = default;
     IInputFiles& operator=(IInputFiles&&) = default;
 };
+
+/// The realtime clocks `IInputFiles::Now` and `IInputFiles::Fence` read, and the wait between two
+/// reads: a seam so the fence's ORDERING decision can be driven against clock readings a test host
+/// does not produce -- a coarse clock lagging a fine stamp is what a multigrain kernel shows and no
+/// local kernel here does (#1650).
+class IRealtimeClocks
+{
+  public:
+    virtual ~IRealtimeClocks() = default;
+
+    /// @return The coarse realtime clock -- the one a filesystem stamps changes with -- or nullopt
+    ///         where the platform has none or it does not answer.
+    [[nodiscard]] virtual std::optional<FileInstant> Coarse() const = 0;
+
+    /// @return The fine realtime clock, or nullopt where it does not answer.
+    [[nodiscard]] virtual std::optional<FileInstant> Fine() const = 0;
+
+    /// Blocks for about @p duration.
+    /// @param duration How long to wait.
+    virtual void Pause(std::chrono::nanoseconds duration) const = 0;
+
+    /// @return A monotonic reading from an arbitrary origin, for bounding a wait.
+    [[nodiscard]] virtual std::chrono::nanoseconds Monotonic() const = 0;
+
+  protected:
+    /// Protected rather than deleted, for `IInputFiles`' reason.
+    IRealtimeClocks() = default;
+    IRealtimeClocks(IRealtimeClocks const&) = default;
+    IRealtimeClocks& operator=(IRealtimeClocks const&) = default;
+    IRealtimeClocks(IRealtimeClocks&&) = default;
+    IRealtimeClocks& operator=(IRealtimeClocks&&) = default;
+};
+
+/// `IInputFiles::Now` over @p clocks: the coarse clock, else the fine one moved back by
+/// `FineClockSafetyTick`, else 0 -- every input then reads as changed.
+/// @param clocks The clocks to read.
+/// @return The instant.
+[[nodiscard]] FileInstant NowOn(IRealtimeClocks const& clocks);
+
+/// `IInputFiles::Fence` over @p clocks, as that function states it.
+/// @param clocks The clocks to read and wait on.
+/// @return The fenced instant.
+[[nodiscard]] FileInstant FenceOn(IRealtimeClocks const& clocks);
+
+/// @return This machine's realtime clocks: `GetSystemTimeAsFileTime` (coarse) and
+///         `GetSystemTimePreciseAsFileTime` (fine) on Windows; `CLOCK_REALTIME_COARSE` where it
+///         exists and `CLOCK_REALTIME` on POSIX; `std::chrono::steady_clock` for the bound.
+[[nodiscard]] std::unique_ptr<IRealtimeClocks> MakeSystemRealtimeClocks();
 
 /// This machine's files.
 ///

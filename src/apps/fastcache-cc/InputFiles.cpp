@@ -22,12 +22,6 @@ namespace FastCache::Cc
 
 namespace
 {
-    /// How far a FINE clock read is moved back, where no coarse clock answers. It bounds the lag of
-    /// a kernel's tick-granular file stamping behind a fine clock: a change made just after a fine
-    /// read can be stamped up to one tick earlier than that read. 10 ms is one tick at 100 Hz, the
-    /// coarsest tick in common use.
-    constexpr FileInstant FineClockSafetyTick = 10'000'000;
-
     /// How long `Fence` waits for the coarse clock to move before giving up on it. Ten ticks at
     /// 100 Hz: a clock that has not moved in that long is not ticking the way the fence assumes.
     constexpr auto FenceBound = std::chrono::milliseconds { 100 };
@@ -84,6 +78,50 @@ namespace
         HANDLE _handle;
     };
 #endif
+
+    class SystemRealtimeClocks final: public IRealtimeClocks
+    {
+      public:
+        [[nodiscard]] std::optional<FileInstant> Coarse() const override
+        {
+#if defined(_WIN32)
+            FILETIME now {};
+            GetSystemTimeAsFileTime(&now);
+            return FromFileTime(now);
+#else
+    #if defined(CLOCK_REALTIME_COARSE)
+            timespec now {};
+            if (::clock_gettime(CLOCK_REALTIME_COARSE, &now) == 0)
+                return FromTimespec(now);
+    #endif
+            return std::nullopt;
+#endif
+        }
+
+        [[nodiscard]] std::optional<FileInstant> Fine() const override
+        {
+#if defined(_WIN32)
+            FILETIME now {};
+            GetSystemTimePreciseAsFileTime(&now);
+            return FromFileTime(now);
+#else
+            timespec now {};
+            if (::clock_gettime(CLOCK_REALTIME, &now) == 0)
+                return FromTimespec(now);
+            return std::nullopt;
+#endif
+        }
+
+        void Pause(std::chrono::nanoseconds duration) const override
+        {
+            std::this_thread::sleep_for(duration);
+        }
+
+        [[nodiscard]] std::chrono::nanoseconds Monotonic() const override
+        {
+            return std::chrono::steady_clock::now().time_since_epoch();
+        }
+    };
 
     class DiskInputFiles final: public IInputFiles
     {
@@ -156,98 +194,78 @@ namespace
 
         [[nodiscard]] FileInstant Now() const override
         {
-            if (auto const coarse = ReadCoarse())
-                return *coarse;
-            if (auto const fine = ReadFine())
-                return *fine - FineClockSafetyTick;
-            // No clock answered. Zero precedes every change time, so every input reads as changed:
-            // the invocation fails closed rather than trusting a witness it cannot time.
-            return 0;
+            return NowOn(*_clocks);
         }
 
         [[nodiscard]] FileInstant Fence() const override
         {
-            // The FINE clock is read at the call because it, not the coarse one, bounds every stamp
-            // a change made before this call can carry -- coarse, fine, or a multigrain stamp:
-            // Linux 6.13+ stamps a file stat'ed since its last change with a FINE time, and the
-            // coarse clock can still read BELOW that stamp for up to a tick (#1650). Waiting only
-            // for the coarse clock to change returned such an instant, below a change made before it.
-            auto const fineAtCall = ReadFine();
-            if (auto const coarseAtCall = ReadCoarse())
-            {
-                // Every earlier stamp is at or below `floor`. The first coarse reading strictly
-                // above it is therefore an instant no earlier change carries, while every later
-                // change is stamped at or above the coarse clock, so at or above that reading.
-                auto const floor = std::max(*coarseAtCall, fineAtCall.value_or(*coarseAtCall));
-                auto last = *coarseAtCall;
-                auto const deadline = std::chrono::steady_clock::now() + FenceBound;
-                while (std::chrono::steady_clock::now() < deadline)
-                {
-                    std::this_thread::sleep_for(FencePoll);
-                    auto const reading = ReadCoarse();
-                    if (!reading)
-                        break;
-                    if (*reading > floor)
-                        return *reading;
-                    last = *reading;
-                }
-                // The clock did not pass the floor within the bound, or stopped answering. Fail
-                // CLOSED: an instant a safety tick below the last reading can only make more
-                // changes read as at-or-after it, which costs a store and never serves a wrong
-                // object.
-                return last - FineClockSafetyTick;
-            }
-            if (fineAtCall)
-            {
-                // No coarse clock: a fine read can be up to one tick AHEAD of the stamp a change
-                // made just after it receives. So wait that tick out and move the reading back by
-                // it: every change before this call is then at or below the result, and every
-                // change after it at or above.
-                std::this_thread::sleep_for(std::chrono::nanoseconds { FineClockSafetyTick });
-                if (auto const fine = ReadFine())
-                    return *fine - FineClockSafetyTick;
-            }
-            // No clock answered; `Now`'s answer, for `Now`'s reason.
-            return 0;
+            return FenceOn(*_clocks);
         }
 
       private:
-        /// @return The coarse realtime clock -- the one a filesystem stamps changes with -- or
-        ///         nullopt where the platform has none or it does not answer.
-        [[nodiscard]] static std::optional<FileInstant> ReadCoarse() noexcept
-        {
-#if defined(_WIN32)
-            FILETIME now {};
-            GetSystemTimeAsFileTime(&now);
-            return FromFileTime(now);
-#else
-    #if defined(CLOCK_REALTIME_COARSE)
-            timespec now {};
-            if (::clock_gettime(CLOCK_REALTIME_COARSE, &now) == 0)
-                return FromTimespec(now);
-    #endif
-            return std::nullopt;
-#endif
-        }
-
-        /// @return The fine realtime clock, or nullopt where it does not answer. On Windows it is
-        ///         `GetSystemTimePreciseAsFileTime`, which answers always; `Fence` asks it for its
-        ///         floor, and `Now` never reaches it there, since the coarse clock answers first.
-        [[nodiscard]] static std::optional<FileInstant> ReadFine() noexcept
-        {
-#if defined(_WIN32)
-            FILETIME now {};
-            GetSystemTimePreciseAsFileTime(&now);
-            return FromFileTime(now);
-#else
-            timespec now {};
-            if (::clock_gettime(CLOCK_REALTIME, &now) == 0)
-                return FromTimespec(now);
-            return std::nullopt;
-#endif
-        }
+        std::unique_ptr<IRealtimeClocks> _clocks = MakeSystemRealtimeClocks();
     };
 } // namespace
+
+FileInstant NowOn(IRealtimeClocks const& clocks)
+{
+    if (auto const coarse = clocks.Coarse())
+        return *coarse;
+    if (auto const fine = clocks.Fine())
+        return *fine - FineClockSafetyTick;
+    // No clock answered. Zero precedes every change time, so every input reads as changed: the
+    // invocation fails closed rather than trusting a witness it cannot time.
+    return 0;
+}
+
+FileInstant FenceOn(IRealtimeClocks const& clocks)
+{
+    // The FINE clock is read at the call because it, not the coarse one, bounds every stamp a
+    // change made before this call can carry -- coarse, fine, or a multigrain stamp: Linux 6.13+
+    // stamps a file stat'ed since its last change with a FINE time, and the coarse clock can still
+    // read BELOW that stamp for up to a tick (#1650). Waiting only for the coarse clock to change
+    // returned such an instant, below a change made before it.
+    auto const fineAtCall = clocks.Fine();
+    if (auto const coarseAtCall = clocks.Coarse())
+    {
+        // Every earlier stamp is at or below `floor`. The first coarse reading strictly above it
+        // is therefore an instant no earlier change carries, while every later change is stamped
+        // at or above the coarse clock, so at or above that reading.
+        auto const floor = std::max(*coarseAtCall, fineAtCall.value_or(*coarseAtCall));
+        auto last = *coarseAtCall;
+        auto const deadline = clocks.Monotonic() + FenceBound;
+        while (clocks.Monotonic() < deadline)
+        {
+            clocks.Pause(FencePoll);
+            auto const reading = clocks.Coarse();
+            if (!reading)
+                break;
+            if (*reading > floor)
+                return *reading;
+            last = *reading;
+        }
+        // The clock did not pass the floor within the bound, or stopped answering. Fail CLOSED: an
+        // instant a safety tick below the last reading can only make more changes read as
+        // at-or-after it, which costs a store and never serves a wrong object.
+        return last - FineClockSafetyTick;
+    }
+    if (fineAtCall)
+    {
+        // No coarse clock: a fine read can be up to one tick AHEAD of the stamp a change made just
+        // after it receives. So wait that tick out and move the reading back by it: every change
+        // before this call is then at or below the result, and every change after it at or above.
+        clocks.Pause(std::chrono::nanoseconds { FineClockSafetyTick });
+        if (auto const fine = clocks.Fine())
+            return *fine - FineClockSafetyTick;
+    }
+    // No clock answered; `NowOn`'s answer, for `NowOn`'s reason.
+    return 0;
+}
+
+std::unique_ptr<IRealtimeClocks> MakeSystemRealtimeClocks()
+{
+    return std::make_unique<SystemRealtimeClocks>();
+}
 
 std::unique_ptr<IInputFiles> MakeDiskInputFiles()
 {
