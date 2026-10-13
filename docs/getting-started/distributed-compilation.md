@@ -825,9 +825,9 @@ the same.
 The fingerprint is a digest of the compiler's version banner, its argument
 grammar **and the include tree that belongs to it**. That is what lets two
 machines with the same toolchain at different install prefixes match, while two
-machines whose headers differ do not. It cannot be loosened: an over-strict match costs one local
-compile, an over-loose one produces a silently wrong object that is then stored
-under a key every other machine fetches.
+machines whose headers differ do not. It cannot be loosened: an over-strict
+match costs one local compile, an over-loose one produces a silently wrong
+object that is then stored under a key every other machine fetches.
 
 *Belongs to it* is the operative phrase on Windows. `cl` carries **no** tree:
 its banner names its toolset version and target, and the toolset and SDK headers
@@ -839,9 +839,9 @@ the driver names when asked (`-print-resource-dir`), because they borrow the VC
 toolset and the SDK rather than owning them — so two machines with different
 SDKs or VS languages installed still match. A clang targeting anything else
 carries every directory its `-v` search list names, as GCC does. None of them
-derives its fingerprint from `INCLUDE`, which is set per developer command prompt and never inherited by
-a service — so a worker installed as a service matches the launchers that talk
-to it.
+derives its fingerprint from `INCLUDE`, which is set per developer command
+prompt and never inherited by a service — so a worker installed as a service
+matches the launchers that talk to it.
 
 ### The fingerprint and the cache key are not the same string
 

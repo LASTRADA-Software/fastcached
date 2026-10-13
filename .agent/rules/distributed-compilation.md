@@ -3099,9 +3099,13 @@ whose `-v` probe names a `*-windows-msvc*` target folds only its resource direct
 other GNU driver keeps its whole `-v` list — libstdc++ IS read, and two machines
 can differ in it under one `--version`.
 - **That makes the banner the whole of `cl`'s identity, so a FALLBACK banner is
-  `NoEvidence` under `cl` whatever its layout** — the defect test asks the tree the
-  fingerprint FOLDS, never the one discovery found, or #195's "every MSVC is `cl`" comes
-  back behind a located layout.
+  `NoEvidence` under `cl` whatever its layout** — a row that folds no tree BY
+  CONSTRUCTION is judged as having none, or #195's "every MSVC is `cl`" comes back behind
+  a located layout. Every other row is judged on discovery's roots before the cache read,
+  and asked AGAIN of the tree it folded on the walk: an MSVC-targeting clang whose banner
+  fell back and whose `-print-resource-dir` named no directory folds nothing, so it is
+  `NoEvidence` too, and NOT cached, since a later hit asks only discovery's roots and
+  would serve it.
 - **The fingerprint cache's stamp folds `FingerprintSchema`** (stamp v2), so a schema bump
   misses every older entry rather than serving a value the new rules would not compute.
   Before it, nothing tied a cached value to the rules that produced it.

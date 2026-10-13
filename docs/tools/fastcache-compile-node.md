@@ -545,8 +545,9 @@ journalctl -u fastcache-compile-node | grep 'serving'     # on the worker
 
 They must be identical. If they are not, the two machines really do have
 different toolchains — different patch releases, a different Xcode SDK or
-sysroot, a vendored header that differs. `--print-toolchain-fingerprint` recomputes rather than
-reading the cache, so it also repairs a stale entry on its way past.
+sysroot, a vendored header that differs. `--print-toolchain-fingerprint`
+recomputes rather than reading the cache, so it also repairs a stale entry on
+its way past.
 
 ### A node that never appears in the fleet at all
 
