@@ -1193,7 +1193,8 @@ try {
         Wait-ForReady Daemon $cachePort $daemon "daemon" $daemonLog
 
         # Asked of the launcher rather than derived here. The fingerprint is a
-        # digest over the compiler's whole include tree; a fixture that recomputed
+        # digest over the banner, the grammar and the include tree the compiler
+        # owns (none, for cl -- #1656); a fixture that recomputed
         # it would assert its own reimplementation, and if the two disagreed every
         # case would degrade to a local compile and still exit 0 -- passing while
         # testing nothing.

@@ -3066,10 +3066,11 @@ means different things to them:
 
 - **`cl` owns the VC toolset it lives inside**, so `MsvcToolsetIncludeRoots` walks up
   from the driver to `VC\Tools\MSVC\<version>`. Those roots no longer reach its
-  FINGERPRINT (the corollary below, #1656); they feed the fingerprint cache's stamp and
-  the node's evidence of a toolchain moving, which must agree between a service and a
-  prompt exactly as the fingerprint once had to. The `INCLUDE` fallback stays for that
-  stamp, for a wrapper outside the layout.
+  FINGERPRINT (the corollary below, #1656). Discovery is kept for the fingerprint
+  cache's stamp and so a node notices a toolset or SDK update and re-surveys; both are
+  per-process local checks that never cross a machine, so a service and a prompt
+  disagreeing about these roots costs a recompute and no longer affects matching. The
+  `INCLUDE` fallback stays for that stamp, for a wrapper outside the layout.
 - **`clang-cl` owns only its resource directory** —
   `<prefix>/lib/clang/<version>/include` — and it is **asked** for it
   (`-print-resource-dir`) rather than having it derived. That is correctness, not
@@ -3093,8 +3094,9 @@ with different SDKs installed, and an installed VS language pack drops IntelliSe
 into the toolset's `include` and split two office machines on one toolset and one SDK.
 Which tree a fingerprint walks is `DriverSpec::fingerprintTree`, a column, never an `if`
 on the driver: `cl` folds **none** (its banner names toolset and target, #195), a clang
-whose `-v` probe names a `*-windows-msvc*` target folds only its resource directory, and
-every other GNU driver keeps its whole `-v` list — libstdc++ IS read, and two machines
+whose `-v` probe names a `*-windows-msvc*` target folds only its resource directory (the
+`gcc` row too, since a `cc` that IS such a clang reaches it by its stem), and every
+other GNU driver keeps its whole `-v` list — libstdc++ IS read, and two machines
 can differ in it under one `--version`.
 - **That makes the banner the whole of `cl`'s identity, so a FALLBACK banner is
   `NoEvidence` under `cl` whatever its layout** — the defect test asks the tree the

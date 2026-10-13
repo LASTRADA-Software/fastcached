@@ -1309,10 +1309,11 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # a compile on both processes at the same time, each in a scratch root it claimed.
         # Each node is started and waited for BEFORE the next one, and that is a
         # deliberate reduction in what this fixture asks of the machine. A bare
-        # `--toolchain` makes a node compute a fingerprint by walking the compiler's
-        # whole include tree, which is seconds when warm and much longer cold; two of
+        # `--toolchain` makes a node compute a fingerprint by walking the include tree
+        # the compiler owns, which is seconds when warm and much longer cold; two of
         # those racing on a two-core CI runner exceeded the budget and the fixture
-        # failed having never reached a compile.
+        # failed having never reached a compile. (Measured before #1656, when cl still
+        # walked its toolset and SDK; cl walks nothing now, a GNU driver still walks.)
         #
         # Serialising costs nothing this test is about. The collision it exists to
         # catch happens when two workers COMPILE at once, which is arranged below --

@@ -269,9 +269,11 @@ tier: C's shared tier is the fleet's disk.
 
 ### One Visual Studio, everywhere
 
-A worker serves the compilers it finds, each under a fingerprint of the compiler and its
-include roots, and a client's compile goes only to a worker with the same fingerprint. So keep
-Visual Studio and the Windows SDK at **one version on every PC**, and upgrade them together. A
+A worker serves the compilers it finds, each under a fingerprint of the compiler's version
+banner, which names the toolset version and the target, and a client's compile goes only to a
+worker with the same fingerprint. So keep the **compiler version** the same on every PC, and
+upgrade it together. The Windows SDK and the Visual Studio UI languages need not match: a
+worker compiles text the client already preprocessed, so neither is part of the fingerprint. A
 worker notices a compiler upgraded under it and re-registers under the new fingerprint by
 itself. A PC whose compiler no worker serves compiles locally, and the leader raises
 `unserved-toolchain` naming the driver and the version. `fastcache-cc

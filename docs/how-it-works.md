@@ -310,8 +310,8 @@ journalctl -u fastcache-compile-node | grep serving       # on the worker
 ```
 
 They must be identical strings. If they are not, the two machines genuinely have
-different toolchains — a different patch release, a different SDK, a vendored
-header that is not the same file.
+different toolchains — a different patch release, a different Xcode SDK or
+sysroot, a vendored header that is not the same file.
 
 Note that the fingerprint deliberately omits the target, so a developer-prompt
 launcher and a service-run worker still match. Dispatch closes that gap on the
