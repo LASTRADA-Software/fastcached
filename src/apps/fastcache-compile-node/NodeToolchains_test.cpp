@@ -780,8 +780,31 @@ TEST_CASE("NodeToolchains: an unaskable compiler with a locatable include tree i
 {
     // The other side of the same rule, and what keeps it from being a regression.
     // A driver this build cannot interrogate is not thereby unusable: where the
-    // include tree WAS located, that tree carries the identity, and refusing on the
-    // banner alone would drop a toolchain the fleet can serve perfectly well.
+    // include tree its fingerprint FOLDS was located, that tree carries the identity,
+    // and refusing on the banner alone would drop a toolchain the fleet can serve
+    // perfectly well.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/usr/bin/gcc") } };
+    SpawnScript runner;
+    runner.Speechless("/usr/bin/gcc").IncludeRoots("/usr/bin/gcc", { "/usr/lib/gcc/x86_64-linux-gnu/14/include" });
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
+    REQUIRE(resolved.has_value());
+    REQUIRE(Unwrap(resolved).size() == 1);
+    CHECK(Unwrap(resolved).begin()->second.compiler == "/usr/bin/gcc");
+}
+
+TEST_CASE("NodeToolchains: an unaskable cl is refused even where its layout is located", "[node][toolchains]")
+{
+    // #1656 moved `cl` onto the first case's side of the rule. Its layout is still
+    // located -- the stamp and the evidence read it -- but its fingerprint folds none
+    // of it, so a `cl` that could not be asked its version digests the string `cl`,
+    // which every MSVC toolset on earth produces. Before #1656 this exact arrangement
+    // was SERVED, on the toolset tree's identity; served now, it would be #195's false
+    // match behind a located layout.
     NodeConfig const cfg = Startable();
     FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = std::string { MsvcCompiler },
                                                           .layout = "visual-studio" } } };
@@ -792,10 +815,12 @@ TEST_CASE("NodeToolchains: an unaskable compiler with a locatable include tree i
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
-    REQUIRE(resolved.has_value());
-    REQUIRE(Unwrap(resolved).size() == 1);
-    CHECK(Unwrap(resolved).begin()->second.compiler == MsvcCompiler);
+    // The layout really is there, so the refusal below is the FOLDED tree's doing.
+    REQUIRE_FALSE(Cc::MsvcToolsetIncludeRoots(host, std::string { MsvcCompiler }).empty());
+
+    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger).has_value());
+    CHECK(Logged(logger, std::string { MsvcCompiler }));
+    CHECK(Logged(logger, "--toolchain="));
 }
 
 TEST_CASE("NodeToolchains: an operator's pinned identity is never second-guessed", "[node][toolchains]")

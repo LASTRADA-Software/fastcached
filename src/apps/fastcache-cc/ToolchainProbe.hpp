@@ -129,6 +129,9 @@ struct ToolchainFileScan
 /// the entire win, and it is a Windows defect with a portable mechanism rather
 /// than a throughput improvement.
 ///
+/// The MSVC rows are measurements of the WALK and stand as such; since #1656 no
+/// fingerprint walks those trees (`FingerprintTree`), so `cl` pays none of it.
+///
 /// Enumeration stays serial. Only the content hashing is parallel, and the digest
 /// sorts, so the fingerprint does not depend on the order slices finish in.
 ///
@@ -446,6 +449,15 @@ struct IncludeSearchRoots
     /// The search paths, in the driver's own order. Empty is an ordinary answer.
     std::vector<std::string> roots;
 
+    /// The target the same probe's output names, read the way the driver's
+    /// `TargetDiscovery` row says to read it; empty where nothing was printed to read.
+    ///
+    /// Only `IncludeDiscovery::GnuVerbose` fills it: `-E -v` prints the `-cc1` line and
+    /// the `Target:` header beside the search list, so this costs no spawn. It is what
+    /// `FingerprintTree::OwnTreeWhenTargetingMsvc` decides on -- and it is NOT the cache
+    /// key's target, which `DiscoverTargetTriple` asks for per invocation.
+    std::string targetTriple;
+
     /// False ONLY when a mechanism that has to run the driver could not run it.
     ///
     /// True where nothing is spawned at all -- `IncludeDiscovery::None`, and
@@ -459,6 +471,40 @@ struct IncludeSearchRoots
     /// `IProcessRunner` defines as "could not be spawned at all", clears it.
     bool answered { true };
 };
+
+/// Whether a target triple names the MSVC environment (`*-windows-msvc*`).
+///
+/// The `-cc1` spelling carries a version suffix (`x86_64-pc-windows-msvc19.51.36231`)
+/// and the `Target:` header does not; both answer yes. A MinGW or Cygwin triple
+/// (`*-windows-gnu`, `*-windows-cygnus`) answers no: those read their own headers.
+///
+/// @param triple A triple as `TargetTripleFromDriverOutput` returns it.
+/// @return True when a driver generating for it borrows the VC toolset and the SDK.
+[[nodiscard]] bool TargetsMsvc(std::string_view triple) noexcept;
+
+/// The include roots a toolchain FINGERPRINT walks, chosen from those discovery found.
+///
+/// Dispatches on `spec.fingerprintTree` with no `default:`. The answer is a subset of
+/// the toolchain's trees, never a superset, so it can only make two machines AGREE
+/// where they disagreed on a tree the driver does not own (#1656); the banner and the
+/// grammar still separate one compiler from another.
+///
+/// Called on the walk's path only, so a cache hit spawns nothing for it. A clang that
+/// targets MSVC is asked `-print-resource-dir` here -- one spawn, on a miss, and only on
+/// that driver -- and one that could not be spawned is reported as `answered == false`,
+/// exactly as `ClangResourceIncludeRoots` reports it.
+///
+/// @param runner Process-spawning seam.
+/// @param host The machine's filesystem.
+/// @param compiler The compiler being identified, bare name or path.
+/// @param spec The driver's table row.
+/// @param discovered What `DiscoverIncludePaths` answered for it.
+/// @return The roots to walk, and whether any probe this needed could be run.
+[[nodiscard]] IncludeSearchRoots FingerprintIncludeRoots(IProcessRunner& runner,
+                                                         IToolchainHost& host,
+                                                         std::string const& compiler,
+                                                         DriverSpec const& spec,
+                                                         IncludeSearchRoots const& discovered);
 
 /// A clang driver's own resource directory: the headers that ship WITH it.
 ///
@@ -477,15 +523,16 @@ struct IncludeSearchRoots
 /// the SCM fingerprinted one compiler two ways and the scheduler matched nothing.
 /// A resource directory is a property of the binary, so both ends reach it.
 ///
-/// **What is deliberately NOT here is the VC toolset and the Windows SDK.**
-/// `MsvcToolsetIncludeRoots` folds them into `cl`'s identity because `cl` LIVES
-/// inside the toolset and because its banner is the constant `cl`, so those headers
-/// are the only identity it has. Neither holds for `clang-cl`: it announces a
-/// genuine version, and it borrows whichever MSVC the machine happens to have.
-/// Folding a borrowed tree in would buy no discrimination -- a worker compiles text
-/// the client already preprocessed, so it opens no MSVC header -- while costing
+/// **What is deliberately NOT here is the VC toolset and the Windows SDK.** `clang-cl`
+/// announces a genuine version, and it borrows whichever MSVC the machine happens to
+/// have. Folding a borrowed tree in would buy no discrimination -- a worker compiles
+/// text the client already preprocessed, so it opens no MSVC header -- while costing
 /// real matches, since the newest-kit rule would split two boxes running one
-/// clang-cl with different SDKs installed.
+/// clang-cl with different SDKs installed. The argument outgrew `clang-cl` (#1656):
+/// `cl`'s banner names its toolset and target since #195, so `cl` folds none of
+/// those trees either (`FingerprintTree::None`), and a GNU-grammar clang targeting
+/// MSVC folds this directory and nothing else
+/// (`FingerprintTree::OwnTreeWhenTargetingMsvc`).
 ///
 /// @param runner Process-spawning seam.
 /// @param host The machine's filesystem.
@@ -647,11 +694,12 @@ enum class IdentityDefect : std::uint8_t
     /// Decided where both halves are known, because reconstructing it outside meant
     /// guessing which branch `CompilerBanner` took and deriving the include roots a
     /// second time. The condition: the driver has a way to find its include roots,
-    /// that way found none, AND the banner is itself the fallback name. All three,
-    /// because each alone is ordinary -- `IncludeDiscovery::None` has no roots by
-    /// construction, a real version banner is an identity whatever its roots, and a
-    /// fallback banner over a located include tree is exactly the MSVC case that
-    /// works.
+    /// the fingerprint folds no tree -- that way found none, or the driver's row folds
+    /// none by construction (`FingerprintTree::None`, `cl` since #1656) -- AND the
+    /// banner is itself the fallback name. All three, because each alone is ordinary
+    /// -- `IncludeDiscovery::None` has no roots by construction, a real version banner
+    /// is an identity whatever its roots, and a fallback banner over a folded include
+    /// tree still digests that tree's content.
     ///
     /// Together they are not a weak identity but no identity:
     /// `KeyDigest("toolchain-v1").Field("cl")` is a value this repository could
@@ -711,8 +759,8 @@ struct IdentityDefectRow
 inline constexpr EnumTable<IdentityDefect, IdentityDefectRow> IdentityDefectTable { {
     { .defect = IdentityDefect::None, .reason = {}, .remedy = {} },
     { .defect = IdentityDefect::NoEvidence,
-      .reason = "it could not be asked its version and no include roots were found, so its fingerprint carries "
-                "nothing about which compiler it is -- every install of it digests the same",
+      .reason = "it could not be asked its version and its fingerprint folds no include tree, so the fingerprint "
+                "carries nothing about which compiler it is -- every install of it digests the same",
       .remedy = "Pin one with --toolchain=<fingerprint>=<compiler> if that is deliberate." },
     { .defect = IdentityDefect::UnrunProbe,
       .reason = "its include search paths could not be discovered, because the driver could not be run at all -- so "
