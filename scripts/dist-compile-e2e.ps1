@@ -25,6 +25,10 @@
 #
 #   1. Equivalent object -- a worker's object matches a locally compiled one.
 #   2. Still a cache     -- a dispatched result is served from the cache next time.
+#  2b. Saved mid-dispatch -- a save landing after the key was taken and before the `/E`
+#                           dispatch preprocess reads the source stores nothing: the
+#                           worker compiled the SAVED content, and its object must never
+#                           be filed under the key of the content it replaced (#1650).
 #   3. C, not C++        -- a dispatched C translation unit comes back compiled as C.
 #  3b. Root-bound        -- a dispatched object naming its checkout (the builtin
 #                           `source_location` is made of) is not served into a second
@@ -57,7 +61,8 @@
 # architecture -- is still a failure.
 #
 # Usage:
-#   dist-compile-e2e.ps1 -Fastcached <path> -Node <path> -Launcher <path>
+#   dist-compile-e2e.ps1 -Fastcached <path> -Node <path> -Launcher <path> [-Cli <path>]
+#                        [-EditStub <mid-compile-edit-stub>]
 #   dist-compile-e2e.ps1 -SelfTest        # the object comparison only, no build
 #
 # Exit codes: 0 = all assertions held; 1 = a failure; 77 = a runtime prerequisite
@@ -71,6 +76,9 @@ param(
     # withdrawn; see `Assert-NotWithdrawn`. Without it a withdrawal still fails, and
     # cannot say which limit took the slots.
     [string]$Cli        = "",
+    # The stub compiler case 2b runs through (src/tests/MidCompileEditStub.cpp). That case
+    # FAILS without it: the ctest registration passes it whenever the stub is built.
+    [string]$EditStub   = "",
     # Zero allocates a free block per run, which is the default; a non-zero value
     # pins one, which is what somebody reproducing a failure wants. See
     # `Get-FreePortBlock` for why the fixed default had to go.
@@ -128,6 +136,9 @@ if (-not $SelfTest) {
 # up as the fault it is.
 $NoLocalCache = "--cache-memory=0"
     $Launcher   = (Resolve-Path $Launcher).Path
+    # Only when it EXISTS: `Resolve-Path` on a missing path is a terminating error that would
+    # end the run here, before case 2b can report the missing stub as its own failure.
+    if ($EditStub -and (Test-Path -LiteralPath $EditStub -PathType Leaf)) { $EditStub = (Resolve-Path -LiteralPath $EditStub).Path }
 }
 
 # Scratch beside the build tree, not under %TEMP%, for the reason
@@ -1370,6 +1381,148 @@ try {
             throw "a cached compile was dispatched again"
         }
         Write-Host "   served from the cache on the second compile"
+
+        # --- 2b: a save between the key and the dispatch stores nothing (#1650) ----
+        #
+        # The window #1650 derived and never reproduced: the key is taken over the source as
+        # it was, and a dispatched compile then preprocesses the source a SECOND time (`/E`)
+        # for the worker. A save landing between the two hands the worker the SAVED content,
+        # and its object came back under the OLD content's key. Before the fix, the step below
+        # that restores the original content and builds it again was a HIT serving the
+        # worker's object of the SAVED content under the original key -- exit 0, a wrong
+        # object, fetched by every checkout holding the original content. That is what this
+        # case discriminates.
+        #
+        # No timing can place a save there, so the compiler the launcher runs is
+        # `mid-compile-edit-stub` (src/tests/MidCompileEditStub.cpp), under the driver's own
+        # file name (the grammar is picked by it): it forwards to the real driver and, once,
+        # overwrites the source in place right BEFORE forwarding the `/E`, after the key's own
+        # `/EP` has run. The POSIX fixture's case 2b is its twin.
+        Write-Host "== case 2b: a save between the key and the dispatch preprocess stores nothing"
+        if (-not $EditStub -or -not (Test-Path -LiteralPath $EditStub -PathType Leaf)) {
+            throw "case 2b needs -EditStub ('$EditStub' names no file): the ctest registration (src/tests/CMakeLists.txt, dist-compile-e2e) passes it whenever the stub is built, and CI runs this script only through that registration"
+        }
+        $moved = Join-Path $scratch "moved"
+        $movedStubDir = Join-Path $moved "stub"
+        New-Item -ItemType Directory -Force -Path $movedStubDir | Out-Null
+        $movedStub = Join-Path $movedStubDir "$cc.exe"
+        Copy-Item -LiteralPath $EditStub -Destination $movedStub -Force
+        $env:FC_EDIT_STUB_REAL = $ccPath
+        try {
+            # The worker serves only a matching toolchain fingerprint. A stub that changed it
+            # could be dispatched nowhere, and every assertion below would then be about a
+            # LOCAL compile -- the tautology distributed-compilation.md warns about. Refused
+            # here, never loosened.
+            $stubFingerprint = Use-E2ELauncherState $launcherState { (& $Launcher --print-toolchain-fingerprint $movedStub) | Select-Object -First 1 }
+            if (-not $stubFingerprint) { throw "the launcher could not fingerprint the edit stub" }
+            if ($stubFingerprint -ne $fingerprint) {
+                throw "the edit stub changes the toolchain fingerprint ($stubFingerprint vs $fingerprint), so no compile through it can be dispatched and this case would test a local compile"
+            }
+            Write-Host "   the edit stub keeps the toolchain fingerprint ($stubFingerprint)"
+
+            # V1 is the content the key is taken from; V2, the saved content, differs in one
+            # LITERAL, which is what survives preprocessing.
+            #
+            # Both include a PROJECT header whose content never changes. /showIncludes never
+            # names the TU itself, so without one this compile reports no dependency under the
+            # root, the manifest is refused, and the line below could not pin the keyed-manifest
+            # suffix. One beside each copy of the TU: a quoted include resolves against its
+            # directory.
+            $v1Src = New-Source (Join-Path $moved "v1") "$cc-dist-case-moved"
+            $v2Src = New-Source (Join-Path $moved "v2") "$cc-dist-case-moved-saved"
+            $mroot = Join-Path $moved "proj"
+            New-Item -ItemType Directory -Force -Path (Join-Path $mroot "build") | Out-Null
+            foreach ($dir in @((Join-Path $moved "v1"), (Join-Path $moved "v2"), $mroot)) {
+                "#pragma once`n#define U_MOVED_HEADER 1`n" | Set-Content -NoNewline -Encoding utf8 (Join-Path $dir "u.hpp")
+            }
+            foreach ($tu in @($v1Src, $v2Src)) {
+                ("#include `"u.hpp`"`n" + [IO.File]::ReadAllText($tu)) | Set-Content -NoNewline -Encoding utf8 $tu
+            }
+            $msrc = Join-Path $mroot "u.cpp"
+            $mobj = Join-Path $mroot "build\u.obj"
+
+            # The references, each compiled to the object path the LAUNCHER writes and moved
+            # aside, for the reason case 1 gives. And the control that they differ: an object
+            # equivalent to both would pass every comparison below whichever content the
+            # worker compiled.
+            $v1Ref = Join-Path $moved "v1-reference.obj"
+            $v2Ref = Join-Path $moved "v2-reference.obj"
+            foreach ($pair in @(@($v1Src, $v1Ref), @($v2Src, $v2Ref))) {
+                & $cc /nologo /c "/Fo$mobj" $pair[0] | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "a case 2b reference compile failed ($($pair[0]))" }
+                Move-Item -LiteralPath $mobj -Destination $pair[1] -Force
+            }
+            if (Test-EquivalentObject $v1Ref $v2Ref $rules) {
+                throw "case 2b cannot bite: the original and the saved content compile to one object"
+            }
+
+            # A fresh file, before any key is taken; the save and the restore below write IN
+            # PLACE, the way an editor does.
+            Copy-Item -LiteralPath $v1Src -Destination $msrc -Force
+            $trigger = Join-Path $moved "trigger"
+            New-Item -ItemType File -Force -Path $trigger | Out-Null
+            $env:FC_EDIT_STUB_AT      = "before-dispatch-preprocess"
+            $env:FC_EDIT_STUB_TRIGGER = $trigger
+            $env:FC_EDIT_STUB_FROM    = $v2Src
+            $env:FC_EDIT_STUB_TO      = $msrc
+            try {
+                $r = Invoke-Dispatching $movedStub $mroot $mobj "127.0.0.1:$dispatchPort" $cachePort
+            } finally {
+                foreach ($name in "FC_EDIT_STUB_AT", "FC_EDIT_STUB_TRIGGER", "FC_EDIT_STUB_FROM", "FC_EDIT_STUB_TO") {
+                    Remove-Item -Path "env:$name" -ErrorAction SilentlyContinue
+                }
+            }
+            $logged = Get-E2ELauncherLogField (Get-Content -LiteralPath $launcherState.Log -Tail 1) 'outcome'
+            Write-Host $r.stderr
+            if ($r.code -ne 0) { throw "case 2b: the racing compile failed (exit $($r.code))" }
+            if ($r.stderr -cnotmatch "DISPATCHED to ") {
+                Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$dispatchPort" $fingerprint
+                Write-Host "--- worker log ---"
+                Write-Host (Read-LiveText $workerLog)
+                throw "case 2b: the compile was not dispatched to a worker, so it says nothing about a dispatched compile"
+            }
+            if (Test-Path -LiteralPath $trigger) { throw "case 2b: the stub never fired, so this case tested nothing" }
+            if ((Get-FileHash -LiteralPath $v2Src).Hash -ne (Get-FileHash -LiteralPath $msrc).Hash) {
+                throw "case 2b: the stub fired but the source does not hold the saved content"
+            }
+            # The save landed where it was meant to: the WORKER compiled the saved content.
+            if (-not (Test-Path -LiteralPath $mobj) -or -not (Test-EquivalentObject $v2Ref $mobj $rules)) {
+                throw "case 2b: the dispatched object is not the saved content's, so the save did not land between the key and the dispatch preprocess"
+            }
+            # The WHOLE line pins the window's LOWER bound: a save before the key's own snapshot
+            # logs INPUTS-MOVED as well, but says "while the key was taken" and keeps no manifest.
+            if ($r.stderr -cnotmatch "an input changed during the compile: [^;\r\n]*[\\/]u\.cpp; compiled, not stored; manifest recorded from the keyed content\r?(\n|$)") {
+                throw "case 2b: the save between the key and the dispatch was not seen, or the line does not name the saved file and the keyed manifest"
+            }
+            if ($r.stderr.Contains("STORED key=")) {
+                throw "case 2b: the worker's object of the saved content was stored under the original content's key"
+            }
+            if ($logged -cne "INPUTS-MOVED") { throw "case 2b: recorded '$logged', not INPUTS-MOVED" }
+            $racedKey = [regex]::Match($r.stderr, 'fastcache-cc: MISS key=(\S+)').Groups[1].Value
+
+            # The original content again, written in place: its key is the one the raced
+            # compile was keyed on, and nothing may stand behind it.
+            [System.IO.File]::WriteAllBytes($msrc, [System.IO.File]::ReadAllBytes($v1Src))
+            Remove-Item -LiteralPath $mobj -Force
+            $r = Invoke-Dispatching $movedStub $mroot $mobj "127.0.0.1:$dispatchPort" $cachePort
+            Write-Host $r.stderr
+            if ($r.code -ne 0) { throw "case 2b: the rebuild of the original content failed (exit $($r.code))" }
+            if ($r.stderr -cnotmatch "fastcache-cc: MISS") {
+                throw "case 2b: the original content was served from the cache -- the worker's object of the saved content under the original key (the #1650 defect)"
+            }
+            # The SAME key the raced compile was taken on, or this MISS says nothing about that key.
+            $rebuiltKey = [regex]::Match($r.stderr, 'fastcache-cc: MISS key=(\S+)').Groups[1].Value
+            if (-not $racedKey -or $racedKey -cne $rebuiltKey) {
+                throw "case 2b: the rebuild missed on key '$rebuiltKey', not on the raced compile's key '$racedKey'"
+            }
+            if (-not $r.stderr.Contains("STORED key=")) { throw "case 2b: the original content compiled but was not stored" }
+            if (-not (Test-EquivalentObject $v1Ref $mobj $rules)) {
+                throw "case 2b: the rebuild's object is not the original content's"
+            }
+        } finally {
+            Remove-Item -Path "env:FC_EDIT_STUB_REAL" -ErrorAction SilentlyContinue
+        }
+        Write-Host "   the saved content stored nothing, and the original content is a MISS that builds it"
 
         # --- 3: a C translation unit comes back compiled as C --------------
         #

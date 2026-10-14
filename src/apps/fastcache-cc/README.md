@@ -36,10 +36,23 @@ Built by default (`FASTCACHED_BUILD_LAUNCHER=ON`) and installed alongside
 `clang-cl` on Windows; `scripts/compile-cache-e2e.sh` does the equivalent on
 POSIX. Both assert the same contract: first compile MISSes and stores; second
 (object deleted) HITs and reproduces the object byte-identically; content
-stored from a deep checkout HITs from a shallow checkout. CI runs both.
+stored from a deep checkout HITs from a shallow checkout; and a save landing
+DURING a compile stores nothing unsound (#1650). CI runs both.
+
+That last case runs the compile through `mid-compile-edit-stub`, a test-only
+compiler built beside the launcher, and FAILS rather than skips when it is not
+named — so a manual run builds it and passes it:
 
 ```powershell
-pwsh src/apps/fastcache-cc/run-launcher-e2e.ps1
+cmake --build --preset clangcl-debug --target fastcached fastcache-cc mid-compile-edit-stub
+pwsh src/apps/fastcache-cc/run-launcher-e2e.ps1 `
+    -EditStub out/build/clangcl-debug/target/mid-compile-edit-stub.exe
+```
+
+```sh
+bash scripts/compile-cache-e2e.sh --fastcached <build>/target/fastcached \
+    --launcher <build>/target/fastcache-cc --compiler g++ \
+    --edit-stub <build>/target/mid-compile-edit-stub
 ```
 
 Unit tests build as `fastcache-cc-tests` and run under `ctest`.

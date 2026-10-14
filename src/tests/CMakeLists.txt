@@ -4944,6 +4944,23 @@ else()
         "no PowerShell 7 interpreter found (pwsh, pwsh-preview), so the wait classifier's decision table was not exercised on this host")
 endif()
 
+# The editor's save, landing inside one launcher invocation (#1650): a stub compiler that
+# forwards to the real one and, while a trigger file exists, overwrites a source either after
+# the compile or before a dispatch preprocess. Built for the e2e fixtures below and never
+# installed. It is copied there under the real compiler's own file name, because the launcher
+# picks its driver grammar by that name.
+if(TARGET fastcache-cc)
+    add_executable(mid-compile-edit-stub MidCompileEditStub.cpp)
+endif()
+# Passed whenever it was built, and a fixture that is not handed it FAILS rather than skips:
+# the stub is built exactly when the launcher is, so its absence is a broken registration.
+set(_fc_e2e_edit_stub_posix "")
+set(_fc_e2e_edit_stub_windows "")
+if(TARGET mid-compile-edit-stub)
+    set(_fc_e2e_edit_stub_posix --edit-stub "$<TARGET_FILE:mid-compile-edit-stub>")
+    set(_fc_e2e_edit_stub_windows -EditStub "$<TARGET_FILE:mid-compile-edit-stub>")
+endif()
+
 # ---------------------------------------------------------------------------
 # End-to-end compile-cache test. Starts a real daemon, drives real compiles
 # through the launcher, and asserts miss/hit, byte-identical object
@@ -4981,6 +4998,7 @@ elseif(WIN32)
         COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/run-launcher-e2e.ps1"
             -Fastcached "$<TARGET_FILE:fastcached>"
             -Launcher "$<TARGET_FILE:fastcache-cc>"
+            ${_fc_e2e_edit_stub_windows}
     )
 else()
     # Passed when it was built, and the fixture says out loud which of the two it
@@ -4998,6 +5016,7 @@ else()
             --launcher "$<TARGET_FILE:fastcache-cc>"
             --compiler "${CMAKE_CXX_COMPILER}"
             ${_fc_e2e_testclient}
+            ${_fc_e2e_edit_stub_posix}
     )
 endif()
 if(TARGET fastcached AND TARGET fastcache-cc)
@@ -5095,6 +5114,7 @@ else()
                 -Node "$<TARGET_FILE:fastcache-compile-node>"
                 -Launcher "$<TARGET_FILE:fastcache-cc>"
                 ${_fc_dist_e2e_cli}
+                ${_fc_e2e_edit_stub_windows}
         )
     else()
         # The client reads the scheduler's record of a worker whose lease came back
@@ -5111,6 +5131,7 @@ else()
                 --launcher "$<TARGET_FILE:fastcache-cc>"
                 --compiler "${CMAKE_CXX_COMPILER}"
                 ${_fc_dist_e2e_cli}
+                ${_fc_e2e_edit_stub_posix}
                 --case suite
         )
     endif()

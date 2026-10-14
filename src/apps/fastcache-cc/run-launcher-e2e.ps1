@@ -51,6 +51,14 @@
 #      into the source root: the key maps it onto a root, so
 #      the scan must know the junction spelling -- every root it names, recorded as the
 #      key maps it, walking up the whole spelling.
+#  12. A save DURING a compile records nothing unsound (#1650): through
+#      `mid-compile-edit-stub`, which forwards to the real driver and overwrites a file
+#      in place once the compile has exited, the raced compile stores nothing and is
+#      logged INPUTS-MOVED, and the saved content -- the TU's or a header's -- is a MISS
+#      that builds what was saved and stores it, here and in another checkout; the raced
+#      manifest names the KEYED content, so an object another checkout stores under that
+#      key is never served to the saved content. With no save, the same
+#      stub still stores, direct-hits, and shares across checkouts.
 #   8. Replayed diagnostics: two checkouts sharing a key LEGITIMATELY (nothing in
 #      the preprocessed text names a path, direct mode off) -- the second HITs,
 #      and every warning and `note:` it replays names the SECOND checkout, with
@@ -121,6 +129,10 @@ param(
     [string]$EditTemp,
     [string]$AliasTemp,
     [string]$BoundTemp,
+    # `mid-compile-edit-stub`, the compiler that saves a file during the launcher's
+    # invocation (#1650). The registration passes it whenever it was built, which is
+    # whenever the launcher is, so a run without it FAILS the case rather than skipping.
+    [string]$EditStub,
     # Drive the port helpers above against real listeners and exit. Needs no
     # daemon, no launcher and no compiler -- which is the point: the decision is
     # what can be wrong, and it was previously reachable only by running a fixture
@@ -188,6 +200,9 @@ if (-not $SelfTestPorts) {
 if (-not $SelfTestPorts) {
     $Fastcached = (Resolve-Path $Fastcached).Path
     $Launcher   = (Resolve-Path $Launcher).Path
+    # Only when it EXISTS: `Resolve-Path` on a missing path is a terminating error that would end
+    # the whole run here, before the mid-compile-save case can report the failure itself.
+    if ($EditStub -and (Test-Path -LiteralPath $EditStub -PathType Leaf)) { $EditStub = (Resolve-Path -LiteralPath $EditStub).Path }
 }
 
 # AFTER the resolution above, and that ordering is the whole point: both callers
@@ -334,6 +349,47 @@ function Invoke-LauncherWithEnv([string]$compiler, [string]$srcRoot, [string]$bu
     Set-Item -Path "env:$name" -Value $value
     try   { return Invoke-Launcher $compiler $srcRoot $buildTree $obj }
     finally { Remove-Item -Path "env:$name" -ErrorAction SilentlyContinue }
+}
+
+# The mid-compile save's tree (#1650): `m.cpp` including `m.hpp`, each carrying a message
+# in a string LITERAL so the object says which content it was built from. One tree per
+# leg, and the caller makes the CONTENT per leg too: the key is portable across checkouts,
+# so two legs starting from the same bytes share a key, and once one leg's raced object is
+# stored the next leg's racing compile is a HIT that never runs the stub (measured, with the
+# witness neutered).
+function New-MovedInputTree([string]$root, [string]$message, [string]$headerMessage) {
+    $src = Join-Path $root "src"
+    New-Item -ItemType Directory -Force -Path $src, (Join-Path $root "build") | Out-Null
+    Set-Content -Path (Join-Path $src "m.hpp") -Value "#pragma once`n#define HEADER_MESSAGE `"$headerMessage`"`n"
+    Set-Content -Path (Join-Path $src "m.cpp") `
+                -Value "#include `"m.hpp`"`nchar const* Message() { return `"$message`"; }`nchar const* HeaderMessage() { return HEADER_MESSAGE; }`n"
+    return $src
+}
+
+# Compile `m.cpp` of one such tree through the launcher with $stub as the compiler and the
+# stub's instructions in $stubEnv, each set for the run and cleared again afterwards so none
+# can leak into the cases that follow -- Invoke-LauncherWithEnv's pattern, for several.
+function Invoke-LauncherThroughStub([string]$stub, [string]$root, [hashtable]$stubEnv) {
+    $env:FASTCACHE_ADDR       = "127.0.0.1:$Port"
+    $env:FASTCACHE_SOURCE_DIR = $root
+    $env:FASTCACHE_BINARY_DIR = Join-Path $root "build"
+    $env:FASTCACHE_VERBOSE    = "1"
+    $source = Join-Path $root "src\m.cpp"
+    $obj = Join-Path $root "build\m.obj"
+    foreach ($name in $stubEnv.Keys) { Set-Item -Path "env:$name" -Value $stubEnv[$name] }
+    $errFile = New-TemporaryFile
+    try {
+        $p = Wait-LauncherProcess (Use-E2ELauncherState $launcherState {
+            Start-Process -FilePath $Launcher `
+                -ArgumentList $stub,"/nologo","/c","/showIncludes","/Fo$obj",$source `
+                -NoNewWindow -PassThru -RedirectStandardError $errFile
+        })
+    } finally {
+        foreach ($name in $stubEnv.Keys) { Remove-Item -Path "env:$name" -ErrorAction SilentlyContinue }
+    }
+    $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
+    Remove-Item $errFile -ErrorAction SilentlyContinue
+    return @{ code = $p.ExitCode; stderr = [string]$err; obj = $obj }
 }
 
 # Map a free drive letter onto $target, giving one directory a SECOND spelling.
@@ -1439,6 +1495,153 @@ try {
                 Write-Host $leg.r.stderr
             }
             $exit = 1
+        }
+
+        # A save DURING a compile (#1650). The launcher used to hash its manifest AFTER the
+        # compile, so a save landing during it paired the new content with the old object:
+        # every later build of the new content was a direct HIT on the old object, exit 0, in
+        # every checkout whose files matched. The compiler the launcher runs here is
+        # `mid-compile-edit-stub`, under the driver's own file name (the grammar is picked by
+        # it), which forwards to the real driver and overwrites a file IN PLACE, once, after a
+        # real compile exits 0. For `cl` that is the only place a save CAN land: `cl` holds the
+        # source open while compiling (measured on #1650).
+        #
+        # The CONTROLS are what make the legs mean something: a witness that refused every
+        # store would pass all of them, so the same stub with no save must still store, record
+        # a manifest, direct-hit, and share with a second checkout.
+        Write-Host "=== a save during a compile records nothing unsound ($cc) ==="
+        $msFail = [System.Collections.Generic.List[string]]::new()
+        $msLogs = [System.Collections.Generic.List[string]]::new()
+        if (-not $EditStub -or -not (Test-Path -LiteralPath $EditStub -PathType Leaf)) {
+            Write-Host "  MID-COMPILE SAVE FAIL ($cc): -EditStub names no file ('$EditStub'); the ctest registration passes it whenever the stub is built, and so does CI's direct run of this script (.github/workflows/build.yml, compile-cache-e2e-windows)" -ForegroundColor Red
+            $exit = 1
+        } else {
+            $msCase = Join-Path $MoveTemp "midsave-$cc"
+            Remove-Item -Recurse -Force $msCase -ErrorAction SilentlyContinue
+            $msStubDir = Join-Path $MoveTemp "stub-$cc"
+            New-Item -ItemType Directory -Force $msStubDir | Out-Null
+            $msStub = Join-Path $msStubDir "$cc.exe"
+            Copy-Item -LiteralPath $EditStub -Destination $msStub -Force
+            $env:FC_EDIT_STUB_REAL = (Get-Command $cc).Source
+            try {
+                foreach ($leg in 'tu', 'header') {
+                    $msRoot = Join-Path $msCase $leg
+                    $msV2 = Join-Path $msCase "$leg-v2"
+                    New-MovedInputTree $msRoot "MESSAGE_V1_OLD_$leg" "HEADER_V1_OLD_$leg" | Out-Null
+                    if ($leg -eq 'tu') {
+                        New-MovedInputTree $msV2 "MESSAGE_V2_NEW_$leg" "HEADER_V1_OLD_$leg" | Out-Null
+                        $from = Join-Path $msV2 "src\m.cpp"; $to = Join-Path $msRoot "src\m.cpp"; $want = "MESSAGE_V2_NEW_$leg"; $savedName = 'm\.cpp'
+                    } else {
+                        New-MovedInputTree $msV2 "MESSAGE_V1_OLD_$leg" "HEADER_V2_NEW_$leg" | Out-Null
+                        $from = Join-Path $msV2 "src\m.hpp"; $to = Join-Path $msRoot "src\m.hpp"; $want = "HEADER_V2_NEW_$leg"; $savedName = 'm\.hpp'
+                    }
+                    $trigger = Join-Path $msCase "$leg.trigger"
+                    New-Item -ItemType File -Force $trigger | Out-Null
+                    $rRaced = Invoke-LauncherThroughStub $msStub $msRoot @{
+                        FC_EDIT_STUB_AT = "after-compile"; FC_EDIT_STUB_TRIGGER = $trigger
+                        FC_EDIT_STUB_FROM = $from; FC_EDIT_STUB_TO = $to
+                    }
+                    $msLogs.Add("--- $leg, the raced compile ---`n$($rRaced.stderr)")
+                    $logged = Get-E2ELauncherLogField (Get-Content -LiteralPath $launcherState.Log -Tail 1) 'outcome'
+                    if ($rRaced.code -ne 0) { $msFail.Add("$leg`: the racing compile failed (exit $($rRaced.code))") }
+                    if (Test-Path -LiteralPath $trigger) { $msFail.Add("$leg`: the stub never fired, so this leg tested nothing") }
+                    elseif ((Get-FileHash $from).Hash -ne (Get-FileHash $to).Hash) { $msFail.Add("$leg`: the stub fired but $to does not hold the saved content") }
+                    if (-not $rRaced.stderr.Contains("an input changed during the compile: ")) { $msFail.Add("$leg`: the save during the compile was not seen") }
+                    # The whole line: the file it names is the one that was SAVED, and the manifest
+                    # was still recorded -- from the content the key was taken from.
+                    if ($rRaced.stderr -notmatch "an input changed during the compile: [^;\r\n]*[\\/]$savedName; compiled, not stored; manifest recorded from the keyed content\r?(\n|$)") {
+                        $msFail.Add("$leg`: the line does not name the saved file and the keyed manifest")
+                    }
+                    if ($rRaced.stderr.Contains("STORED key=")) { $msFail.Add("$leg`: the raced object was stored") }
+                    if ($logged -ne "INPUTS-MOVED") { $msFail.Add("$leg`: recorded '$logged', not INPUTS-MOVED") }
+
+                    Remove-Item -LiteralPath $rRaced.obj -Force -ErrorAction SilentlyContinue
+                    $rSaved = Invoke-LauncherThroughStub $msStub $msRoot @{}
+                    $msLogs.Add("--- $leg, the saved content rebuilt ---`n$($rSaved.stderr)")
+                    if ($rSaved.code -ne 0) { $msFail.Add("$leg`: the rebuild failed (exit $($rSaved.code))") }
+                    if ((Get-Outcome $rSaved.stderr) -ne "MISS") { $msFail.Add("$leg`: the saved content was served from the cache (the #1650 defect)") }
+                    # And it STORES: refusing the raced object must not cost the next invocation its store.
+                    if (-not $rSaved.stderr.Contains("STORED key=")) { $msFail.Add("$leg`: the saved content compiled but was not stored") }
+                    if (-not (Test-ObjectNames $rSaved.obj $want)) { $msFail.Add("$leg`: the object does not say $want") }
+
+                    # Inside the loop, before the next leg: every tree here spells the same
+                    # relative source and arguments, so they share ONE manifest key and the next
+                    # leg's manifest replaces this one's -- measured, with the fix reverted, as
+                    # this check passing once the header leg had run.
+                    $msOther = Join-Path $msCase "$leg-other"
+                    Copy-Item -Recurse -LiteralPath $msV2 -Destination $msOther
+                    $rOther = Invoke-LauncherThroughStub $msStub $msOther @{}
+                    $msLogs.Add("--- $leg, another checkout holding the saved content ---`n$($rOther.stderr)")
+                    if ($rOther.code -ne 0) { $msFail.Add("$leg`: the other checkout failed (exit $($rOther.code))") }
+                    if (-not (Test-ObjectNames $rOther.obj $want)) { $msFail.Add("$leg`: another checkout was served the raced object") }
+                }
+
+                # The manifest guard ALONE. The raced compile records a manifest from the content
+                # its key was taken from (v1) and stores nothing; a second checkout of v1 with
+                # direct mode OFF then stores key(v1) without touching that manifest. So the
+                # object behind the manifest's key EXISTS, and only the manifest's own hashes
+                # decide what the saved content (v2) gets: a manifest hashed from the disk after
+                # the save would name v2 and serve it v1's object.
+                $msKeyed = Join-Path $msCase "keyed"
+                $msKeyedV2 = Join-Path $msCase "keyed-v2"
+                $msKeyedTwin = Join-Path $msCase "keyed-v1-twin"
+                New-MovedInputTree $msKeyed "MESSAGE_V1_OLD_keyed" "HEADER_V1_OLD_keyed" | Out-Null
+                New-MovedInputTree $msKeyedV2 "MESSAGE_V2_NEW_keyed" "HEADER_V1_OLD_keyed" | Out-Null
+                New-MovedInputTree $msKeyedTwin "MESSAGE_V1_OLD_keyed" "HEADER_V1_OLD_keyed" | Out-Null
+                $trigger = Join-Path $msCase "keyed.trigger"
+                New-Item -ItemType File -Force $trigger | Out-Null
+                $rKeyed = Invoke-LauncherThroughStub $msStub $msKeyed @{
+                    FC_EDIT_STUB_AT = "after-compile"; FC_EDIT_STUB_TRIGGER = $trigger
+                    FC_EDIT_STUB_FROM = (Join-Path $msKeyedV2 "src\m.cpp"); FC_EDIT_STUB_TO = (Join-Path $msKeyed "src\m.cpp")
+                }
+                $msLogs.Add("--- keyed manifest, the raced compile ---`n$($rKeyed.stderr)")
+                $keyedKey = [regex]::Match($rKeyed.stderr, 'fastcache-cc: MISS key=(\S+)').Groups[1].Value
+                if ($rKeyed.code -ne 0) { $msFail.Add("keyed manifest: the racing compile failed (exit $($rKeyed.code))") }
+                if (Test-Path -LiteralPath $trigger) { $msFail.Add("keyed manifest: the stub never fired, so this case tested nothing") }
+                if (-not $rKeyed.stderr.Contains("manifest recorded from the keyed content")) { $msFail.Add("keyed manifest: the raced compile recorded no manifest, so this case tests nothing") }
+                if (-not $keyedKey) { $msFail.Add("keyed manifest: the raced compile traced no MISS key") }
+                $rKeyedTwin = Invoke-LauncherThroughStub $msStub $msKeyedTwin @{ FASTCACHE_NO_DIRECT = "1" }
+                $msLogs.Add("--- keyed manifest, the v1 twin (direct mode off) ---`n$($rKeyedTwin.stderr)")
+                if (-not $keyedKey -or -not $rKeyedTwin.stderr.Contains("STORED key=$keyedKey ")) {
+                    $msFail.Add("keyed manifest: the v1 twin did not store key(v1)='$keyedKey', so nothing stands behind the manifest")
+                }
+                Remove-Item -LiteralPath $rKeyed.obj -Force -ErrorAction SilentlyContinue
+                $rKeyedSaved = Invoke-LauncherThroughStub $msStub $msKeyed @{}
+                $msLogs.Add("--- keyed manifest, the saved content ---`n$($rKeyedSaved.stderr)")
+                if ($rKeyedSaved.code -ne 0) { $msFail.Add("keyed manifest: the saved content's build failed (exit $($rKeyedSaved.code))") }
+                if ((Get-Outcome $rKeyedSaved.stderr) -ne "MISS") { $msFail.Add("keyed manifest: the saved content was served key(v1)'s object through the raced manifest") }
+                if (-not (Test-ObjectNames $rKeyedSaved.obj "MESSAGE_V2_NEW_keyed")) { $msFail.Add("keyed manifest: the object does not say MESSAGE_V2_NEW_keyed") }
+
+                $msControl = Join-Path $msCase "control"
+                New-MovedInputTree $msControl "MESSAGE_CONTROL" "HEADER_CONTROL" | Out-Null
+                $rControl = Invoke-LauncherThroughStub $msStub $msControl @{}
+                $msLogs.Add("--- control, a quiet compile ---`n$($rControl.stderr)")
+                if ($rControl.code -ne 0) { $msFail.Add("control: the compile failed (exit $($rControl.code))") }
+                if (-not $rControl.stderr.Contains("STORED key=")) { $msFail.Add("control: a quiet compile through the stub did not store") }
+                if (-not $rControl.stderr.Contains("MANIFEST stored key=")) { $msFail.Add("control: a quiet compile did not record a manifest") }
+                Remove-Item -LiteralPath $rControl.obj -Force -ErrorAction SilentlyContinue
+                $rControl2 = Invoke-LauncherThroughStub $msStub $msControl @{}
+                $msLogs.Add("--- control, the rebuild ---`n$($rControl2.stderr)")
+                if ($rControl2.code -ne 0) { $msFail.Add("control: the rebuild failed (exit $($rControl2.code))") }
+                if (-not $rControl2.stderr.Contains("direct mode: the manifest validated")) { $msFail.Add("control: the rebuild was not a direct hit") }
+
+                $msTwin = Join-Path $msCase "control-twin-deeper\tree"
+                New-MovedInputTree $msTwin "MESSAGE_CONTROL" "HEADER_CONTROL" | Out-Null
+                $rTwin = Invoke-LauncherThroughStub $msStub $msTwin @{}
+                $msLogs.Add("--- control, a second checkout ---`n$($rTwin.stderr)")
+                if ($rTwin.code -ne 0) { $msFail.Add("control: the twin checkout failed (exit $($rTwin.code))") }
+                if (-not $rTwin.stderr.Contains("direct mode: the manifest validated")) { $msFail.Add("control: cross-checkout sharing did not survive the witness") }
+                if (-not (Test-ObjectNames $rTwin.obj "MESSAGE_CONTROL")) { $msFail.Add("control: the twin checkout's object does not say MESSAGE_CONTROL") }
+            } finally {
+                Remove-Item Env:\FC_EDIT_STUB_REAL -ErrorAction SilentlyContinue
+            }
+            if ($msFail.Count -eq 0) {
+                Write-Host "  tu and header saved mid-compile: nothing stored, INPUTS-MOVED, the saved content a MISS that stores, here and in another checkout; the manifest names the keyed content; quiet compiles store, direct-hit and share: OK ($cc)" -ForegroundColor Green
+            } else {
+                foreach ($line in $msFail) { Write-Host "  MID-COMPILE SAVE FAIL ($cc): $line" -ForegroundColor Red }
+                foreach ($log in $msLogs) { Write-Host $log }
+                $exit = 1
+            }
         }
 
         # Roots that do not identify the checkout. `relroots` exports `.` and `build`, the

@@ -6,64 +6,18 @@
 #include <chrono>
 #include <cstddef>
 
-using core::platform::SteadyTimePoint;
+#include <tests/OverrunningDrainWait.hpp>
+
 using FastCache::DefaultDrainWait;
 using FastCache::DrainBound;
 using FastCache::DrainResult;
 using FastCache::DrainWithin;
-using FastCache::IDrainWait;
+using FastCache::Testing::OverrunningDrainWait;
 
 using namespace std::chrono_literals;
 
 namespace
 {
-
-/// An `IDrainWait` whose sleeps cost more than they asked for, by a factor the
-/// test names.
-///
-/// This is the whole apparatus. The defect `DrainWithin` exists to prevent is a
-/// loop that accumulates the *requested* poll and calls the sum "elapsed", and
-/// that loop is indistinguishable from a correct one on any host where a sleep
-/// costs what it asked for. Windows' ~15 ms timer granularity is what made the
-/// two shipped copies enforce 15 s and 7.5 s against a stated 5 s; a fake that
-/// can overrun on demand reproduces it on every platform, and deterministically.
-class OverrunningDrainWait final: public IDrainWait
-{
-  public:
-    /// @param overrun How many times longer a sleep costs than it requested.
-    explicit OverrunningDrainWait(int overrun) noexcept:
-        _overrun { overrun }
-    {
-    }
-
-    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
-    {
-        return _now;
-    }
-
-    void Sleep(std::chrono::milliseconds requested) noexcept override
-    {
-        ++_sleeps;
-        _now += requested * _overrun;
-    }
-
-    /// @return How many times `Sleep` was called.
-    [[nodiscard]] std::size_t Sleeps() const noexcept
-    {
-        return _sleeps;
-    }
-
-    /// @return How much time this wait has handed out since construction.
-    [[nodiscard]] std::chrono::milliseconds Elapsed() const noexcept
-    {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(_now - core::platform::SteadyTimePoint {});
-    }
-
-  private:
-    int _overrun;
-    std::size_t _sleeps { 0 };
-    core::platform::SteadyTimePoint _now {};
-};
 
 /// A predicate that reports busy for the first `n` calls and idle afterwards.
 class BusyForCalls
@@ -150,10 +104,11 @@ TEST_CASE("DrainWithin: the default bound is what every shutdown path wants", "[
 
 TEST_CASE("DrainWithin: the production wait blocks and returns", "[core][drain]")
 {
-    // The fake above proves the arithmetic; this proves the seam it stands in
-    // for is wired to a real clock and a real sleep. A small ceiling, so the
-    // case costs what it says: the assertion is that it comes back at all and
-    // reports the ceiling, not how precisely it lands on it.
+    // The shared overrunning fake (tests/OverrunningDrainWait.hpp) proves the
+    // arithmetic; this proves the seam it stands in for is wired to a real
+    // clock and a real sleep. A small ceiling, so the case costs what it says:
+    // the assertion is that it comes back at all and reports the ceiling, not
+    // how precisely it lands on it.
     auto const start = std::chrono::steady_clock::now();
     CHECK(DrainWithin([] { return true; }, DrainBound { .ceiling = 40ms, .poll = 5ms }, DefaultDrainWait())
           == DrainResult::Ceiling);

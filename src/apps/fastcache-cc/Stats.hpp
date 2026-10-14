@@ -38,6 +38,16 @@ enum class Outcome : std::uint8_t
     /// hit rate by the number of wrong objects served, and the one line an operator reads
     /// to judge the cache would read best when the cache was at its worst.
     VerifyMismatch,
+    /// Compiled, and an input changed while the key was taken or during the compile, so the
+    /// OBJECT was not stored (#1650); a manifest from the keyed content may still be recorded,
+    /// and the next build caches as usual.
+    ///
+    /// Its own outcome because both neighbours would be false: `Miss` claims compiled AND
+    /// stored, and `Uncacheable` claims a lasting property of the translation unit, where
+    /// this is one invocation's race with an editor. The detail is the verdict's fixed sentence;
+    /// the path is on the `FASTCACHE_VERBOSE` line.
+    /// An input that could not be OBSERVED at all is `Uncacheable`, not this.
+    InputsMoved,
 };
 
 /// @param outcome The outcome to name.

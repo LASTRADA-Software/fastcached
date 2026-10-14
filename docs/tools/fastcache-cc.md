@@ -696,6 +696,15 @@ than being read by position and misread. The report counts failed compiles only 
 records that carry an exit code, which is what tells a compiler killed from outside
 apart from a cache that broke the build.
 
+`INPUTS-MOVED` is a compile one of whose inputs changed while the key was taken or during
+the compile — an editor's save, a `git checkout` in another terminal — so the launcher did
+not store its object (a direct-mode manifest built from the content the key was taken over
+may still be recorded); the `detail` column says which of the two moments it moved in, and
+the next build caches as usual. An input that could not be observed at all — unreadable when
+the key was taken — is not a race and is recorded `UNCACHEABLE` instead. `detail` carries the
+fixed sentence only, so `--show-stats` ranks one row per cause rather than one per file; the
+file itself is named on the `FASTCACHE_VERBOSE` line.
+
 The two dispatch columns are the distribution axis: the
 fixed reason tallied under `why distribution did not help`, and then what to act on
 about it when the reason alone does not say — the argument a worker would not take,
@@ -735,8 +744,9 @@ never cached (1 translation units)
   1x  volatile.cpp
 ```
 
-The hit rate is computed over **cacheable** compiles (hits + misses), not all
-invocations, so an unreachable daemon does not silently look like a low hit
+The hit rate is computed over **cacheable** compiles — hits, misses, wrong objects
+(hits `FASTCACHE_VERIFY` rejected) and compiles an input moved during (`INPUTS-MOVED`),
+every compile the cache was asked for — not all invocations, so an unreachable daemon does not silently look like a low hit
 rate — it is reported separately as `CACHE NOT REACHED`.
 
 Latency is shown as a distribution rather than an average because compile
@@ -873,6 +883,9 @@ ask.
 | `the cached object names its <parts>; this compile's differs, or its copy was evicted; compiled this one's own` | Not a fault, and still a miss. The object stored under this key names the checkout that compiled it -- a `__FILE__` or a `std::source_location` -- so it is [not shared](#an-object-that-names-its-checkout-is-not-shared-with-another-one), and this compile built and stored its own copy, which the next compile here hits. `<parts>` is what the object names, from `source-root`, `build-tree` and `working-directory`; an object naming only the build tree or the working directory also misses from a second build directory of the SAME checkout. The reason cannot say which part differed -- this end never sees the producer's -- and neither does the `MISS` trace line under `FASTCACHE_VERBOSE`, which carries the same text. A translation unit that shows up here from every checkout is one whose source keeps it from ever being shared across them; spelling its sources relatively AND compiling without `/FC` (which MSBuild turns on by default as "Use Full Paths", and which makes `cl` write the absolute path whatever the command line said), or not baking the file name into program data, is what changes that. |
 | `a worker answered about a different compile` | **A defect somewhere in the fleet, not a fleet declining to help.** The worker's reply did not belong to the request that asked for it — see [`correlation`](../protocols/compile-cache.md#distributed-execution). The object is refused unread and the translation unit is compiled locally, so the build is correct and the caching of it is unaffected (the outcome is still a miss). This is the one reason printed unconditionally rather than only under `FASTCACHE_VERBOSE`, and the line names the worker, the correlation this client expected and the one that arrived. Accepting such a reply would store a wrong object under a correct key and serve it to every other machine that fetches it, so there is no configuration that relaxes this. If it appears at all, find the machine the line names. |
 | `a reported dependency path is not text this host can read`, `a captured region names a path that is not text this host can read` | Deliberate, and Windows-only. `cl.exe` writes the paths in `/showIncludes` in the **console output** code page, while this launcher's own roots arrive as UTF-8 -- so a header under a non-ASCII directory can reach it as bytes it cannot read as text. Such a path prefix-matches no root, which would key a project header as toolchain content and serve a stale object under a zero exit code, so the compile is not cached at all. Reported as *uncacheable*, not as an error. The fix is the console: `chcp 65001` makes `cl` emit UTF-8 and this stops appearing. |
+| `an input changed during the compile` | Not a fault. The file (named on the `FASTCACHE_VERBOSE` line) was saved — by an editor, a `git checkout`, a generator — while the compiler was running, so the object may describe either version of it and was not stored. In direct mode the manifest, built from the content the key was taken over, is still recorded unless recording it was declined; the `FASTCACHE_VERBOSE` line ends `manifest recorded from the keyed content` or `no manifest recorded` to say which. Recorded as `INPUTS-MOVED`. Ordinarily nothing to do: the next build compiles and caches as usual. If it recurs for files nobody edited — which here is a path named only by the build's own depfile, judged by the clock alone — see the row below for what to check. |
+| `an input changed while the key was taken` | Not a fault. The file (named on the `FASTCACHE_VERBOSE` line) changed while the launcher was reading it for the key — between the start of the invocation and the snapshot taken right after the key's preprocess — so neither the object nor the manifest was stored. Recorded as `INPUTS-MOVED`. Ordinarily nothing to do: the next build caches as usual. If it recurs for files nobody edited, the clock is the suspect rather than an editor: a share whose clock runs AHEAD of this machine's (SMB, NFS, or `/mnt/<drive>` under a WSL clock that lags the Windows host) stamps a fresh file at or after the moment the launcher fenced, and so does a filesystem with whole-second (or FAT's 2-second) stamps for a file written in that same second. Then every build reports it again, generated headers on such a share included — check the share's clock against this machine's, or move the build tree to a filesystem with fine-grained stamps. The object is never wrong there; only its caching is lost. |
+| `an input could not be observed` | The file (named on the `FASTCACHE_VERBOSE` line) could not be read or identified when the key was taken, so the launcher could not tell whether it changed during the compile and stored nothing. Recorded as *uncacheable*, because unlike a race it usually persists. Check the file's permissions, or for a tool that replaces it in place while builds run. |
 
 ## Verifying that a hit is the right object
 

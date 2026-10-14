@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -156,13 +157,34 @@ void AppendRawLine(std::string_view line)
 
 } // namespace
 
-TEST_CASE("ToStringView round-trips every outcome token")
+TEST_CASE("ToStringView names every outcome by its token")
 {
     CHECK(ToStringView(Outcome::Hit) == "HIT");
     CHECK(ToStringView(Outcome::Miss) == "MISS");
     CHECK(ToStringView(Outcome::Uncacheable) == "UNCACHEABLE");
     CHECK(ToStringView(Outcome::Unavailable) == "UNAVAILABLE");
     CHECK(ToStringView(Outcome::VerifyMismatch) == "VERIFY-MISMATCH");
+    CHECK(ToStringView(Outcome::InputsMoved) == "INPUTS-MOVED");
+}
+
+TEST_CASE("Every outcome reads back from the log as itself", "[stats][1650]")
+{
+    // Listed by hand: `Outcome` has no trailing `Last`, so `Enumerators<Outcome>()` cannot walk
+    // it, and giving it one would add an arm to every exhaustive switch over it for a value no
+    // record carries. `Unavailable` is last on purpose -- it is also what an unknown token reads
+    // back as, so a token the parser lost would pass for it; every other entry cannot.
+    ScopedStateDir const scoped;
+    constexpr std::array outcomes { Outcome::Hit,         Outcome::Miss,       Outcome::Uncacheable, Outcome::VerifyMismatch,
+                                    Outcome::InputsMoved, Outcome::Unavailable };
+    for (auto const outcome: outcomes)
+        AppendRecord(MakeRecord(outcome, "main", std::string { ToStringView(outcome) } + ".cpp", 10));
+    auto const records = ParseLog("");
+    REQUIRE(records.size() == outcomes.size());
+    for (auto const index: std::views::iota(std::size_t { 0 }, outcomes.size()))
+    {
+        INFO("record " << index << " written as " << ToStringView(outcomes.at(index)));
+        CHECK(records.at(index).outcome == outcomes.at(index));
+    }
 }
 
 TEST_CASE("A hit the verifier rejected is recorded as its own outcome and never as a hit")
@@ -211,6 +233,79 @@ TEST_CASE("A report with no rejected hit says nothing about wrong objects")
     AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
     CHECK_FALSE(FormatReport("").contains("wrong object"));
     CHECK_FALSE(FormatHtmlReport("").contains("wrong objects"));
+}
+
+TEST_CASE("A compile an edit raced is recorded under its own token and reads back as itself", "[stats][1650]")
+{
+    CHECK(ToStringView(Outcome::InputsMoved) == "INPUTS-MOVED");
+
+    // An unknown token reads back as `Unavailable`, so a parser that never learnt this one
+    // would turn an editor's save into an outage on the report.
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::InputsMoved, "main", "moved.cpp", 300));
+    auto const records = ParseLog("");
+    REQUIRE(records.size() == 1);
+    CHECK(records.front().outcome == Outcome::InputsMoved);
+}
+
+TEST_CASE("FormatReport counts a compile an edit raced and names its source", "[stats][1650]")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::InputsMoved, "main", "moved.cpp", 300));
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("compiles     : 2"));
+    // A REQUIRE: a record read back as `Unavailable` (what an unknown token parses as) fails
+    // exactly four of the checks below, and a case failing exactly four assertions exits 4, which
+    // ctest scores as SKIPPED (`SKIP_RETURN_CODE 4`, #1152). Stopping here makes that regression
+    // one failure, a red.
+    REQUIRE(report.contains("inputs moved : 1"));
+    // Asked of the cache and not a hit, so it is in the denominator: one of two.
+    CHECK(report.contains("50.0% of 2 cacheable"));
+    CHECK_FALSE(report.contains("unavailable"));
+    CHECK(report.contains("never cached"));
+    CHECK(report.contains("moved.cpp"));
+
+    auto const html = FormatHtmlReport("");
+    CHECK(html.contains("inputs moved"));
+}
+
+TEST_CASE("A day's hit rate on the trend counts a compile an edit raced as asked of the cache", "[stats][1650]")
+{
+    ScopedStateDir const scoped;
+    for (auto const outcome: { Outcome::Hit, Outcome::InputsMoved })
+    {
+        auto record = MakeRecord(outcome, "main", "a.cpp", 10);
+        record.timestampUnixSeconds = 1'700'000'000; // both on one day
+        AppendRecord(record);
+    }
+    // One point at 50%: x = the left pad, y = top pad + half the plot height. Counted as a
+    // compile the cache was not asked for, the day would read 100% (cy="14.0").
+    CHECK(FormatHtmlReport("").contains(R"(<circle class="trend-point" cx="26.0" cy="94.0" r="3"/>)"));
+}
+
+TEST_CASE("A group's hit rate on the HTML report counts a compile an edit raced as asked of the cache", "[stats][1650]")
+{
+    // The per-group row reads the same denominator as the headline (`Tally::Servable`): one HIT
+    // and one INPUTS-MOVED is 50%. Hits over hits-plus-misses -- a second definition -- read 100%.
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "alpha", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::InputsMoved, "alpha", "moved.cpp", 300));
+    AppendRecord(MakeRecord(Outcome::Hit, "beta", "b.cpp", 10)); // a second group shows the table
+
+    auto const html = FormatHtmlReport("");
+    CHECK(html.contains(R"html(alpha</td><td>2</td><td style="color:var(--hit)">50.0%</td>)html"));
+    CHECK(html.contains(R"(<div class="bar-fill" style="width:50.0%">)"));
+    CHECK_FALSE(html.contains(R"html(alpha</td><td>2</td><td style="color:var(--hit)">100.0%</td>)html"));
+}
+
+TEST_CASE("A report with no raced compile says nothing about moved inputs", "[stats][1650]")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    CHECK_FALSE(FormatReport("").contains("inputs moved"));
+    CHECK_FALSE(FormatHtmlReport("").contains("inputs moved"));
 }
 
 TEST_CASE("RecordingFor names what an operator reads for each dispatch status")

@@ -4,6 +4,7 @@
 #include "DirectManifest.hpp"
 #include "KeyDigest.hpp"
 #include "KeyDigestTestSupport.hpp"
+#include "ManifestContentTestSupport.hpp"
 #include "ReplayGuard.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -688,6 +689,7 @@ TEST_CASE("ValidateManifest rejects entries whose files do not exist")
 
 TEST_CASE("BuildManifest tells dropped, absent and unobserved dependencies apart")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // Three states that an empty path list renders as two, which is what issue #512
     // separated. Asserted in one case because they are only meaningful against each
     // other: every wrong shape of this guard passes one of them.
@@ -721,7 +723,8 @@ TEST_CASE("BuildManifest tells dropped, absent and unobserved dependencies apart
                         .reportedDependencies = ReportedDependencies::Observed({ R"(D:\some\other\checkout\src\dep.hpp)" }),
                         .workingDirectory = root.string(),
                         .toolchainStamp = "cl-19.51",
-                        .objectKey = "objkey-1" },
+                        .objectKey = "objkey-1",
+                        .content = hashedWhenAsked },
                       layout);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().fault == ManifestFault::NoProjectDeps);
@@ -747,7 +750,8 @@ TEST_CASE("BuildManifest tells dropped, absent and unobserved dependencies apart
                                       .reportedDependencies = ReportedDependencies::Observed({}),
                                       .workingDirectory = root.string(),
                                       .toolchainStamp = "cl-19.51",
-                                      .objectKey = "objkey-1" },
+                                      .objectKey = "objkey-1",
+                                      .content = hashedWhenAsked },
                                     layout);
     REQUIRE(kept.has_value());
     CHECK(kept->entries.size() == 1);
@@ -763,7 +767,8 @@ TEST_CASE("BuildManifest tells dropped, absent and unobserved dependencies apart
                                             .reportedDependencies = ReportedDependencies::NotObserved(),
                                             .workingDirectory = root.string(),
                                             .toolchainStamp = "cl-19.51",
-                                            .objectKey = "objkey-1" },
+                                            .objectKey = "objkey-1",
+                                            .content = hashedWhenAsked },
                                           layout);
     REQUIRE_FALSE(unobserved.has_value());
     CHECK(unobserved.error().fault == ManifestFault::DepsNotObserved);
@@ -780,6 +785,7 @@ TEST_CASE("BuildManifest tells dropped, absent and unobserved dependencies apart
 
 TEST_CASE("BuildManifest refuses an unobserved dependency record before it looks at any path")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // The ordering half, which the case above cannot show. `DepsNotObserved` is
     // asked before the TU is even resolved, so a compile that observed nothing is
     // refused for THAT rather than for whatever else is wrong with it -- here a
@@ -794,7 +800,8 @@ TEST_CASE("BuildManifest refuses an unobserved dependency record before it looks
                                          .reportedDependencies = ReportedDependencies::NotObserved(),
                                          .workingDirectory = "/home/dev/proj/out",
                                          .toolchainStamp = "cl-19.51",
-                                         .objectKey = "objkey-1" },
+                                         .objectKey = "objkey-1",
+                                         .content = hashedWhenAsked },
                                        layout);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().fault == ManifestFault::DepsNotObserved);
@@ -824,6 +831,7 @@ TEST_CASE("HashFileContents returns empty for a missing file")
 
 TEST_CASE("Build then validate a manifest against real files on disk")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // The end-to-end invalidation contract, exercised against the filesystem rather
     // than fixtures: a manifest validates while the headers are untouched, and stops
     // validating the moment one of them changes or disappears.
@@ -844,7 +852,8 @@ TEST_CASE("Build then validate a manifest against real files on disk")
                                 .reportedDependencies = ReportedDependencies::Observed({ headerPath.string() }),
                                 .workingDirectory = root.string(),
                                 .toolchainStamp = std::string { stamp },
-                                .objectKey = std::string { objectKey } };
+                                .objectKey = std::string { objectKey },
+                                .content = hashedWhenAsked };
     };
 
     auto built = BuildManifest(inputs("objkey-1"), layout);
@@ -871,6 +880,7 @@ TEST_CASE("Build then validate a manifest against real files on disk")
 
 TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC-style")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // /showIncludes (and therefore ParseIncludePaths) never names the primary
     // translation unit -- only the headers it pulls in. RecordManifest (main.cpp)
     // compensates by adding the TU's own source path to the list it hands to
@@ -896,7 +906,8 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
                                  .reportedDependencies = ReportedDependencies::Observed({ headerPath.string() }),
                                  .workingDirectory = root.string(),
                                  .toolchainStamp = std::string { stamp },
-                                 .objectKey = "objkey-1" },
+                                 .objectKey = "objkey-1",
+                                 .content = hashedWhenAsked },
                                layout);
     REQUIRE(built.has_value());
     REQUIRE(built->entries.size() == 2);
@@ -912,6 +923,7 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
 
 TEST_CASE("BuildManifest records a relative dependency path instead of dropping it")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // The regression this case exists for. BuildManifest classified the path
     // against the roots before classifying the anchor, and every path outside both
     // roots is toolchain -- which a relative path always is, since it
@@ -941,7 +953,8 @@ TEST_CASE("BuildManifest records a relative dependency path instead of dropping 
                                          .reportedDependencies = ReportedDependencies::Observed({ "src/header.hpp" }),
                                          .workingDirectory = root.string(),
                                          .toolchainStamp = std::string { stamp },
-                                         .objectKey = "objkey-rel" };
+                                         .objectKey = "objkey-rel",
+                                         .content = hashedWhenAsked };
 
     auto const built = BuildManifest(inputs, layout);
     REQUIRE(built.has_value());
@@ -963,6 +976,7 @@ TEST_CASE("BuildManifest records a relative dependency path instead of dropping 
 
 TEST_CASE("BuildManifest records a relatively-named translation unit (issue #57)")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // The same defect reaching the TU rather than a header, and the reason the
     // source is BuildManifest's own field: the CMake Ninja generator spells sources
     // relative to the build directory, so `cmd.source` arrived relative, was
@@ -985,7 +999,8 @@ TEST_CASE("BuildManifest records a relatively-named translation unit (issue #57)
                                          .reportedDependencies = ReportedDependencies::Observed({ headerPath.string() }),
                                          .workingDirectory = (root / "out").string(),
                                          .toolchainStamp = std::string { stamp },
-                                         .objectKey = "objkey-tu" };
+                                         .objectKey = "objkey-tu",
+                                         .content = hashedWhenAsked };
 
     auto const built = BuildManifest(inputs, layout);
     REQUIRE(built.has_value());
@@ -1029,6 +1044,7 @@ TEST_CASE("CanonicalSourceToken agrees whichever way the source is spelled")
 
 TEST_CASE("BuildManifest tells its refusals apart and names the path (issue #68)")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // Refusals with nothing in common but the word "no". Each names a different
     // thing to go and fix -- a working directory, a layout, a root spelled almost
     // right, a file -- and the launcher has exactly one line in which to say which
@@ -1037,12 +1053,14 @@ TEST_CASE("BuildManifest tells its refusals apart and names the path (issue #68)
     // translation unit that silently stopped shortcutting had no other trace at all.
     FastCache::PathCanon::Layout const layout { .sourceRoot = "/w/src", .buildTree = "/w/build" };
 
-    auto const inputsWith = [&layout](std::string source, std::vector<std::string> includes, std::string cwd) {
+    auto const inputsWith = [&layout,
+                             &hashedWhenAsked](std::string source, std::vector<std::string> includes, std::string cwd) {
         return BuildManifest({ .sourcePath = std::move(source),
                                .reportedDependencies = ReportedDependencies::Observed(std::move(includes)),
                                .workingDirectory = std::move(cwd),
                                .toolchainStamp = "cc-test-1",
-                               .objectKey = "objkey-1" },
+                               .objectKey = "objkey-1",
+                               .content = hashedWhenAsked },
                              layout);
     };
 
@@ -1094,6 +1112,7 @@ TEST_CASE("BuildManifest tells its refusals apart and names the path (issue #68)
 
 TEST_CASE("BuildManifest names the offending DEPENDENCY, not the source (issue #68)")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // The source has to be real here: BuildManifest records the TU before it looks
     // at a single dependency, so a fictitious source would refuse first and every
     // case below would be testing the wrong path. Which is itself the property under
@@ -1115,7 +1134,8 @@ TEST_CASE("BuildManifest names the offending DEPENDENCY, not the source (issue #
                                .reportedDependencies = ReportedDependencies::Observed(std::move(includes)),
                                .workingDirectory = std::move(cwd),
                                .toolchainStamp = "cc-test-1",
-                               .objectKey = "objkey-1" },
+                               .objectKey = "objkey-1",
+                               .content = hashedWhenAsked },
                              layout);
     };
 
@@ -1311,6 +1331,7 @@ TEST_CASE("ResolveAgainst anchors by the layout's conventions, not the host's")
 
 TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one token")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // Real /showIncludes output echoes the resolved-but-unnormalized path, e.g.
     // `D:\src\AppCore\../applib/Widget.hpp`. Two spellings of the same header must
     // collapse to a single canonical token, or an entry recorded through one
@@ -1342,7 +1363,8 @@ TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one to
                                        .reportedDependencies = ReportedDependencies::Observed(includes),
                                        .workingDirectory = root.string(),
                                        .toolchainStamp = "cl-test-1",
-                                       .objectKey = "objkey-1" },
+                                       .objectKey = "objkey-1",
+                                       .content = hashedWhenAsked },
                                      layout);
     REQUIRE(built.has_value());
     // The header once, plus the TU.
@@ -1355,6 +1377,7 @@ TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one to
 
 TEST_CASE("BuildManifest drops toolchain headers and deduplicates project headers")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-dedup" };
     auto const& root = scratch.Path();
 
@@ -1380,7 +1403,8 @@ TEST_CASE("BuildManifest drops toolchain headers and deduplicates project header
                                        .reportedDependencies = ReportedDependencies::Observed(includes),
                                        .workingDirectory = root.string(),
                                        .toolchainStamp = "cl-test-1",
-                                       .objectKey = "objkey-1" },
+                                       .objectKey = "objkey-1",
+                                       .content = hashedWhenAsked },
                                      layout);
     REQUIRE(built.has_value());
     // The project header once, plus the TU; neither toolchain header appears.
@@ -1556,6 +1580,7 @@ TEST_CASE("ParseDepFilePaths returns nothing for text that is not a rule")
 
 TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // The point of parsing depfiles at all: on POSIX the GNU drivers report
     // dependencies ONLY here, so without this direct mode can never populate —
     // it would pay for a manifest lookup on every compile and never hit.
@@ -1584,7 +1609,8 @@ TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
                                        .reportedDependencies = ReportedDependencies::Observed(paths),
                                        .workingDirectory = root.string(),
                                        .toolchainStamp = "gcc-test-1",
-                                       .objectKey = "objkey-dep" },
+                                       .objectKey = "objkey-dep",
+                                       .content = hashedWhenAsked },
                                      layout);
     REQUIRE(built.has_value());
     CHECK(built->entries.size() == 2); // the source and its header, both under the root
@@ -1680,14 +1706,16 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
     // the object key was needed for. v5 is the same direction again (issue #111),
     // retiring the manifests recorded before a drive-relative path under no root
     // was refused; `objkey` moved with it to keep the two tags from sitting apart,
-    // not because anything forced it.
+    // not because anything forced it. v8 (#1650) moved alone as well, and ONLY the
+    // tag: these inputs are unchanged, so the digest this vector pinned under v7 is
+    // exactly the retired v7 row below.
     // Computed ONCE and asserted twice, for the reason the matching case in
     // CacheKey_test.cpp records: the rows below are digests of these exact inputs,
     // so spelling the call a second time is a place for the two assertions to come
     // to disagree about what was hashed.
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
     auto const manifestKey = ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51");
-    CHECK(manifestKey == "c9ccdb2f69e66935265a024bef7b0c5e");
+    CHECK(manifestKey == "b9a2743a677286c58882078de789f4c5");
 
     // And the generations it has retired stay retired. This is the half the vector
     // above cannot cover: a v5 manifest is only safe because no launcher carrying
@@ -1701,6 +1729,9 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
         // Retired by root binding: a v6 manifest is shared between checkouts and points
         // straight at the producer's object, `__FILE__` and all. Only the tag moved.
         { .key = "manifest-v6", .digest = "2f8e995262b738bea0d31e062b6d4682" },
+        // Retired by #1650: a v7 manifest's hashes were read after the compile, so an edit saved during it paired the new
+        // content with the old object. Only the tag moved.
+        { .key = "manifest-v7", .digest = "c9ccdb2f69e66935265a024bef7b0c5e" },
     });
     RequireNoRetiredDigest<std::string_view>(manifestKey, Retired);
 
@@ -1848,6 +1879,7 @@ constexpr std::string_view Stamp = "cl 19.51.36231 x64";
 
 TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it was not built from")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // Issue #368's mechanism, shown rather than described. This is the state the
     // installed launcher reached, and the assertion below is what it cost.
     //
@@ -1894,7 +1926,8 @@ TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it w
                                         .reportedDependencies = ReportedDependencies::Observed({}),
                                         .workingDirectory = oldCheckout.sourceRoot,
                                         .toolchainStamp = std::string { Stamp },
-                                        .objectKey = "object-from-the-old-checkout" },
+                                        .objectKey = "object-from-the-old-checkout",
+                                        .content = hashedWhenAsked },
                                       oldCheckout);
     REQUIRE(hollow.has_value());
     // The TU and nothing else. `entries.size()` rather than a header count,
@@ -1924,6 +1957,7 @@ TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it w
 
 TEST_CASE("An honest manifest still records its header, and still fails in the other checkout")
 {
+    Test::HashedWhenAsked const hashedWhenAsked;
     // The guard above must not be the reason everything refuses. A compile whose
     // dependency lies under its own roots records it, validates at home, and --
     // the property the hollow manifest lost -- FAILS where that header differs.
@@ -1937,7 +1971,8 @@ TEST_CASE("An honest manifest still records its header, and still fails in the o
                         .reportedDependencies = ReportedDependencies::Observed({ checkouts.Header("checkout-old") }),
                         .workingDirectory = oldCheckout.sourceRoot,
                         .toolchainStamp = std::string { Stamp },
-                        .objectKey = "object-key" },
+                        .objectKey = "object-key",
+                        .content = hashedWhenAsked },
                       oldCheckout);
     REQUIRE(sound.has_value());
     CHECK(sound->entries.size() == 2);
@@ -1946,4 +1981,81 @@ TEST_CASE("An honest manifest still records its header, and still fails in the o
     // The header differs there, so this is the answer the hollow manifest could
     // not give.
     CHECK_FALSE(ValidateManifest(*sound, newCheckout, Stamp));
+}
+
+TEST_CASE("BuildManifest takes every hash from its content source, never from the disk", "[direct-manifest][1650]")
+{
+    // #1650: the hashes BuildManifest recorded were read AFTER the compile, so a save during it
+    // paired the new content with the old object. The content source is the witness in
+    // production; this proves BuildManifest no longer reads the files itself.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-content-source" };
+    scratch.Write("src/header.hpp", "#pragma once\n");
+    scratch.Write("src/a.cpp", "#include \"header.hpp\"\n");
+    auto const& root = scratch.Path();
+    FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
+    auto const source = (root / "src" / "a.cpp").string();
+    auto const header = (root / "src" / "header.hpp").string();
+    auto const resolvedSource = ResolveAgainst(source, root.string(), layout);
+    auto const resolvedHeader = ResolveAgainst(header, root.string(), layout);
+
+    Test::ScriptedContent const content { { { .path = resolvedSource, .response = std::string { "tu-as-keyed" } },
+                                            { .path = resolvedHeader, .response = std::string { "header-as-keyed" } } } };
+    auto const built = BuildManifest({ .sourcePath = source,
+                                       .reportedDependencies = ReportedDependencies::Observed({ header }),
+                                       .workingDirectory = root.string(),
+                                       .toolchainStamp = "stamp",
+                                       .objectKey = "objkey",
+                                       .content = content },
+                                     layout);
+    REQUIRE(built.has_value());
+    std::vector<std::string> hashes;
+    for (auto const& entry: built->entries)
+        hashes.push_back(entry.contentHash);
+    std::ranges::sort(hashes);
+    CHECK(hashes == std::vector<std::string> { "header-as-keyed", "tu-as-keyed" });
+
+    // And it asked about exactly the TU plus what ProjectDependencyPaths names, so a witness
+    // taken over that list answers every lookup.
+    auto expected = ProjectDependencyPaths(std::vector<std::string> { header }, root.string(), layout);
+    expected.insert(expected.begin(), resolvedSource);
+    CHECK(content.Asked() == expected);
+}
+
+TEST_CASE("A content source's refusal names its path and its fault", "[direct-manifest][1650]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-content-refusal" };
+    scratch.Write("src/header.hpp", "#pragma once\n");
+    scratch.Write("src/a.cpp", "#include \"header.hpp\"\n");
+    auto const& root = scratch.Path();
+    FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
+    auto const source = (root / "src" / "a.cpp").string();
+    auto const header = (root / "src" / "header.hpp").string();
+    auto const resolvedHeader = ResolveAgainst(header, root.string(), layout);
+
+    Test::ScriptedContent const content {
+        { { .path = ResolveAgainst(source, root.string(), layout), .response = std::string { "tu" } },
+          { .path = resolvedHeader, .response = std::unexpected(ManifestFault::ChangedDuringInvocation) } }
+    };
+    auto const built = BuildManifest({ .sourcePath = source,
+                                       .reportedDependencies = ReportedDependencies::Observed({ header }),
+                                       .workingDirectory = root.string(),
+                                       .toolchainStamp = "stamp",
+                                       .objectKey = "objkey",
+                                       .content = content },
+                                     layout);
+    REQUIRE_FALSE(built.has_value());
+    CHECK(built.error() == ManifestFailure { .fault = ManifestFault::ChangedDuringInvocation, .path = resolvedHeader });
+    CHECK(DescribeManifestFailure(built.error()) == "changed during this compile: " + resolvedHeader);
+}
+
+TEST_CASE("ProjectDependencyPaths keeps project headers, resolved, and drops toolchain ones", "[direct-manifest][1650]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-project-paths" };
+    auto const& root = scratch.Path();
+    FastCache::PathCanon::Layout const layout { .sourceRoot = (root / "src").string(),
+                                                .buildTree = (root / "out").string() };
+    auto const project = (root / "src" / "inc" / ".." / "h.hpp").string();
+    auto const toolchain = (root / "sdk" / "vector").string();
+    auto const kept = ProjectDependencyPaths(std::vector<std::string> { project, toolchain }, root.string(), layout);
+    CHECK(kept == std::vector<std::string> { ResolveAgainst(project, root.string(), layout) });
 }
