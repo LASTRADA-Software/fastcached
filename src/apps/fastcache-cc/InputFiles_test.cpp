@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-#include <core/platform/Clock.hpp>
+#include <tests/OverrunningDrainWait.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SteppedDrainWait.hpp>
 #include <tests/Unwrap.hpp>
@@ -96,35 +96,6 @@ class ScriptedClocks final: public IRealtimeClocks
     std::vector<std::optional<FileInstant>> _coarse;
     mutable std::size_t _next = 0;
     mutable int _reads = 0;
-};
-
-/// A drain wait whose every sleep COSTS `ChargeFactor` times what it asked for, as a coarse host
-/// timer charges a short request -- so a bound that COUNTS requested sleeps and one that MEASURES
-/// them end at different instants, and a case can tell which one it ran. It never blocks.
-class OverchargingDrainWait final: public FastCache::IDrainWait
-{
-  public:
-    /// How many times its request every sleep costs.
-    static constexpr int ChargeFactor = 3;
-
-    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
-    {
-        return core::platform::SteadyTimePoint {} + _elapsed;
-    }
-
-    void Sleep(std::chrono::milliseconds requested) noexcept override
-    {
-        _elapsed += requested * ChargeFactor;
-    }
-
-    /// @return The time every sleep so far cost.
-    [[nodiscard]] std::chrono::milliseconds Elapsed() const noexcept
-    {
-        return _elapsed;
-    }
-
-  private:
-    std::chrono::milliseconds _elapsed {};
 };
 
 /// An instant in 2025, for scripted clocks to read near.
@@ -220,7 +191,11 @@ TEST_CASE("A fence lands strictly above a fine-clock instant read before it at e
     //
     // Each iteration first sleeps a different fraction of a tick, so the fence starts at a sweep
     // of phases across it rather than wherever the previous fence left off: 163 us steps cover
-    // 16.3 ms, a Windows tick (15.6 ms) as well as four of Linux's 4 ms ones.
+    // 16.3 ms, four of Linux's 4 ms ticks.
+    //
+    // On Windows the case checks the same property but cannot tell the old fence from the new: the
+    // old rule was measured at 0 of 200 there. And at the default timer resolution (15.6 ms) a
+    // sub-tick `sleep_for` rounds up to whole ticks, so the sweep does not really sweep phases.
     constexpr auto Iterations = 100;
     constexpr auto PhaseStep = std::chrono::microseconds { 163 };
     auto const clocks = MakeSystemRealtimeClocks();
@@ -271,10 +246,11 @@ TEST_CASE("A fence whose coarse clock never passes the floor answers a safety ti
     // COUNTED one: measured, it stops at the first look at or past 100 ms of what the sleeps COST,
     // which is under one charged sleep past it; counted (`waited += poll`), it would run 100
     // requested sleeps -- 300 ms by this clock -- and read the coarse clock about 100 times.
+    constexpr auto Overrun = 3;
     ScriptedClocks const clocks { ScriptBase + 9, { ScriptBase } };
-    OverchargingDrainWait wait;
+    FastCache::Testing::OverrunningDrainWait wait { Overrun };
     constexpr auto Bound = std::chrono::milliseconds { 100 };
-    constexpr auto ChargedPoll = std::chrono::milliseconds { 1 } * OverchargingDrainWait::ChargeFactor;
+    constexpr auto ChargedPoll = std::chrono::milliseconds { 1 } * Overrun;
 
     CHECK(FenceOn(clocks, wait) == ScriptBase - FineClockSafetyTick);
     CHECK(wait.Elapsed() >= Bound);
