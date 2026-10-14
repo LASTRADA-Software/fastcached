@@ -163,7 +163,7 @@ class IInputFiles
     /// then holds until the next one, so it lags real time by up to about TWO ticks -- measured
     /// 7.45 ms behind `CLOCK_REALTIME` on WSL's 4 ms tick. Its first new reading can therefore still
     /// lie at or below a fine-clock instant read before this call: with a fence that waited only for
-    /// the coarse clock to change, that happened in 33 to 100 of 100 runs on WSL (Linux 6.6). A
+    /// the coarse clock to change, that happened in 25 to 100 of 100 runs on WSL (Linux 6.6). A
     /// FILE STAMP reaches that region only where the kernel stamps with the fine clock -- Linux
     /// 6.13+ (multigrain timestamps, on ext4, xfs, btrfs and tmpfs) stamps a change to a file
     /// stat'ed since its last change with a FINE time. MEASURED in CI: under that waiting rule, 57
