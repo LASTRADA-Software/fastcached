@@ -214,11 +214,10 @@ FileInstant FenceOn(IRealtimeClocks const& clocks, IDrainWait& wait)
     // change made before this call can carry -- coarse, fine, or a multigrain stamp. On the Linux
     // timekeeper (measured on WSL 6.6) the coarse clock reads the last tick boundary it
     // accumulated, which trails its publication and holds until the next one, so it lags real time
-    // by up to about two ticks: its first NEW
-    // reading can still lie at or below a fine instant read before this call (#1650). Waiting only
-    // for the coarse clock to change returned such an instant, and Linux 6.13+ stamps a file
-    // stat'ed since its last change with a FINE time, so a change made before it could read as
-    // made after it.
+    // by up to about two ticks: its first NEW reading can still lie at or below a fine instant read
+    // before this call (#1650). Waiting only for the coarse clock to change returned such an
+    // instant, and Linux 6.13+ stamps a file stat'ed since its last change with a FINE time, so a
+    // change made before it could read as made after it.
     auto const fineAtCall = clocks.Fine();
     if (auto const coarseAtCall = clocks.Coarse())
     {
@@ -256,7 +255,9 @@ FileInstant FenceOn(IRealtimeClocks const& clocks, IDrainWait& wait)
         // the stamp a change made just after it receives -- within `FineClockSafetyTick` at 200 Hz
         // or faster. So wait that margin out and move the reading back by it: every change before
         // this call is then at or below the result, and every change after it at or above. Rounded
-        // UP to the wait's unit, so the wait is never shorter than the margin.
+        // UP to the wait's unit, so the wait is never shorter than the margin. That two-tick lag
+        // was measured on Linux; on macOS, the one platform that takes this path, it is INFERRED,
+        // and a lag over the margin fails OPEN (see `FineClockSafetyTick`).
         wait.Sleep(std::chrono::ceil<std::chrono::milliseconds>(std::chrono::nanoseconds { FineClockSafetyTick }));
         if (auto const fine = clocks.Fine())
             return *fine - FineClockSafetyTick;

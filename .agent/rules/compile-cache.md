@@ -2434,13 +2434,13 @@ four were each wrong in a draft of #1650 before they were right:
   so it lags real time by up to about TWO ticks (7.45 ms on WSL's 4 ms tick), and its first new
   reading can lie at or below a fine-clock instant read before the fence -- in about 20 to 100 of
   100 runs there, varying per boot. A unit case asks it of the machine's own clocks; on Windows
-  that case checks the property but cannot tell the old fence from the new (0 of 200 there). The STAMPING half is Linux 6.13+, whose
-  multigrain timestamps stamp a file stat'ed since its last change with a FINE time, carrying
-  that lag into FILE STAMPS -- MEASURED: 57 of 60 such saves read as after the fence on
-  `Linux-gcc-release-arm64` in CI; the multigrain cause is INFERRED, no local kernel stamps that
-  way, and a scripted-clock case stands in for it. Without any fence,
-  5 of 30 compiles launched right after a write refused to store (WSL, 4 ms ticks; measured, and
-  30 of 30 stored with it). Read T0 COARSELY, too: a finer clock can read later than the stamp
+  that case checks the property but cannot tell the old fence from the new (0 of 200 there). The
+  STAMPING half is Linux 6.13+, whose multigrain timestamps stamp a file stat'ed since its last
+  change with a FINE time, carrying that lag into FILE STAMPS -- MEASURED: 57 of 60 such saves
+  read as after the fence on `Linux-gcc-release-arm64` in CI; the multigrain cause is INFERRED, no
+  local kernel stamps that way, and a scripted-clock case stands in for it. Without any fence, 5
+  of 30 compiles launched right after a write refused to store (WSL, 4 ms ticks; measured, and 30
+  of 30 stored with it). Read T0 COARSELY, too: a finer clock can read later than the stamp
   of a change that follows it.
 - **Every comparison with T0 is `Cc::ChangedAtOrAfter`, never a raw `>=`.** It floors T0 to the
   grid the stamp itself shows -- the largest of 2 s, then each decimal unit from 1 s down to
