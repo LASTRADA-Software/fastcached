@@ -369,9 +369,10 @@ namespace
     /// The include directories a Windows SDK kit is made of, in the order
     /// `vcvarsall` lists them in `INCLUDE`.
     ///
-    /// A table so the next one the SDK grows is a row. The order does not reach the
-    /// fingerprint -- that sorts -- but it is what an operator compares against
-    /// their own `INCLUDE` when a fingerprint disagrees.
+    /// A table so the next one the SDK grows is a row. The order reaches no
+    /// fingerprint -- no `cl` fingerprint folds these roots since #1656 -- but it is
+    /// what an operator compares against their own `INCLUDE` when the stamp's roots
+    /// are in question.
     constexpr std::array<std::string_view, 5> WindowsKitIncludeSubdirectories {
         "ucrt", "um", "shared", "winrt", "cppwinrt"
     };
@@ -410,6 +411,10 @@ namespace
 
     /// The header a GNU driver prints its own target on.
     constexpr std::string_view TargetHeaderPrefix = "Target:";
+
+    /// The triple components naming the MSVC environment, the `-cc1` spelling's
+    /// version suffix (`msvc19.51.36231`) included by being a prefix of it.
+    constexpr std::string_view MsvcTargetEnvironment = "-windows-msvc";
 
     /// The first line of @p text that @p extract gets an answer out of.
     ///
@@ -593,7 +598,13 @@ namespace
     /// things: this one versions what the stamp COVERS. Adding an input to the
     /// stamp without moving it would let a cache entry written under the old rules
     /// validate under the new ones -- a stale fingerprint that looks fresh.
-    constexpr std::string_view StampSchema = "toolchain-stamp-v1";
+    ///
+    /// v2 added `FingerprintSchema` itself as an input (#1656). Until then nothing
+    /// tied a cached value to the rules that computed it: bumping the fingerprint's
+    /// schema changed every freshly computed value while a cache entry written under
+    /// the old one still validated, so a launcher kept serving the old identity
+    /// against a worker that had restarted onto the new one.
+    constexpr std::string_view StampSchema = "toolchain-stamp-v2";
 
     /// A path's last-write time as its native tick count, or 0 when unreadable.
     ///
@@ -972,7 +983,7 @@ std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host)
     // answer `RegistryString` can give and the easy one to miss: a zero-length
     // value comes back as an empty string rather than as `nullopt`. Testing only
     // `has_value()` skipped the native read on a machine whose 32-bit value had
-    // been emptied, and dropped the SDK half of its identity in silence.
+    // been emptied, and dropped the SDK half of what its stamp watches in silence.
     if (!kitsRoot.has_value() || kitsRoot->empty())
         kitsRoot = host.RegistryString(RegistryHive::LocalMachine, InstalledRootsKey, KitsRootValue, RegistryView::Native);
     if (!kitsRoot.has_value() || kitsRoot->empty())
@@ -1025,7 +1036,7 @@ IncludeSearchRoots ClangResourceIncludeRoots(IProcessRunner& runner, IToolchainH
     // back the same empty list a wrapper that understood nothing gives. See
     // `IncludeSearchRoots::answered`.
     if (run.exitCode == NotSpawned)
-        return IncludeSearchRoots { .roots = {}, .answered = false };
+        return IncludeSearchRoots { .roots = {}, .targetTriple = {}, .answered = false };
 
     // Any OTHER exit code is not consulted, for the reason the GNU arm below states:
     // a driver can exit non-zero for reasons that leave its answer perfectly good.
@@ -1046,11 +1057,46 @@ IncludeSearchRoots ClangResourceIncludeRoots(IProcessRunner& runner, IToolchainH
         // Answered, badly. A driver that printed nothing usable is still served, on a
         // banner-only fingerprint -- which is what the case above must not collapse
         // into.
-        return IncludeSearchRoots { .roots = {}, .answered = true };
+        return IncludeSearchRoots { .roots = {}, .targetTriple = {}, .answered = true };
 
     std::vector<std::string> roots;
     AppendIfDirectory(host, roots, resourceDir, ClangResourceIncludeSubdirectory);
-    return IncludeSearchRoots { .roots = std::move(roots), .answered = true };
+    return IncludeSearchRoots { .roots = std::move(roots), .targetTriple = {}, .answered = true };
+}
+
+bool TargetsMsvc(std::string_view triple) noexcept
+{
+    return triple.contains(MsvcTargetEnvironment);
+}
+
+IncludeSearchRoots FingerprintIncludeRoots(IProcessRunner& runner,
+                                           IToolchainHost& host,
+                                           std::string const& compiler,
+                                           DriverSpec const& spec,
+                                           IncludeSearchRoots const& discovered)
+{
+    // No `default:`, so a selection added to the table fails to compile here rather
+    // than silently walking nothing -- or everything.
+    switch (spec.fingerprintTree)
+    {
+        case FingerprintTree::DiscoveredRoots:
+            return discovered;
+
+        case FingerprintTree::None:
+            // Nothing is asked, so nothing can be missing: the identity is the banner
+            // and the grammar by construction, not because a probe came back empty.
+            return IncludeSearchRoots { .roots = {}, .targetTriple = {}, .answered = true };
+
+        case FingerprintTree::OwnTreeWhenTargetingMsvc:
+            // A target the probe did not name keeps every root, which is the direction
+            // that can only cost a match: the borrowed trees stay in and two machines
+            // may split, as they did before #1656, rather than a tree being dropped on
+            // a guess.
+            if (!TargetsMsvc(discovered.targetTriple))
+                return discovered;
+            return ClangResourceIncludeRoots(runner, host, compiler);
+    }
+    return {};
 }
 
 std::string ParseDriverTargetTriple(std::string_view driverOutput)
@@ -1158,7 +1204,7 @@ IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
         case IncludeDiscovery::None:
             // Nothing is asked, so nothing is missing: a driver with no mechanism is
             // not one whose mechanism failed. See `IncludeSearchRoots::answered`.
-            return IncludeSearchRoots { .roots = {}, .answered = true };
+            return IncludeSearchRoots { .roots = {}, .targetTriple = {}, .answered = true };
 
         case IncludeDiscovery::GnuVerbose: {
             auto const run = runner.RunCaptureSplit(ProbeArgv(compiler, spec.includeProbeFlags));
@@ -1167,7 +1213,7 @@ IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
             // list a driver that ran and listed nothing gives -- and that one is
             // legitimately served. See `IncludeSearchRoots::answered` (issue #225).
             if (run.exitCode == NotSpawned)
-                return IncludeSearchRoots { .roots = {}, .answered = false };
+                return IncludeSearchRoots { .roots = {}, .targetTriple = {}, .answered = false };
 
             // Any OTHER exit code is deliberately NOT checked. The list is printed
             // before anything that could fail, and a driver can exit non-zero for
@@ -1176,7 +1222,9 @@ IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
             // output is usable; an exit code cannot.
             //
             // Read from stderr, which is where every GNU-family driver prints it.
-            return IncludeSearchRoots { .roots = ParseGnuIncludeSearchPaths(run.err), .answered = true };
+            return IncludeSearchRoots { .roots = ParseGnuIncludeSearchPaths(run.err),
+                                        .targetTriple = TargetTripleFromDriverOutput(spec, run.err),
+                                        .answered = true };
         }
 
         case IncludeDiscovery::MsvcLayout: {
@@ -1192,11 +1240,12 @@ IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
             // nothing about which compiler is being identified -- on any machine with
             // an SDK installed, a `cl.exe` outside the `VC\Tools\MSVC\<version>`
             // layout (a shim, a wrapper, a VS2015-era `<vs>\VC\bin\cl.exe`) would come
-            // back with SDK roots only, never reach the fallback, and drop the VC
-            // headers from its identity. Two such toolchains then digest IDENTICALLY,
-            // which is exactly the false match this mechanism exists to prevent.
+            // back with SDK roots only, never reach the fallback, and stamp without
+            // the VC headers. Since #1656 no `cl` fingerprint folds these roots, so this
+            // gate decides only what the stamp watches and what the node re-surveys on,
+            // never whether two toolchains match.
             if (roots.empty())
-                return IncludeSearchRoots { .roots = IncludeEnvironmentRoots(host), .answered = true };
+                return IncludeSearchRoots { .roots = IncludeEnvironmentRoots(host), .targetTriple = {}, .answered = true };
 
             // A partial layout answer IS kept rather than topped up from `INCLUDE`:
             // both ends of a dispatch run this same code and so reach the same partial
@@ -1204,7 +1253,7 @@ IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
             // how the two stop agreeing.
             auto kits = WindowsKitIncludeRoots(host);
             roots.insert(roots.end(), std::make_move_iterator(kits.begin()), std::make_move_iterator(kits.end()));
-            return IncludeSearchRoots { .roots = std::move(roots), .answered = true };
+            return IncludeSearchRoots { .roots = std::move(roots), .targetTriple = {}, .answered = true };
         }
 
         case IncludeDiscovery::ClangResourceLayout:
@@ -1220,7 +1269,10 @@ IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
     return {};
 }
 
-std::string ComputeToolchainStamp(std::string_view banner, std::string const& compiler, std::span<std::string const> roots)
+std::string ComputeToolchainStamp(std::string_view banner,
+                                  std::string const& compiler,
+                                  std::span<std::string const> roots,
+                                  std::string_view schema)
 {
     auto const binary = PathFromNarrowText(compiler);
     if (!binary.has_value())
@@ -1237,6 +1289,9 @@ std::string ComputeToolchainStamp(std::string_view banner, std::string const& co
         return {};
 
     KeyDigest digest { StampSchema };
+    // The rules the cached value was computed under: a schema bump then misses every
+    // entry written before it, rather than serving one the new rules would not give.
+    digest.Field(schema);
     digest.Field(banner);
     digest.Path(compiler);
     digest.Field(std::to_string(size));
@@ -1284,7 +1339,18 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     auto const probeDefect = [&] {
         if (!discovered.answered)
             return IdentityDefect::UnrunProbe;
-        if (spec.includeDiscovery != IncludeDiscovery::None && roots.empty() && banner == NormalizedCompilerName(compiler))
+        // A row that folds no tree BY CONSTRUCTION is judged as having none: `cl`
+        // discovers its toolset and folds none of it (#1656), so a `cl` that could not
+        // be asked its version digests the string `cl` and its grammar, whatever its
+        // layout -- the #195 identity of every MSVC ever installed.
+        //
+        // Every other row is judged here on DISCOVERY's roots, because this runs before
+        // the cache read and the folded tree of `OwnTreeWhenTargetingMsvc` is only known
+        // on the walk. The walk asks the question again of the tree it folded -- see
+        // `foldedNothing` below -- so an MSVC-targeting clang whose banner fell back and
+        // whose resource probe named no directory is refused there, never served.
+        auto const foldsNoTree = spec.fingerprintTree == FingerprintTree::None || roots.empty();
+        if (spec.includeDiscovery != IncludeDiscovery::None && foldsNoTree && banner == NormalizedCompilerName(compiler))
             return IdentityDefect::NoEvidence;
         return IdentityDefect::None;
     }();
@@ -1337,9 +1403,11 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     // Not READ, for the same reason from the other end: an earlier failure may
     // already have written one, and the stamp cannot tell it from a good entry.
     //
-    // `NoEvidence` is deliberately still cached. It is a stable property of the
-    // machine rather than an accident of one moment, and re-walking a toolchain that
-    // will reach the same answer buys nothing.
+    // `NoEvidence` decided HERE, on discovery's roots, is deliberately still cached. It
+    // is a stable property of the machine rather than an accident of one moment, and
+    // re-walking a toolchain that will reach the same answer buys nothing. The one
+    // decided on the walk (`foldedNothing` below) is not cached, because a later hit
+    // asks only discovery's roots and would serve it.
     //
     // A cache HIT needs only this test, because a hit did no walk: the entry it
     // returns was written by a run that completed one.
@@ -1352,10 +1420,30 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
                                        .evidence = std::move(evidence) };
     }
 
+    // Which of those roots the digest walks is the driver row's answer, asked only
+    // here so a hit spawns nothing for it (#1656). A probe it needed that could not be
+    // run is the unrun probe one layer down: the digest would describe a different
+    // tree from every machine that ran it, so it is neither served nor cached, and it
+    // carries no evidence -- `ToolchainIdentity::evidence` is disengaged for exactly
+    // that defect.
+    auto const walked = FingerprintIncludeRoots(runner, host, compiler, spec, discovered);
+    if (!walked.answered)
+        evidence.reset();
+
     // The expensive part, reached only on a miss or a forced refresh.
-    auto scan = ProbeToolchainFiles(roots, parallel);
+    auto scan = ProbeToolchainFiles(walked.roots, parallel);
     auto const complete = scan.complete;
     auto const fingerprint = ComputeToolchainFingerprint(banner, grammar, std::move(scan.files));
+
+    // `NoEvidence` asked again, of the tree the digest FOLDED, which only the walk
+    // knows. It differs from `probeDefect` only where the walk selected fewer roots
+    // than discovery found -- an MSVC-targeting clang whose resource probe named no
+    // directory -- and there a fallback banner over no tree is the string `clang++`
+    // and its grammar, every such install alike. Not cached, for the reason it was
+    // not caught above: a later HIT asks only discovery's roots, and would serve it.
+    auto const foldedNothing = probeDefect == IdentityDefect::None && walked.answered
+                               && spec.includeDiscovery != IncludeDiscovery::None && walked.roots.empty()
+                               && banner == NormalizedCompilerName(compiler);
 
     // A short walk is excluded from the cache for a HARSHER reason than an unrun
     // probe is, and this is the line that matters most in this function. An unrun
@@ -1364,7 +1452,7 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     // stamped input identical -- the path and the mtime of each root, never their
     // contents -- so the short digest would validate against its own stamp forever,
     // and no later run would ever walk again to notice.
-    if (discovered.answered && complete && !stamp.empty() && !cachePath.empty())
+    if (discovered.answered && walked.answered && !foldedNothing && complete && !stamp.empty() && !cachePath.empty())
         WriteCacheAtomically(cachePath, stamp, fingerprint);
 
     // Mutually exclusive in practice -- every probe-level defect leaves the root list
@@ -1373,6 +1461,10 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     auto const defect = [&] {
         if (probeDefect != IdentityDefect::None)
             return probeDefect;
+        if (!walked.answered)
+            return IdentityDefect::UnrunProbe;
+        if (foldedNothing)
+            return IdentityDefect::NoEvidence;
         return complete ? IdentityDefect::None : IdentityDefect::PartialTree;
     }();
     return ToolchainIdentity { .fingerprint = fingerprint, .defect = defect, .evidence = std::move(evidence) };

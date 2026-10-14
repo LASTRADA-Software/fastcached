@@ -308,6 +308,7 @@ namespace
           .usesDepfile = false,
           .includeDiscovery = IncludeDiscovery::None,
           .targetDiscovery = TargetDiscovery::None,
+          .fingerprintTree = FingerprintTree::DiscoveredRoots,
           .includeProbeFlags = {},
           .targetProbeFlags = {},
           // `--version` even here. An unrecognised driver is not cached, so this
@@ -324,13 +325,19 @@ namespace
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false,
           // Layout rather than environment, because a Windows SERVICE inherits no
-          // `INCLUDE`, and a worker started that way would otherwise carry no
-          // toolchain content in its fingerprint at all. See the enumerator.
+          // `INCLUDE`. The roots feed the fingerprint cache's stamp and the node's
+          // re-survey, never the fingerprint (`fingerprintTree` below). See the
+          // enumerator.
           .includeDiscovery = IncludeDiscovery::MsvcLayout,
           // Nothing to ask and nothing to state: `cl` has no `-###` and no
           // `--target`. Which code generator runs is decided by WHICH `cl.exe` is
           // invoked, and a launcher cannot restate that on a command line.
           .targetDiscovery = TargetDiscovery::None,
+          // Banner and grammar only (#1656). The roots above are the toolset `cl`
+          // lives in and the newest SDK, a worker opens neither for a preprocessed
+          // compile, and an installed VS language pack's IntelliSense XML in the
+          // toolset's `include` split two otherwise identical machines.
+          .fingerprintTree = FingerprintTree::None,
           .includeProbeFlags = {},
           .targetProbeFlags = {},
           // EMPTY, and that is the probe: `cl` prints its banner on every
@@ -358,6 +365,8 @@ namespace
           // from that same borrowed install and DOES bake into code generation.
           // Stated on the dispatch line instead of digested into an identity.
           .targetDiscovery = TargetDiscovery::ClangDriverLine,
+          // Its discovery already names only its own resource directory.
+          .fingerprintTree = FingerprintTree::DiscoveredRoots,
           .includeProbeFlags = {},
           .targetProbeFlags = MsvcTargetProbe,
           .versionFlags = VersionProbe },
@@ -379,6 +388,10 @@ namespace
           // version string covers x86_64 and aarch64 alike, and an arch-independent
           // translation unit keys the same on both.
           .targetDiscovery = TargetDiscovery::GnuTargetLine,
+          // No gcc targets MSVC, so this keeps every root for gcc itself. It is the
+          // Clang row's answer because a `cc`/`c++` that IS an MSVC-targeting clang
+          // reaches this row by its stem, and must fingerprint as the Clang row does.
+          .fingerprintTree = FingerprintTree::OwnTreeWhenTargetingMsvc,
           .includeProbeFlags = GnuIncludeProbe,
           .targetProbeFlags = GnuTargetProbe,
           .versionFlags = VersionProbe },
@@ -393,6 +406,11 @@ namespace
           .usesDepfile = true,
           .includeDiscovery = IncludeDiscovery::GnuVerbose,
           .targetDiscovery = TargetDiscovery::ClangDriverLine,
+          // On Windows its `-v` list is clang's resource directory plus the VC
+          // toolset and the SDK it borrows, which it is identified without, as
+          // `clang-cl` is; anywhere else the list is libstdc++ or an SDK it reads,
+          // and stays folded (#1656).
+          .fingerprintTree = FingerprintTree::OwnTreeWhenTargetingMsvc,
           .includeProbeFlags = GnuIncludeProbe,
           .targetProbeFlags = GnuTargetProbe,
           .versionFlags = VersionProbe },

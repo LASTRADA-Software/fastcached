@@ -194,9 +194,10 @@ struct ServedToolchain
 ///
 /// The bare form exists because the fingerprint stopped being something a person
 /// can derive. It used to be the compiler's `--version` line, which an operator
-/// could read off a terminal; it is now a digest over the whole include tree, and
-/// requiring that to be pasted into a config would make every toolchain update a
-/// manual two-step that silently un-registers a worker when somebody forgets.
+/// could read off a terminal; it is now a digest of the banner, the grammar and the
+/// include tree the driver owns (`Cc::FingerprintTree`), and requiring that to be
+/// pasted into a config would make every toolchain update a manual two-step that
+/// silently un-registers a worker when somebody forgets.
 ///
 /// The override is kept because it is the only way to run a worker whose compiler
 /// this process cannot execute -- a cross-compiler, or a wrapper that must not be

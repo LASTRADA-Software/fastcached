@@ -39,7 +39,12 @@ struct ToolchainFile
 /// A fingerprint mismatch merely disables distribution, so a bump here is cheap;
 /// a false *match* would dispatch to the wrong toolchain, which is the failure
 /// this whole mechanism exists to prevent.
-inline constexpr std::string_view FingerprintSchema = "toolchain-v2";
+///
+/// v3 (#1656): `cl` folds no include tree and a clang targeting MSVC folds only its
+/// own resource directory (`FingerprintTree`), so the same toolchain digests
+/// differently under v2 and v3. The fingerprint cache's stamp folds this tag, so an
+/// entry written under v2 is a miss rather than a v2 value served as a v3 one.
+inline constexpr std::string_view FingerprintSchema = "toolchain-v3";
 
 /// Compute a toolchain fingerprint from a compiler identity and its include tree.
 ///
@@ -48,7 +53,12 @@ inline constexpr std::string_view FingerprintSchema = "toolchain-v2";
 /// below be a unit test rather than a fixture with a real compiler installed.
 ///
 /// The banner is folded in as well as the files, because the two answer different
-/// questions and neither subsumes the other. A banner alone is what the cache key
+/// questions and neither subsumes the other -- WHERE the toolchain owns a tree. Which
+/// files are passed is the driver row's `FingerprintTree`: a tree the driver merely
+/// BORROWS (the VC toolset and the Windows SDK, under `cl` and under any clang
+/// targeting MSVC) is never passed, because a worker opens no header from it for a
+/// preprocessed compile, and passing it split machines on an installed VS language
+/// pack's IntelliSense XML (#1656). A banner alone is what the cache key
 /// already uses, and it is too weak here: two machines can print an identical
 /// `--version` while resolving different libstdc++ headers, and for *distribution*
 /// that produces a silently wrong object rather than the stale path a replay guard

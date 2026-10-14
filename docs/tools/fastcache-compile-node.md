@@ -465,10 +465,11 @@ compilers a machine holds is a fact the worker can establish.
 A compiler that is found but **cannot be executed** is dropped at startup, named,
 with the layout that found it — rather than registering and failing every job it
 is sent. So is one whose fingerprint would say nothing about which compiler it
-is: a driver this build cannot ask for a version *and* whose include tree could
-not be located digests to its own basename, which every install of that compiler
-on earth would also produce. Pin such a toolchain with
-`--toolchain=<fingerprint>=<compiler>` if you want it served anyway. A worker
+is: a driver this build cannot ask for a version *and* whose fingerprint folds no
+include tree — none could be located, or it is `cl`, which folds none — digests to
+its own basename, which every install of that compiler on earth would also
+produce. Pin such a toolchain with `--toolchain=<fingerprint>=<compiler>` if you
+want it served anyway. A worker
 that ends up with nothing to serve refuses to start and prints where it looked.
 
 ### Where it looks
@@ -495,34 +496,42 @@ Only the bindir matching this machine's own architecture is offered, from either
 row. The other holds a compiler built for a different *host*, which this machine
 cannot run.
 
-The fingerprint is a digest of the compiler's version banner **and its whole
-include tree**, so two machines with the same compiler at different install
-prefixes match, while two machines whose headers differ do not. The banner names
-the target as well as the version — `... Version 19.51.36252 for x64` — which is
-what tells the x86 and x64 `cl.exe` of one toolset apart, since those two share an
-include tree exactly. Matching is
+The fingerprint is a digest of the compiler's version banner, its argument
+grammar **and the include tree the compiler owns**, so two machines with the same
+compiler at different install prefixes match, while two machines whose own headers
+differ do not. A tree the compiler merely *borrows* — the VC toolset and the
+Windows SDK, under `cl` and under any clang targeting MSVC — is left out: a worker
+compiles text the client already preprocessed and opens none of it, and folding it
+in split machines on nothing but an installed Visual Studio language pack, whose
+IntelliSense XML lands in the toolset's `include` directory (#1656). So two
+Windows machines need the same compiler *version*, not the same SDK or the same
+Visual Studio languages. The banner names the target as well as the version —
+`... Version 19.51.36252 for x64` — which is what tells the x86 and x64 `cl.exe`
+of one toolset apart. Matching is
 byte-identical and cannot be loosened: an over-strict match costs a local
 compile, an over-loose one produces a silently wrong object that is then stored
 under a key other machines fetch.
 
-Computing it walks the include tree, which takes a few seconds the first time a
-machine sees a toolchain and is cached afterwards.
+Computing it walks that tree, which takes a few seconds the first time a machine
+sees a toolchain and is cached afterwards.
 
-**Which tree, per driver.** GCC and Clang are asked directly (`-E -v`), and so is
-`clang-cl` (`-print-resource-dir`). `cl` prints no search list at any verbosity, so
-its tree is read off its install layout instead: the `VC\Tools\MSVC\<version>`
-toolset it lives inside, plus the newest Windows SDK the registry names. (Its
-*version* it does state — on every invocation, which is why it is asked for it with
-no options at all.) `clang-cl` covers only its own resource
-directory, `<prefix>\lib\clang\<version>\include`: it borrows the VC toolset and
-the SDK rather than owning them, and a worker compiles text the client already
-preprocessed, so it opens no header from either.
+**Which tree, per driver.** GCC and Clang are asked directly (`-E -v`) and fold
+every directory they list — libstdc++, an Xcode SDK. A Clang whose target is
+`*-windows-msvc*` folds only its own resource directory, as `clang-cl` does
+(`-print-resource-dir`): `<prefix>\lib\clang\<version>\include`. `cl` folds **no**
+tree: its banner names its toolset version and target, and everything its layout
+leads to — the `VC\Tools\MSVC\<version>` toolset it lives inside, the newest
+Windows SDK the registry names — is borrowed in the sense above. (Its *version* it
+does state — on every invocation, which is why it is asked for it with no options
+at all.) The layout is still read, for the cache's validity stamp and so a node
+notices an SDK or toolset update and re-surveys.
 
 Neither takes its answer from `INCLUDE`, which a developer command prompt sets
 and a Windows service never inherits — that is why a service-run worker and a
 developer-prompt launcher agree. `cl` still falls back to it for a driver outside
-any `VC\Tools\MSVC` layout, because a banner alone cannot see a patched header;
-`clang-cl` never does, since it owns a resource directory it can be asked for.
+any `VC\Tools\MSVC` layout, for the stamp and the re-survey above — never for the
+fingerprint, which folds no tree under `cl`; `clang-cl` never does, since it owns a
+resource directory it can be asked for.
 
 ### When no worker matches
 
@@ -535,9 +544,10 @@ journalctl -u fastcache-compile-node | grep 'serving'     # on the worker
 ```
 
 They must be identical. If they are not, the two machines really do have
-different toolchains — different patch releases, different SDKs, a vendored
-header that differs. `--print-toolchain-fingerprint` recomputes rather than
-reading the cache, so it also repairs a stale entry on its way past.
+different toolchains — different patch releases, a different Xcode SDK or
+sysroot, a vendored header that differs. `--print-toolchain-fingerprint`
+recomputes rather than reading the cache, so it also repairs a stale entry on
+its way past.
 
 ### A node that never appears in the fleet at all
 

@@ -57,16 +57,18 @@ namespace
     ///
     /// What survives as the reason for one directory is cost and identity hygiene, not
     /// safety: offering all of them registers one machine as several toolchains, each
-    /// paying its own include-tree survey, and the survey is the expensive half of
-    /// startup -- and capacity is per NODE, so six registrations of one machine is a
-    /// capacity question rather than a table edit. That is #201, which already exists;
-    /// widening this table is its work and not a side effect of correcting a sentence.
+    /// paying its own survey (no longer a walk for `cl`, which folds no include tree
+    /// since #1656, but still a spawn and a stamp each) -- and capacity is per NODE, so
+    /// six registrations of one machine is a capacity question rather than a table
+    /// edit. That is #201, which already exists; widening this table is its work and
+    /// not a side effect of correcting a sentence.
     ///
-    /// The residual, stated rather than smoothed over: a `cl` that RUNS and exits
-    /// non-zero falls back to the normalized basename, and every variant collapses onto
-    /// `cl` again. A probe that could not be spawned at all is already refused
-    /// (`exitCode == NotSpawned`, neither served nor cached); this narrower arm is not,
-    /// and no bare `cl` measured here reaches it.
+    /// A `cl` that RUNS and exits non-zero falls back to the normalized basename, and
+    /// every variant would collapse onto `cl` again. Since #1656 that identity is
+    /// refused rather than served: `cl` folds no include tree, so a fallback banner is
+    /// `IdentityDefect::NoEvidence` whatever its layout. A probe that could not be
+    /// spawned at all was already refused (`exitCode == NotSpawned`, neither served nor
+    /// cached), and no bare `cl` measured here reaches either arm.
     ///
     /// **Which one is the MACHINE's, not this build's** (#146). It was a `#if` on
     /// `_M_ARM64`/`_M_X64`, so an x64 build searched `bin/Hostx64/x64` wherever it

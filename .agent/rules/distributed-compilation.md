@@ -3065,9 +3065,12 @@ drivers were on it and both had to come off, by different routes, because *owns*
 means different things to them:
 
 - **`cl` owns the VC toolset it lives inside**, so `MsvcToolsetIncludeRoots` walks up
-  from the driver to `VC\Tools\MSVC\<version>`. It keeps an `INCLUDE` fallback
-  because it must: a banner cannot see a patched header, so a wrapper outside that
-  layout would be left with an identity carrying no toolchain content at all.
+  from the driver to `VC\Tools\MSVC\<version>`. Those roots no longer reach its
+  FINGERPRINT (the corollary below, #1656). Discovery is kept for the fingerprint
+  cache's stamp and so a node notices a toolset or SDK update and re-surveys; both are
+  per-process local checks that never cross a machine, so a service and a prompt
+  disagreeing about these roots costs a recompute and no longer affects matching. The
+  `INCLUDE` fallback stays for that stamp, for a wrapper outside the layout.
 - **`clang-cl` owns only its resource directory** —
   `<prefix>/lib/clang/<version>/include` — and it is **asked** for it
   (`-print-resource-dir`) rather than having it derived. That is correctness, not
@@ -3082,11 +3085,30 @@ means different things to them:
   one clang from another.
 
 The corollary is the part that looks like an omission and is not: **the VC toolset and
-the Windows SDK stay out of `clang-cl`'s identity.** It borrows them rather than owning
-them, a worker compiles text the client already preprocessed and so opens no header
-from either, and the newest-kit-on-the-machine rule that would pick them splits two
-boxes running one clang-cl with different SDKs installed — spending real matches to buy
-no discrimination.
+the Windows SDK stay out of every fingerprint** — `clang-cl`'s since #145, and `cl`'s
+and an MSVC-targeting `clang`/`clang++`'s since
+[#1656](https://github.com/LASTRADA-Software/fastcached/issues/1656). A worker compiles
+text the client already preprocessed and so opens no header from either, so folding them
+buys no discrimination while spending real matches: the newest-kit rule splits two boxes
+with different SDKs installed, and an installed VS language pack drops IntelliSense XML
+into the toolset's `include` and split two office machines on one toolset and one SDK.
+Which tree a fingerprint walks is `DriverSpec::fingerprintTree`, a column, never an `if`
+on the driver: `cl` folds **none** (its banner names toolset and target, #195), a clang
+whose `-v` probe names a `*-windows-msvc*` target folds only its resource directory (the
+`gcc` row too, since a `cc` that IS such a clang reaches it by its stem), and every
+other GNU driver keeps its whole `-v` list — libstdc++ IS read, and two machines
+can differ in it under one `--version`.
+- **That makes the banner the whole of `cl`'s identity, so a FALLBACK banner is
+  `NoEvidence` under `cl` whatever its layout** — a row that folds no tree BY
+  CONSTRUCTION is judged as having none, or #195's "every MSVC is `cl`" comes back behind
+  a located layout. Every other row is judged on discovery's roots before the cache read,
+  and asked AGAIN of the tree it folded on the walk: an MSVC-targeting clang whose banner
+  fell back and whose `-print-resource-dir` named no directory folds nothing, so it is
+  `NoEvidence` too, and NOT cached, since a later hit asks only discovery's roots and
+  would serve it.
+- **The fingerprint cache's stamp folds `FingerprintSchema`** (stamp v2), so a schema bump
+  misses every older entry rather than serving a value the new rules would not compute.
+  Before it, nothing tied a cached value to the rules that produced it.
 
 **A cold start fingerprints several toolchains at once, and reports them in table
 order.** A cold walk is seconds per toolchain and a surveyed machine routinely holds

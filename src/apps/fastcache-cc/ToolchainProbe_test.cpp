@@ -19,10 +19,12 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -677,7 +679,8 @@ TEST_CASE("A directory absent from the layout is not offered as a root", "[toolc
 {
     // A toolchain without ATL/MFC installed is ordinary. `ProbeToolchainFiles`
     // would skip the root anyway; emitting it only makes the list harder to read
-    // beside an operator's own INCLUDE when a fingerprint disagrees.
+    // beside an operator's own INCLUDE. (These roots no longer reach a `cl`
+    // fingerprint, #1656, so it is the stamp's list being read.)
     ScriptedToolchainHost host;
     constexpr std::string_view toolset = "C:/VS/VC/Tools/MSVC/14.0.0";
     host.AddExecutable(std::string { toolset } + "/bin/Hostx64/x64/cl.exe");
@@ -789,7 +792,9 @@ TEST_CASE("An empty 32-bit KitsRoot10 still reaches the native view", "[toolchai
     // alone never read the native view, and the machine's `cl` lost the whole SDK
     // half of its identity while the VC half kept `MsvcLayout` off its `INCLUDE`
     // fallback too. It then fingerprinted differently from an identically
-    // toolchained peer, with no diagnostic at either end.
+    // toolchained peer, with no diagnostic at either end. (That was before #1656;
+    // those roots now reach only the stamp, so the cost is a re-survey, never a
+    // split.)
     ScriptedToolchainHost host;
     constexpr std::string_view roots = R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)";
     constexpr std::string_view kits = "C:/Program Files (x86)/Windows Kits/10";
@@ -809,8 +814,10 @@ TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[tool
     // `cl` on every MSVC toolset in existence. Two nodes on different toolsets were
     // interchangeable to the scheduler, which is the false match the fingerprint
     // exists to prevent and the one that yields a silently wrong object. The banner
-    // names the toolset now; the roots are still what make the digest sensitive to
-    // a patched header, which no banner is.
+    // names the toolset now, and the fingerprint folds none of these roots (#1656).
+    // Discovery is kept for the fingerprint cache's stamp and to notice a toolset or
+    // SDK update; those are local checks, so a service and a prompt disagreeing here
+    // would cost a recompute and no longer a match. The agreement is still pinned.
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
 
     ScriptedToolchainHost service;
@@ -830,67 +837,16 @@ TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[tool
     CHECK(std::ranges::find(underPrompt, "C:/somewhere/else") == underPrompt.end());
 }
 
-TEST_CASE("Two MSVC toolsets do not fingerprint identically", "[toolchain-probe]")
-{
-    // The other half of the guarantee, and the half nothing asserted. The case
-    // above pins that one toolchain reaches ONE digest however it was reached;
-    // this pins that two toolchains reach TWO -- "never two different ones",
-    // which is precisely what a banner-only MSVC fingerprint dropped and what the
-    // layout exists to restore. It was evidenced only by a measurement on one
-    // machine, so nothing would have caught its regression.
-    //
-    // Driven through the layout walk rather than the launcher's whole path, which
-    // the case above already covers. Each link here is tested on its own too --
-    // the walk yields per-toolset roots, the digest is content-sensitive -- so a
-    // reader had to compose them to believe the property the fleet depends on.
-    // Asserting it in one place is the point, not extra coverage of the links.
-    FastCache::Testing::ScratchDirectory machine { "fc-tcp-two-toolsets" };
-    ScriptedToolchainHost host;
-
-    // Real files, because `ProbeToolchainFiles` walks the filesystem rather than
-    // the scripted machine -- the scripted half only has to agree with it.
-    auto const describe = [&](std::string_view version, std::string_view stlUpdate) {
-        auto const toolset = "vs/VC/Tools/MSVC/" + std::string { version };
-        machine.Write(toolset + "/include/yvals_core.h", stlUpdate);
-        machine.Write(toolset + "/include/vector", "template <class T> struct vector {};");
-
-        auto const compiler = (machine / (toolset + "/bin/Hostx64/x64/cl.exe")).generic_string();
-        host.AddExecutable(compiler);
-        host.AddDirectory((machine / (toolset + "/include")).generic_string());
-        return compiler;
-    };
-
-    // Two toolsets differ in what their headers SAY -- `yvals_core.h` carries
-    // `_MSVC_STL_UPDATE` -- and that is what has to separate them, not the version
-    // in the path: `ProbeToolchainFiles` records every file relative to its own
-    // root, so that one toolchain at two install prefixes still matches.
-    auto const older = describe("14.29.30133", "#define _MSVC_STL_UPDATE 202008L\n");
-    auto const newer = describe("14.51.36231", "#define _MSVC_STL_UPDATE 202506L\n");
-
-    auto const digestOf = [&](std::string const& compiler) {
-        auto const roots = MsvcToolsetIncludeRoots(host, compiler);
-        REQUIRE_FALSE(roots.empty());
-        auto const scan = WalkSerially(roots);
-        // Not vacuous: two empty walks would digest equal and the check below would
-        // pass having compared nothing.
-        REQUIRE(scan.files.size() == 2);
-        // "cl" for both, which is what the banner fallback gives every MSVC
-        // toolchain -- so the roots are the only thing that can tell these apart.
-        return ComputeToolchainFingerprint("cl", DriverGrammarName(DriverFamily::Msvc), scan.files);
-    };
-
-    CHECK(digestOf(older) != digestOf(newer));
-}
-
 TEST_CASE("INCLUDE is the fallback when no toolset layout can be determined", "[toolchain-probe]")
 {
     // A wrapper named cl.exe outside any VC layout -- ON A MACHINE THAT HAS AN SDK,
     // which is the whole point of the case. `WindowsKitIncludeRoots` answers from
     // the registry alone and knows nothing about which compiler is being
     // identified, so gating the fallback on the MERGED roots would leave such a
-    // compiler with SDK roots only: no VC headers in its identity, and two
-    // different wrapped toolsets digesting identically. That is the false match the
-    // whole mechanism exists to prevent, reached by the fix for it.
+    // compiler with SDK roots only: no VC headers in what its stamp watches. Before
+    // #1656 that was two different wrapped toolsets digesting identically; since then
+    // no `cl` fingerprint folds these roots, and the gate decides only what the stamp
+    // and the node's re-survey watch.
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
     ScriptedToolchainHost host;
     DescribeWindowsMachine(host);
@@ -1027,13 +983,13 @@ TEST_CASE("A clang-cl service and a developer prompt derive the same roots", "[t
 TEST_CASE("An undiscoverable clang-cl layout does not fall back to INCLUDE", "[toolchain-probe]")
 {
     // Where this mechanism deliberately parts company with `MsvcLayout`. That one
-    // falls back to `INCLUDE` because a `cl` outside the VC layout would otherwise
-    // be left with a `NoEvidence` identity -- its banner is the constant `cl`, so the
-    // headers are the only identity it has. `clang-cl` announces a genuine version,
-    // so a driver that cannot answer degrades to a banner-only fingerprint, which is
-    // weaker but still tells one clang from another. Reading `INCLUDE` here would
-    // buy that wrapper nothing and reintroduce the very asymmetry this fixes: a
-    // service and a developer prompt disagreeing about a compiler neither can place.
+    // falls back to `INCLUDE` for what its stamp watches; it no longer reaches `cl`'s
+    // fingerprint at all (#1656), whose banner names its toolset. `clang-cl`
+    // announces a genuine version, so a driver that cannot answer degrades to a
+    // banner-only fingerprint, which is weaker but still tells one clang from
+    // another. Reading `INCLUDE` here would buy that wrapper nothing and reintroduce
+    // the very asymmetry this fixes: a service and a developer prompt disagreeing
+    // about a compiler neither can place.
     ScriptedRunner runner { CompileRun { .exitCode = 1, .out = {}, .err = {} } };
     ScriptedToolchainHost host;
     DescribeWindowsMachine(host);
@@ -2526,4 +2482,597 @@ TEST_CASE("A Windows child's CRLF first line is stripped once", "[toolchain-prob
     auto const identity = ProbeDriverIdentity(runner, "clang-cl");
 
     CHECK(identity.banner == "clang version 22.1.3");
+}
+
+// --- which tree a fingerprint folds (#1656) -------------------------------------
+
+namespace
+{
+/// A Visual Studio toolset and a Windows SDK written to DISK under @p machine, and
+/// described to @p host at the same paths.
+///
+/// On disk because `ProbeToolchainFiles` walks the real filesystem: a fingerprint
+/// that still folded these trees would digest every byte written here, and that is
+/// what lets the cases below go red when the selection is neutered rather than pass
+/// over a tree nobody could have read.
+///
+/// @param machine Where the install lives.
+/// @param host The scripted machine to describe it to.
+/// @param stlUpdate What the toolset's `yvals_core.h` says.
+/// @param sdkHeader What the SDK's `windows.h` says.
+/// @return The `cl.exe` the toolset holds.
+[[nodiscard]] std::string WriteMsvcInstall(FastCache::Testing::ScratchDirectory const& machine,
+                                           ScriptedToolchainHost& host,
+                                           std::string_view stlUpdate,
+                                           std::string_view sdkHeader)
+{
+    constexpr std::string_view toolset = "vs/VC/Tools/MSVC/14.51.36231";
+    constexpr std::string_view kit = "kits/Include/10.0.26100.0";
+    auto const at = [&](std::string const& relative) {
+        return (machine / relative).generic_string();
+    };
+
+    machine.Write(std::string { toolset } + "/include/yvals_core.h", stlUpdate);
+    machine.Write(std::string { toolset } + "/atlmfc/include/atlbase.h", "#pragma once\n");
+    machine.Write(std::string { kit } + "/um/windows.h", sdkHeader);
+    machine.Write(std::string { kit } + "/ucrt/stdio.h", "#pragma once\n");
+
+    auto const compiler = at(std::string { toolset } + "/bin/Hostx64/x64/cl.exe");
+    host.AddExecutable(compiler);
+    host.AddDirectory(at(std::string { toolset } + "/include"));
+    host.AddDirectory(at(std::string { toolset } + "/atlmfc/include"));
+    host.AddRegistryValue(RegistryHive::LocalMachine,
+                          R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)",
+                          "KitsRoot10",
+                          at("kits") + "/",
+                          RegistryView::ThirtyTwoBit);
+    host.AddDirectory(at(std::string { kit } + "/um"));
+    host.AddDirectory(at(std::string { kit } + "/ucrt"));
+    return compiler;
+}
+
+/// The banner of the toolset `WriteMsvcInstall` lays out.
+constexpr std::string_view Cl1451Banner = "Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36231 for x64";
+
+/// `cl`'s fingerprint over a machine, every step of the production path.
+///
+/// Refreshed rather than read from the cache, so two "machines" in one process can
+/// never see each other's entry -- each case asserts what a COMPUTATION answers.
+///
+/// @param host The scripted machine.
+/// @param compiler Its `cl.exe`.
+/// @param banner What `cl` says it is.
+/// @return The identity, and how many processes computing it spawned.
+[[nodiscard]] std::pair<ToolchainIdentity, int> ClIdentity(ScriptedToolchainHost& host,
+                                                           std::string const& compiler,
+                                                           std::string_view banner)
+{
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
+    auto identity = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Cl), /*forceRefresh=*/true);
+    return { std::move(identity), runner.Calls() };
+}
+
+/// The include trees a GNU-grammar clang lists under `-E -v`, written to disk.
+struct ClangMachine
+{
+    std::string compiler;           ///< The driver's path.
+    std::string resourceDir;        ///< What `-print-resource-dir` prints.
+    std::vector<std::string> roots; ///< The `-v` search list, resource include first.
+};
+
+/// What a GNU-grammar clang prints under `-E -v`: a `-cc1` line naming @p triple, the
+/// `Target:` header naming @p header, and @p roots as the search list.
+///
+/// Shaped like the real capture from VS 18's clang++ 22.1.3, down to the quoted
+/// driver path on the frontend line -- which is the line the triple is read from.
+///
+/// @param triple The `-cc1` triple.
+/// @param header The `Target:` header's value.
+/// @param roots The search list.
+/// @return The stderr text.
+[[nodiscard]] std::string ClangVerbose(std::string_view triple, std::string_view header, std::span<std::string const> roots)
+{
+    auto text = std::format("clang version 22.1.3\nTarget: {}\nThread model: posix\n"
+                            " \"C:\\\\LLVM\\\\bin\\\\clang++.exe\" -cc1 -triple {} -E -x c++ NUL\n"
+                            "#include \"...\" search starts here:\n#include <...> search starts here:\n",
+                            header,
+                            triple);
+    for (auto const& root: roots)
+        text += " " + root + "\n";
+    return text + "End of search list.\n";
+}
+
+/// Answers the two probes a GNU-grammar clang is asked for its fingerprint.
+///
+/// Keyed on the ARGV rather than on the order of spawns, so a case cannot pass by a
+/// probe being skipped and the next answer landing on the wrong question.
+class ClangProbeRunner final: public IProcessRunner
+{
+  public:
+    ClangProbeRunner(std::string verbose, std::string resourceDir):
+        _verbose { std::move(verbose) },
+        _resourceDir { std::move(resourceDir) }
+    {
+    }
+
+    CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+
+    CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        if (!std::ranges::contains(argv, std::string { "-print-resource-dir" }))
+            return CompileRun { .exitCode = 0, .out = {}, .err = _verbose };
+        ++_resourceProbes;
+        if (_refuseResourceProbe)
+            return CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} };
+        return CompileRun { .exitCode = 0, .out = _resourceDir + "\n", .err = {} };
+    }
+
+    /// Make the resource-directory probe fail to spawn from now on.
+    void RefuseResourceProbe() noexcept
+    {
+        _refuseResourceProbe = true;
+    }
+
+    /// @return How many times `-print-resource-dir` was asked.
+    [[nodiscard]] int ResourceProbes() const noexcept
+    {
+        return _resourceProbes;
+    }
+
+  private:
+    std::string _verbose;
+    std::string _resourceDir;
+    int _resourceProbes { 0 };
+    bool _refuseResourceProbe { false };
+};
+
+/// Write a clang install's resource tree, and one more search root, under @p machine.
+///
+/// @param machine Where it lives.
+/// @param host The scripted machine.
+/// @param resourceHeader What the resource tree's `stddef.h` says.
+/// @param otherRoot The other search root, relative to @p machine.
+/// @param otherContent What that root's `vector` says.
+/// @return The driver, its resource directory and the search list.
+[[nodiscard]] ClangMachine WriteClangInstall(FastCache::Testing::ScratchDirectory const& machine,
+                                             ScriptedToolchainHost& host,
+                                             std::string_view resourceHeader,
+                                             std::string_view otherRoot,
+                                             std::string_view otherContent)
+{
+    machine.Write("llvm/lib/clang/22/include/stddef.h", resourceHeader);
+    machine.Write(std::string { otherRoot } + "/vector", otherContent);
+    auto const compiler = (machine / "llvm/bin/clang++.exe").generic_string();
+    host.AddExecutable(compiler);
+    host.AddDirectory((machine / "llvm/lib/clang/22/include").generic_string());
+    return ClangMachine { .compiler = compiler,
+                          .resourceDir = (machine / "llvm/lib/clang/22").generic_string(),
+                          .roots = { (machine / "llvm/lib/clang/22/include").generic_string(),
+                                     (machine / otherRoot).generic_string() } };
+}
+
+/// The MSVC-targeting triple as VS 18's clang++ spells it on the `-cc1` line.
+constexpr std::string_view MsvcTriple = "x86_64-pc-windows-msvc19.51.36231";
+
+/// The same target as the `Target:` header spells it, unversioned.
+constexpr std::string_view MsvcTargetHeader = "x86_64-pc-windows-msvc";
+
+/// A Linux triple, spelled alike on the `-cc1` line and in the header.
+constexpr std::string_view LinuxTriple = "x86_64-pc-linux-gnu";
+
+/// The banner every clang below prints.
+constexpr std::string_view Clang22Banner = "clang version 22.1.3";
+
+/// A GNU-grammar clang's fingerprint over one machine, refreshed.
+///
+/// @param runner Answers its probes.
+/// @param host The scripted machine.
+/// @param clang The install.
+/// @return The identity.
+[[nodiscard]] ToolchainIdentity ClangIdentity(ClangProbeRunner& runner,
+                                              ScriptedToolchainHost& host,
+                                              ClangMachine const& clang)
+{
+    return CachedFingerprintSerially(
+        runner, host, clang.compiler, Clang22Banner, DriverOf(Flavor::Clang), /*forceRefresh=*/true);
+}
+} // namespace
+
+TEST_CASE("A triple names the MSVC environment or does not", "[toolchain-probe][fingerprint-tree]")
+{
+    REQUIRE(TargetsMsvc("x86_64-pc-windows-msvc"));
+    CHECK(TargetsMsvc("x86_64-pc-windows-msvc19.51.36231"));
+    CHECK(TargetsMsvc("aarch64-pc-windows-msvc19.44.35207"));
+
+    // Windows, but reading headers of their own: MinGW and Cygwin ship them.
+    REQUIRE_FALSE(TargetsMsvc("x86_64-w64-windows-gnu"));
+    CHECK_FALSE(TargetsMsvc("x86_64-pc-windows-cygnus"));
+    CHECK_FALSE(TargetsMsvc("x86_64-pc-linux-gnu"));
+    CHECK_FALSE(TargetsMsvc(""));
+}
+
+TEST_CASE("An installed Visual Studio language pack does not split cl", "[toolchain-probe][fingerprint-tree]")
+{
+    // Issue #1656, as measured on the office fleet: one VS 18 toolset, one SDK, and two
+    // fingerprints, because the German language pack drops 32 IntelliSense XML files
+    // into `VC\Tools\MSVC\<version>\include\de-DE`. The banner already names the toolset
+    // and its target; the trees are the toolset `cl` lives in and an SDK it borrows,
+    // and a worker opens neither for a preprocessed compile.
+    FastCache::Testing::ScratchDirectory english { "fc-tcp-langpack-en" };
+    FastCache::Testing::ScratchDirectory german { "fc-tcp-langpack-de" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-langpack-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost englishHost;
+    ScriptedToolchainHost germanHost;
+    auto const englishCl = WriteMsvcInstall(english, englishHost, "#define _MSVC_STL_UPDATE 202506L\n", "// sdk\n");
+    auto const germanCl = WriteMsvcInstall(german, germanHost, "#define _MSVC_STL_UPDATE 202506L\n", "// sdk\n");
+    german.Write("vs/VC/Tools/MSVC/14.51.36231/include/de-DE/array.xml", "<doc>Ein Feld fester Groesse.</doc>");
+
+    // Discovery still finds the trees -- they feed the stamp and the node's evidence --
+    // so the agreement below is the SELECTION's doing, not an empty layout's.
+    REQUIRE_FALSE(MsvcToolsetIncludeRoots(germanHost, germanCl).empty());
+    REQUIRE_FALSE(WindowsKitIncludeRoots(germanHost).empty());
+
+    auto const [a, aSpawns] = ClIdentity(englishHost, englishCl, Cl1451Banner);
+    auto const [b, bSpawns] = ClIdentity(germanHost, germanCl, Cl1451Banner);
+    REQUIRE(a.Usable());
+    REQUIRE(b.Usable());
+    REQUIRE(a.fingerprint == b.fingerprint);
+
+    // `cl` is asked nothing for its fingerprint: the layout is read, and the tree the
+    // row selects is empty by construction.
+    CHECK(aSpawns == 0);
+    CHECK(bSpawns == 0);
+}
+
+TEST_CASE("cl is identified without its toolset's and SDK's header contents", "[toolchain-probe][fingerprint-tree]")
+{
+    // Every header differing, and the banner the same: one toolchain to the fleet. A
+    // patched STL header under one banner is not a case a worker can get wrong,
+    // because it compiles the text the CLIENT preprocessed against the client's own
+    // headers.
+    FastCache::Testing::ScratchDirectory one { "fc-tcp-cl-content-1" };
+    FastCache::Testing::ScratchDirectory two { "fc-tcp-cl-content-2" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-cl-content-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost oneHost;
+    ScriptedToolchainHost twoHost;
+    auto const oneCl = WriteMsvcInstall(one, oneHost, "#define _MSVC_STL_UPDATE 202506L\n", "// kit A\n");
+    auto const twoCl = WriteMsvcInstall(two, twoHost, "#define _MSVC_STL_UPDATE 202508L\n", "// kit B\n");
+
+    auto const [a, aSpawns] = ClIdentity(oneHost, oneCl, Cl1451Banner);
+    auto const [b, bSpawns] = ClIdentity(twoHost, twoCl, Cl1451Banner);
+    REQUIRE(a.fingerprint == b.fingerprint);
+
+    // The trees are still what discovery reports and what the evidence records, so a
+    // node keeps noticing an SDK being installed beside the toolset -- unchanged by
+    // #1656, which moved only what the DIGEST folds.
+    ScriptedRunner reference { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
+    auto const discovered = DiscoverIncludePaths(reference, twoHost, twoCl, DriverOf(Flavor::Cl)).roots;
+    REQUIRE(discovered.size() == 4);
+    REQUIRE(b.evidence.has_value());
+    CHECK(FastCache::Testing::Unwrap(b.evidence).roots == discovered);
+}
+
+TEST_CASE("Two cl toolsets are told apart by their banners", "[toolchain-probe][fingerprint-tree]")
+{
+    // The direction the fix must not break. The trees used to be what separated two
+    // toolsets; since #195 the banner names the version AND the target, and with the
+    // trees gone (#1656) it is the whole of what separates them -- so it has to.
+    FastCache::Testing::ScratchDirectory machine { "fc-tcp-cl-banners" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-cl-banners-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost host;
+    auto const cl = WriteMsvcInstall(machine, host, "#define _MSVC_STL_UPDATE 202506L\n", "// sdk\n");
+
+    auto const x64 = ClIdentity(host, cl, Cl1451Banner).first.fingerprint;
+    auto const older =
+        ClIdentity(host, cl, "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35229 for x64").first.fingerprint;
+    auto const x86 =
+        ClIdentity(host, cl, "Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36231 for x86").first.fingerprint;
+
+    REQUIRE(x64 != older);
+    CHECK(x64 != x86);
+    CHECK(older != x86);
+
+    // And the same banner agrees with itself, or the three checks above would pass on
+    // a digest that separated everything.
+    CHECK(x64 == ClIdentity(host, cl, Cl1451Banner).first.fingerprint);
+}
+
+TEST_CASE("A cl that cannot be asked its version is no identity, whatever its layout", "[toolchain-probe][fingerprint-tree]")
+{
+    // The #195 failure that #1656 would re-open unless this holds: with no tree
+    // folded, a `cl` whose banner fell back to its name digests the string `cl` and its
+    // grammar, which is the identity of every MSVC ever installed. A located layout
+    // used to rescue it, because the tree it folded was evidence; nothing is folded
+    // now.
+    FastCache::Testing::ScratchDirectory machine { "fc-tcp-cl-noevidence" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-cl-noevidence-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost host;
+    auto const cl = WriteMsvcInstall(machine, host, "#define _MSVC_STL_UPDATE 202506L\n", "// sdk\n");
+    REQUIRE_FALSE(MsvcToolsetIncludeRoots(host, cl).empty());
+
+    auto const identity = ClIdentity(host, cl, NormalizedCompilerName(cl)).first;
+    REQUIRE(identity.defect == IdentityDefect::NoEvidence);
+
+    // A real banner over the same layout is the control.
+    CHECK(ClIdentity(host, cl, Cl1451Banner).first.Usable());
+}
+
+TEST_CASE("A clang targeting MSVC is identified by its own tree, not the MSVC it borrows",
+          "[toolchain-probe][fingerprint-tree]")
+{
+    // The `clang++` half of #1656: on Windows its `-v` search list is its resource
+    // directory plus the VC toolset and the SDK, so it split the fleet exactly as `cl`
+    // did. `clang-cl` never did, because `ClangResourceLayout` folds only the resource
+    // tree; a GNU-grammar clang targeting MSVC now folds the same and nothing else.
+    FastCache::Testing::ScratchDirectory one { "fc-tcp-clang-msvc-1" };
+    FastCache::Testing::ScratchDirectory two { "fc-tcp-clang-msvc-2" };
+    FastCache::Testing::ScratchDirectory three { "fc-tcp-clang-msvc-3" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-clang-msvc-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost oneHost;
+    ScriptedToolchainHost twoHost;
+    auto const a = WriteClangInstall(one, oneHost, "// clang 22\n", "msvc/include", "// STL A\n");
+    auto const b = WriteClangInstall(two, twoHost, "// clang 22\n", "msvc/include", "// STL B\n");
+    two.Write("msvc/include/de-DE/vector.xml", "<doc/>");
+
+    ClangProbeRunner oneRunner { ClangVerbose(MsvcTriple, MsvcTargetHeader, a.roots), a.resourceDir };
+    ClangProbeRunner twoRunner { ClangVerbose(MsvcTriple, MsvcTargetHeader, b.roots), b.resourceDir };
+
+    auto const first = ClangIdentity(oneRunner, oneHost, a);
+    auto const second = ClangIdentity(twoRunner, twoHost, b);
+    REQUIRE(first.Usable());
+    REQUIRE(second.Usable());
+    REQUIRE(first.fingerprint == second.fingerprint);
+
+    // Asked for its resource directory once, on the walk -- the `-v` output already
+    // named the target, so that cost no spawn.
+    CHECK(oneRunner.ResourceProbes() == 1);
+
+    // And the resource tree IS folded, so the fingerprint is not banner-only: a
+    // different clang build under one version line still separates. Without this the
+    // agreement above would also pass on a selection that folded nothing.
+    ScriptedToolchainHost threeHost;
+    auto const c = WriteClangInstall(three, threeHost, "// clang 22, patched\n", "msvc/include", "// STL A\n");
+    ClangProbeRunner threeRunner { ClangVerbose(MsvcTriple, MsvcTargetHeader, c.roots), c.resourceDir };
+    CHECK(ClangIdentity(threeRunner, threeHost, c).fingerprint != first.fingerprint);
+
+    // The search list is still the evidence, borrowed roots included: only the digest
+    // narrowed.
+    REQUIRE(second.evidence.has_value());
+    CHECK(FastCache::Testing::Unwrap(second.evidence).roots == b.roots);
+}
+
+TEST_CASE("A clang targeting anything else still folds every tree it searches", "[toolchain-probe][fingerprint-tree]")
+{
+    // The narrowness of #1656. On Linux the `-v` list is libstdc++, which the driver
+    // reads and which two machines can differ in under one `--version` -- the case the
+    // include-tree fingerprint exists for. It stays folded.
+    FastCache::Testing::ScratchDirectory one { "fc-tcp-clang-linux-1" };
+    FastCache::Testing::ScratchDirectory two { "fc-tcp-clang-linux-2" };
+    FastCache::Testing::ScratchDirectory three { "fc-tcp-clang-linux-3" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-clang-linux-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost oneHost;
+    ScriptedToolchainHost twoHost;
+    ScriptedToolchainHost threeHost;
+    auto const a = WriteClangInstall(one, oneHost, "// clang 22\n", "gcc/include/c++/14", "// libstdc++ A\n");
+    auto const b = WriteClangInstall(two, twoHost, "// clang 22\n", "gcc/include/c++/14", "// libstdc++ B\n");
+    auto const c = WriteClangInstall(three, threeHost, "// clang 22\n", "gcc/include/c++/14", "// libstdc++ A\n");
+
+    ClangProbeRunner oneRunner { ClangVerbose(LinuxTriple, LinuxTriple, a.roots), a.resourceDir };
+    ClangProbeRunner twoRunner { ClangVerbose(LinuxTriple, LinuxTriple, b.roots), b.resourceDir };
+    ClangProbeRunner threeRunner { ClangVerbose(LinuxTriple, LinuxTriple, c.roots), c.resourceDir };
+
+    auto const first = ClangIdentity(oneRunner, oneHost, a);
+    REQUIRE(first.fingerprint != ClangIdentity(twoRunner, twoHost, b).fingerprint);
+
+    // And identical libstdc++ agrees -- the control that the split above is the
+    // CONTENT's doing.
+    CHECK(first.fingerprint == ClangIdentity(threeRunner, threeHost, c).fingerprint);
+
+    // Not targeting MSVC, it is never asked for a resource directory.
+    CHECK(oneRunner.ResourceProbes() == 0);
+}
+
+TEST_CASE("An MSVC-targeting clang whose resource probe cannot run is refused and not cached",
+          "[toolchain-probe][fingerprint-tree]")
+{
+    // The #225 shape one layer down. The digest would cover no tree where every machine
+    // that ran the probe covers the resource directory, so it is a different value that
+    // looks like an identity -- named, never served, never written.
+    FastCache::Testing::ScratchDirectory machine { "fc-tcp-clang-unrun" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-clang-unrun-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost host;
+    auto const clang = WriteClangInstall(machine, host, "// clang 22\n", "msvc/include", "// STL\n");
+    machine.Write("llvm/bin/clang++.exe", "stand-in");
+    ClangProbeRunner runner { ClangVerbose(MsvcTriple, MsvcTargetHeader, clang.roots), clang.resourceDir };
+    runner.RefuseResourceProbe();
+
+    auto const identity = CachedFingerprintSerially(runner, host, clang.compiler, Clang22Banner, DriverOf(Flavor::Clang));
+    REQUIRE(identity.defect == IdentityDefect::UnrunProbe);
+    CHECK_FALSE(identity.evidence.has_value());
+    CHECK(runner.ResourceProbes() == 1);
+    CHECK(StoredFingerprint(state).empty());
+}
+
+TEST_CASE("cl, clang-cl and an MSVC-targeting clang++ stay three toolchains",
+          "[toolchain-probe][fingerprint-tree][driver-grammar]")
+{
+    // With the borrowed trees gone, `clang-cl` and an MSVC-targeting `clang++` from one
+    // install fold the SAME resource tree under the SAME banner, so the grammar is all
+    // that separates them -- and a worker running the wrong one reads `/std:c++20` as a
+    // file (#226). `cl` is held to the same banner here too, which no real `cl` prints,
+    // so that nothing but the row can separate it.
+    FastCache::Testing::ScratchDirectory machine { "fc-tcp-three-drivers" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-three-drivers-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost host;
+    auto const clang = WriteClangInstall(machine, host, "// clang 22\n", "msvc/include", "// STL\n");
+    auto const cl = WriteMsvcInstall(machine, host, "#define _MSVC_STL_UPDATE 202506L\n", "// sdk\n");
+
+    ClangProbeRunner gnuRunner { ClangVerbose(MsvcTriple, MsvcTargetHeader, clang.roots), clang.resourceDir };
+    auto const clangxx = ClangIdentity(gnuRunner, host, clang);
+
+    ScriptedRunner resourceRunner { CompileRun { .exitCode = 0, .out = clang.resourceDir + "\n", .err = {} } };
+    auto const clangCl = CachedFingerprintSerially(
+        resourceRunner, host, clang.compiler, Clang22Banner, DriverOf(Flavor::ClangCl), /*forceRefresh=*/true);
+
+    auto const msvc = ClIdentity(host, cl, Clang22Banner).first;
+
+    REQUIRE(clangxx.fingerprint != clangCl.fingerprint);
+    CHECK(clangxx.fingerprint != msvc.fingerprint);
+    CHECK(clangCl.fingerprint != msvc.fingerprint);
+
+    // `clang-cl` and `clang++` walked the one tree -- the grammar is the only
+    // difference between them, not one of several.
+    CHECK(gnuRunner.ResourceProbes() == 1);
+    CHECK(resourceRunner.Calls() == 1);
+}
+
+TEST_CASE("A stamp names the fingerprint schema it validates", "[toolchain-probe][fingerprint-tree]")
+{
+    // Everything else held equal, so the schema is the only thing that can move it.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-stamp-schema" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+    std::vector<std::string> const roots { (tree / "inc").string() };
+
+    auto const current = ComputeToolchainStamp("cc 1.0", compiler, roots);
+    REQUIRE_FALSE(current.empty());
+    CHECK(current == ComputeToolchainStamp("cc 1.0", compiler, roots, FingerprintSchema));
+    REQUIRE(current != ComputeToolchainStamp("cc 1.0", compiler, roots, "toolchain-v2"));
+}
+
+TEST_CASE("A cache entry another fingerprint schema wrote is recomputed, not served", "[toolchain-probe][fingerprint-tree]")
+{
+    // Stands for the NEXT fingerprint-schema bump made without a stamp bump. This one
+    // (#1656) also moved `StampSchema`, so a v2 entry misses here regardless; what the
+    // case pins is that a schema bump ALONE is enough, because before the stamp named
+    // the schema a launcher kept handing out the old value under a stamp that still
+    // validated, against a worker that had restarted onto the new rules. Planted rather
+    // than produced, because the old build is not here.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-schema-plant" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
+
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-schema-plant-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    CountingRunner runner { VerboseNaming(root) };
+    ScriptedToolchainHost host;
+    constexpr std::string_view banner = "cc 1.0";
+    auto const real = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    REQUIRE(real.Usable());
+    REQUIRE(real.evidence.has_value());
+    auto const& evidence = FastCache::Testing::Unwrap(real.evidence);
+
+    // The one entry that call wrote, overwritten with a fingerprint nothing computes.
+    auto const entry = [&] {
+        std::error_code ec;
+        for (auto const& candidate: std::filesystem::directory_iterator { CacheDirectory(state), ec })
+            if (candidate.path().extension() == ".fingerprint")
+                return candidate.path();
+        return std::filesystem::path {};
+    }();
+    REQUIRE_FALSE(entry.empty());
+    auto const plant = [&](std::string_view schema) {
+        auto const stamp = ComputeToolchainStamp(banner, evidence.compiler, evidence.roots, schema);
+        REQUIRE_FALSE(stamp.empty());
+        std::ofstream { entry, std::ios::binary | std::ios::trunc } << stamp << "\nbogus-fingerprint\n";
+    };
+
+    // The control: planted under THIS schema it is served, so the planting reaches
+    // the reader and the case below is not passing by a missed file.
+    plant(FingerprintSchema);
+    REQUIRE(CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang)).fingerprint
+            == "bogus-fingerprint");
+
+    // Planted under another schema it is a miss: recomputed, and written back.
+    plant("toolchain-v2");
+    auto const recomputed = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    REQUIRE(recomputed.fingerprint == real.fingerprint);
+    CHECK(StoredFingerprint(state) == real.fingerprint);
+}
+
+TEST_CASE("One MSVC-targeting clang fingerprints alike under the gcc and the clang row",
+          "[toolchain-probe][fingerprint-tree]")
+{
+    // A `cc` or `c++` stem classifies as `Gcc` until a banner corrects it, and the node
+    // and `--print-toolchain-fingerprint` classify by stem while the launcher's
+    // dispatch is banner-corrected -- so one binary reaches both rows, through one
+    // cache file per grammar. The two rows must therefore answer alike for it, or a
+    // worker and its clients split on which row they happened to read.
+    FastCache::Testing::ScratchDirectory machine { "fc-tcp-gcc-clang-row" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-gcc-clang-row-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost host;
+    auto const clang = WriteClangInstall(machine, host, "// clang 22\n", "msvc/include", "// STL\n");
+    ClangProbeRunner viaGcc { ClangVerbose(MsvcTriple, MsvcTargetHeader, clang.roots), clang.resourceDir };
+    ClangProbeRunner viaClang { ClangVerbose(MsvcTriple, MsvcTargetHeader, clang.roots), clang.resourceDir };
+
+    auto const asGcc =
+        CachedFingerprintSerially(viaGcc, host, clang.compiler, Clang22Banner, DriverOf(Flavor::Gcc), /*forceRefresh=*/true);
+    auto const asClang = ClangIdentity(viaClang, host, clang);
+
+    CHECK(asGcc.Usable());
+    REQUIRE(asGcc.fingerprint == asClang.fingerprint);
+    CHECK(viaGcc.ResourceProbes() == 1);
+}
+
+TEST_CASE("An MSVC-targeting clang that folds no tree and cannot name itself is no identity",
+          "[toolchain-probe][fingerprint-tree]")
+{
+    // Discovery found roots, so the check made before the cache read passes it; the
+    // walk then selects the resource directory, and the driver named none. A fallback
+    // banner over no tree is the driver's NAME and its grammar -- every install alike,
+    // which is `NoEvidence` asked of the tree the digest actually folded. Not cached
+    // either, because a later hit asks only discovery's roots and would serve it.
+    FastCache::Testing::ScratchDirectory machine { "fc-tcp-clang-folded-nothing" };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-clang-folded-nothing-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    ScriptedToolchainHost host;
+    auto const clang = WriteClangInstall(machine, host, "// clang 22\n", "msvc/include", "// STL\n");
+    machine.Write("llvm/bin/clang++.exe", "stand-in");
+    ClangProbeRunner runner { ClangVerbose(MsvcTriple, MsvcTargetHeader, clang.roots), /*resourceDir=*/ {} };
+    auto const fallback = NormalizedCompilerName(clang.compiler);
+
+    auto const first = CachedFingerprintSerially(runner, host, clang.compiler, fallback, DriverOf(Flavor::Clang));
+    REQUIRE(first.defect == IdentityDefect::NoEvidence);
+    CHECK(StoredFingerprint(state).empty());
+
+    // Asked again with no refresh: still refused, because nothing was cached to hit.
+    auto const second = CachedFingerprintSerially(runner, host, clang.compiler, fallback, DriverOf(Flavor::Clang));
+    CHECK(second.defect == IdentityDefect::NoEvidence);
+    CHECK(runner.ResourceProbes() == 2);
+
+    // The control: a real banner over the same empty resource answer is a banner-only
+    // identity that still tells one clang from another, and is served.
+    auto const named = CachedFingerprintSerially(
+        runner, host, clang.compiler, Clang22Banner, DriverOf(Flavor::Clang), /*forceRefresh=*/true);
+    CHECK(named.Usable());
+
+    // And that one IS written, so the empty store asserted above is the refusal's
+    // doing rather than a fixture that could never write one.
+    CHECK_FALSE(StoredFingerprint(state).empty());
 }

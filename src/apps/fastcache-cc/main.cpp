@@ -2398,7 +2398,9 @@ void RecordManifest(InvocationRecord const& record,
     // What the banner alone still cannot do is stand in for the include tree: two
     // machines can print an identical version line while resolving different
     // libstdc++ headers, and for distribution that is a wrong object rather than a
-    // miss. So a worker is matched on a digest of the whole tree.
+    // miss. So a worker is matched on a digest of the tree the driver OWNS -- never
+    // the VC toolset or the SDK a `cl` or an MSVC-targeting clang borrows, which a
+    // worker does not open for a preprocessed compile (#1656, `FingerprintTree`).
     //
     // Computed HERE rather than beside the stamp, so it stays on the miss-and-
     // dispatch-configured path only: it is a cache read in the steady state, but

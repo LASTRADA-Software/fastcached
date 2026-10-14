@@ -82,8 +82,13 @@ enum class IncludeDiscovery : std::uint8_t
     /// #195, so the digest was too: the false match `ToolchainFingerprint.hpp`
     /// exists to prevent, and the one that yields a silently wrong object rather
     /// than a stale path a replay guard can probe. The banner now names the toolset
-    /// and the target, which does not retire this: a fingerprint carrying no
-    /// toolchain CONTENT still cannot see a patched header.
+    /// and the target, and since #1656 the fingerprint folds NONE of these roots
+    /// (`FingerprintTree::None`) -- they are the toolset `cl` lives in and an SDK it
+    /// borrows, and a worker opens neither for a preprocessed compile. Discovery is
+    /// kept for the fingerprint cache's stamp and so a node notices a toolset or SDK
+    /// update and re-surveys. Both are local checks that never cross a machine, so a
+    /// service and a prompt disagreeing about these roots now costs a recompute, never
+    /// a match; the layout-first rule below was written when it cost the match.
     ///
     /// The layout is tried FIRST and the environment only as a fallback, which is
     /// the whole of why this is not merely "read INCLUDE, then guess". Preferring
@@ -119,9 +124,9 @@ enum class IncludeDiscovery : std::uint8_t
     /// afford that because `clang-cl` announces a genuine version: a driver that
     /// does not answer degrades to a banner-only fingerprint, which still tells one
     /// clang from another. `cl` announces one too now (issue #195), but only after
-    /// being asked the one way it answers -- and a banner alone still cannot see a
-    /// patched header, which is why `MsvcLayout` keeps its fallback and this does
-    /// not need one.
+    /// being asked the one way it answers. `MsvcLayout` keeps its fallback for the
+    /// stamp and the evidence it feeds, not for the fingerprint, which folds no
+    /// MSVC tree at all (#1656).
     ///
     /// The VC toolset and the Windows SDK stay OUT of the answer. `clang-cl`
     /// borrows them rather than owning them, and a worker compiles text the client
@@ -176,6 +181,47 @@ enum class TargetDiscovery : std::uint8_t
     /// states nothing on a dispatched line -- see `TargetPinPrefixFor`, which is
     /// where those two questions are kept apart.
     GnuTargetLine = 2,
+};
+
+/// Which of a driver's include roots its toolchain FINGERPRINT walks
+/// ([#1656](https://github.com/LASTRADA-Software/fastcached/issues/1656)).
+///
+/// Separate from `IncludeDiscovery` because the two answer different questions. That
+/// one says where a driver SEARCHES, and the answer also feeds the fingerprint cache's
+/// stamp and the node's evidence of a toolchain moving; this one says which of those
+/// trees is the driver's OWN, and only the own tree identifies it. A tree the driver
+/// BORROWS -- the VC toolset and the Windows SDK, under `cl` and under a clang that
+/// targets MSVC -- buys no discrimination, because a dispatched compile is preprocessed
+/// on the client and the worker opens no header from it. It does cost matches: an
+/// installed Visual Studio language pack drops IntelliSense XML into the toolset's
+/// `include` directory, and two machines with one toolset and one SDK split on it.
+///
+/// PRIVATE: never transmitted and never persisted. What a fingerprint folds is the
+/// files a row selects, never the enumerator, so the order is free to change and no
+/// value is pinned.
+enum class FingerprintTree : std::uint8_t
+{
+    /// Every root `IncludeDiscovery` found. `clang-cl`'s discovery already names only
+    /// its own resource directory.
+    DiscoveredRoots,
+    /// No include tree at all: the identity is the banner and the grammar. `cl`'s
+    /// banner names its toolset version and its target (#195), and every tree its
+    /// discovery finds -- the toolset it lives in, the newest SDK -- is one a worker
+    /// never opens for a dispatched compile.
+    None,
+    /// The driver's own resource directory when it targets MSVC, exactly as
+    /// `clang-cl` is identified -- and every discovered root otherwise. A GNU-grammar
+    /// clang on Windows lists the VC toolset and the SDK in its `-v` search list; on
+    /// Linux it lists libstdc++, which it does read, and that stays folded. Decided by
+    /// the target the include probe's own output names, so it costs no spawn on a
+    /// driver that targets anything else.
+    ///
+    /// The `gcc` row carries it too, although no gcc targets MSVC. One binary reaches
+    /// both rows -- the node and `--print-toolchain-fingerprint` classify a driver by
+    /// its STEM, the launcher corrects that by its banner, and both share one cache
+    /// file per grammar -- so a `cc` that is really an MSVC-targeting clang must
+    /// fingerprint alike under either row, or a worker and its clients split.
+    OwnTreeWhenTargetingMsvc,
 };
 
 /// True when two family sets overlap.
@@ -556,6 +602,10 @@ struct DriverSpec
     /// member stays in one run: one dropped between two 8-aligned members costs
     /// seven bytes of padding and fails clang-tidy's budget.
     TargetDiscovery targetDiscovery { TargetDiscovery::None };
+    /// Which of the discovered include roots the toolchain fingerprint walks.
+    ///
+    /// In the same byte run as the two above, for the padding reason they give.
+    FingerprintTree fingerprintTree { FingerprintTree::DiscoveredRoots };
     /// Flags that make the driver print its include search list, for
     /// `IncludeDiscovery::GnuVerbose`. Empty for every other mechanism.
     ///
