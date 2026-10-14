@@ -256,9 +256,10 @@ TEST_CASE("FormatReport counts a compile an edit raced and names its source", "[
 
     auto const report = FormatReport("");
     CHECK(report.contains("compiles     : 2"));
-    // A REQUIRE: an INPUTS-MOVED that reads back as anything else fails exactly the four checks
-    // below it, and a case failing exactly four assertions exits 4, which ctest scores as SKIPPED
-    // (`SKIP_RETURN_CODE 4`, #1152). Stopping here makes that regression one failure, a red.
+    // A REQUIRE: a record read back as `Unavailable` (what an unknown token parses as) fails
+    // exactly four of the checks below, and a case failing exactly four assertions exits 4, which
+    // ctest scores as SKIPPED (`SKIP_RETURN_CODE 4`, #1152). Stopping here makes that regression
+    // one failure, a red.
     REQUIRE(report.contains("inputs moved : 1"));
     // Asked of the cache and not a hit, so it is in the denominator: one of two.
     CHECK(report.contains("50.0% of 2 cacheable"));

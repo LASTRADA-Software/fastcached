@@ -35,11 +35,15 @@ class OverrunningDrainWait final: public IDrainWait
     {
     }
 
+    /// @return The accumulated instant: what every sleep so far cost, and nothing else.
     [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
     {
         return _now;
     }
 
+    /// Count the sleep and advance the clock by @p requested times the overrun, rather than
+    /// sleeping.
+    /// @param requested The pause the caller asked for.
     void Sleep(std::chrono::milliseconds requested) noexcept override
     {
         ++_sleeps;

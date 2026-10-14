@@ -283,6 +283,9 @@ TEST_CASE("Every verdict decides the STORE and the manifest exactly", "[input-wi
     CHECK(RowOf(InputStability::MovedBeforeKey).manifest == KeepManifest::No);
     CHECK(RowOf(InputStability::Unwitnessed).store == StoreObject::No);
     CHECK(RowOf(InputStability::Unwitnessed).manifest == KeepManifest::No);
+    // The last real verdict is answered by its own row, not the unknown one: an `index + 1 < size`
+    // bound would hand it `UnknownStabilityRow`, whose store and manifest columns are the same.
+    CHECK(&RowOf(InputStability::Unwitnessed) != &UnknownStabilityRow);
     // And what the statistics record when the object is not stored: a race with an editor is
     // INPUTS-MOVED, while an input that could not be observed is usually a lasting condition
     // (an unreadable file), which the next build would meet again, so it is UNCACHEABLE.
@@ -445,7 +448,10 @@ TEST_CASE("The witnessed content refuses a late path whose identity moves while 
 TEST_CASE("A value that is not a verdict answers its own row and never the nearest", "[input-witness][1650]")
 {
     auto const& row = RowOf(InputStability::Last);
-    CHECK(&row == &UnknownStabilityRow);
+    // A REQUIRE: a `RowOf` that clamps to the nearest row answers `Unwitnessed`'s, which fails
+    // exactly four of the checks below, and a case failing exactly four assertions exits 4, which
+    // ctest scores as SKIPPED (`SKIP_RETURN_CODE 4`, #1152). Stopping here makes that one failure.
+    REQUIRE(&row == &UnknownStabilityRow);
     CHECK(row.stability == InputStability::Last);
     CHECK(row.store == StoreObject::No);
     CHECK(row.manifest == KeepManifest::No);

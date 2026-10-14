@@ -104,10 +104,11 @@ TEST_CASE("DrainWithin: the default bound is what every shutdown path wants", "[
 
 TEST_CASE("DrainWithin: the production wait blocks and returns", "[core][drain]")
 {
-    // The fake above proves the arithmetic; this proves the seam it stands in
-    // for is wired to a real clock and a real sleep. A small ceiling, so the
-    // case costs what it says: the assertion is that it comes back at all and
-    // reports the ceiling, not how precisely it lands on it.
+    // The shared overrunning fake (tests/OverrunningDrainWait.hpp) proves the
+    // arithmetic; this proves the seam it stands in for is wired to a real
+    // clock and a real sleep. A small ceiling, so the case costs what it says:
+    // the assertion is that it comes back at all and reports the ceiling, not
+    // how precisely it lands on it.
     auto const start = std::chrono::steady_clock::now();
     CHECK(DrainWithin([] { return true; }, DrainBound { .ceiling = 40ms, .poll = 5ms }, DefaultDrainWait())
           == DrainResult::Ceiling);
