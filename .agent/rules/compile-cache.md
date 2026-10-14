@@ -2428,11 +2428,16 @@ four were each wrong in a draft of #1650 before they were right:
   never above the fine clock, a later one never below the coarse clock) and under
   `ChangedAtOrAfter`'s condition, a save made before the fence is stamped below T0 and one made
   after it at or above. That is a property of the clocks, NOT an unconditional fact: see the
-  limits below. Waiting only for the coarse clock to CHANGE was wrong on Linux 6.13+, whose
-  multigrain timestamps stamp a file stat'ed since its last change with a FINE time the coarse
-  clock can still be below -- MEASURED: 57 of 60 such saves read as after the fence on
-  `Linux-gcc-release-arm64` in CI; the multigrain cause is INFERRED, and no local kernel (WSL
-  included) reproduces it, so only that CI leg can tell the two fences apart. Without any fence,
+  limits below. Waiting only for the coarse clock to CHANGE was wrong, and it is two halves. The
+  CLOCK half is everywhere: the coarse clock reads the last tick boundary the timekeeper
+  accumulated, which trails its publication and holds until the next one, so it lags real time
+  by up to about TWO ticks (7.45 ms on WSL's 4 ms tick), and its first new reading can lie at or
+  below a fine-clock instant read before the fence -- that reproduces on WSL (Linux 6.6) and is
+  asked of the machine's own clocks by a unit case. The STAMPING half is Linux 6.13+, whose
+  multigrain timestamps stamp a file stat'ed since its last change with a FINE time, carrying
+  that lag into FILE STAMPS -- MEASURED: 57 of 60 such saves read as after the fence on
+  `Linux-gcc-release-arm64` in CI; the multigrain cause is INFERRED, no local kernel stamps that
+  way, and a scripted-clock case stands in for it. Without any fence,
   5 of 30 compiles launched right after a write refused to store (WSL, 4 ms ticks; measured, and
   30 of 30 stored with it). Read T0 COARSELY, too: a finer clock can read later than the stamp
   of a change that follows it.
