@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "InputFiles.hpp"
 
+#include <FastCache/Core/BoundedDrain.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
@@ -13,10 +15,13 @@
 #include <optional>
 #include <ranges>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/SteppedDrainWait.hpp>
 #include <tests/Unwrap.hpp>
 
 #if defined(_WIN32)
@@ -53,9 +58,8 @@ std::string KernelRelease()
 
 /// Realtime clocks whose readings are a script, so the fence's ordering decision can be driven
 /// against readings no local kernel produces. Each `Coarse()` answers the next scripted reading
-/// and then repeats the last one, so a clock scripted to stop moving stays stopped; `Pause`
-/// advances the monotonic reading by exactly what it was asked, so the fence's bound is reached
-/// without waiting for it.
+/// and then repeats the last one, so a clock scripted to stop moving stays stopped; it counts its
+/// reads, so a case can bound how often a wait looked.
 class ScriptedClocks final: public IRealtimeClocks
 {
   public:
@@ -69,6 +73,7 @@ class ScriptedClocks final: public IRealtimeClocks
 
     [[nodiscard]] std::optional<FileInstant> Coarse() const override
     {
+        ++_reads;
         auto const reading = _coarse.at(_next);
         if (_next + 1 < _coarse.size())
             ++_next;
@@ -80,21 +85,46 @@ class ScriptedClocks final: public IRealtimeClocks
         return _fine;
     }
 
-    void Pause(std::chrono::nanoseconds duration) const override
+    /// @return How many times `Coarse()` was read.
+    [[nodiscard]] int CoarseReads() const noexcept
     {
-        _monotonic += duration;
-    }
-
-    [[nodiscard]] std::chrono::nanoseconds Monotonic() const override
-    {
-        return _monotonic;
+        return _reads;
     }
 
   private:
     std::optional<FileInstant> _fine;
     std::vector<std::optional<FileInstant>> _coarse;
     mutable std::size_t _next = 0;
-    mutable std::chrono::nanoseconds _monotonic {};
+    mutable int _reads = 0;
+};
+
+/// A drain wait whose every sleep COSTS `ChargeFactor` times what it asked for, as a coarse host
+/// timer charges a short request -- so a bound that COUNTS requested sleeps and one that MEASURES
+/// them end at different instants, and a case can tell which one it ran. It never blocks.
+class OverchargingDrainWait final: public FastCache::IDrainWait
+{
+  public:
+    /// How many times its request every sleep costs.
+    static constexpr int ChargeFactor = 3;
+
+    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
+    {
+        return core::platform::SteadyTimePoint {} + _elapsed;
+    }
+
+    void Sleep(std::chrono::milliseconds requested) noexcept override
+    {
+        _elapsed += requested * ChargeFactor;
+    }
+
+    /// @return The time every sleep so far cost.
+    [[nodiscard]] std::chrono::milliseconds Elapsed() const noexcept
+    {
+        return _elapsed;
+    }
+
+  private:
+    std::chrono::milliseconds _elapsed {};
 };
 
 /// An instant in 2025, for scripted clocks to read near.
@@ -142,8 +172,10 @@ TEST_CASE("A fence orders a change made just before it below it and one made aft
     // (multigrain timestamps) stamp it with a FINE time; a fence that waited only for the COARSE
     // clock to change returned an instant below such a stamp in 57 of 60 iterations on a CI arm64
     // runner. No kernel available locally stamps multigrain times, so a local pass cannot tell
-    // the fine-clock floor from that wait -- the kernel is in the failure message for that reason,
-    // and "A fence passes a fine stamp the coarse clock's next tick still lags" scripts the readings.
+    // the fine-clock floor from that wait through FILE STAMPS -- the kernel is printed on every run
+    // for that reason. The CLOCK half of it is asked of this machine's clocks by "A fence lands
+    // strictly above a fine-clock instant read before it at every tick phase", and the stamping
+    // half is scripted by "A fence passes a fine stamp the coarse clock's next tick still lags".
     constexpr auto Iterations = 60;
     FastCache::Testing::ScratchDirectory const scratch { "fc-input-files-fence" };
     auto const path = (scratch / "a.hpp").string();
@@ -169,25 +201,62 @@ TEST_CASE("A fence orders a change made just before it below it and one made aft
         if (!ChangedAtOrAfter(after->changeTime, fence))
             ++afterReadAsBefore;
     }
-    INFO("of " << Iterations << " iterations, kernel " << KernelRelease());
+    // WARN rather than INFO, so a GREEN run records the kernel too: which kernel this passed on is
+    // the half of the evidence a failure message alone never carries.
+    WARN("of " << Iterations << " iterations, kernel " << KernelRelease());
     CHECK(unreadable == 0);
     CHECK(beforeReadAsAfter == 0);
     CHECK(afterReadAsBefore == 0);
 }
 
+TEST_CASE("A fence lands strictly above a fine-clock instant read before it at every tick phase", "[input-files]")
+{
+    // The CLOCK half of #1650's CI failure, asked of this machine's own clocks: the coarse clock
+    // reads the last tick boundary the timekeeper accumulated, which trails its publication and
+    // holds until the next one, so its first NEW reading can lie at or below a fine-clock instant
+    // read before the fence. A fence that returned the first coarse reading that merely CHANGED
+    // landed there in many of these iterations on WSL (Linux 6.6, 4 ms tick) -- a kernel that does
+    // not stamp files with the fine clock, so no file-stamp case there can show it.
+    //
+    // Each iteration first sleeps a different fraction of a tick, so the fence starts at a sweep
+    // of phases across it rather than wherever the previous fence left off: 163 us steps cover
+    // 16.3 ms, a Windows tick (15.6 ms) as well as four of Linux's 4 ms ones.
+    constexpr auto Iterations = 100;
+    constexpr auto PhaseStep = std::chrono::microseconds { 163 };
+    auto const clocks = MakeSystemRealtimeClocks();
+
+    auto atOrBelow = 0;
+    auto unanswered = 0;
+    for (auto const iteration: std::views::iota(0, Iterations))
+    {
+        std::this_thread::sleep_for(PhaseStep * iteration);
+        auto const before = clocks->Fine();
+        auto const fence = FenceOn(*clocks, FastCache::DefaultDrainWait());
+        if (!before)
+            ++unanswered;
+        else if (*before >= fence)
+            ++atOrBelow;
+    }
+    WARN("of " << Iterations << " iterations, kernel " << KernelRelease());
+    CHECK(unanswered == 0);
+    CHECK(atOrBelow == 0);
+}
+
 TEST_CASE("A fence passes a fine stamp the coarse clock's next tick still lags", "[input-files]")
 {
-    // #1650's CI failure as readings, which no local kernel produces: a multigrain kernel stamped
-    // the save just before the fence with a FINE time, and the coarse clock -- which lags real time
-    // by up to a tick -- moved once and still read BELOW that stamp. A fence returning the first
-    // coarse reading that merely DIFFERS from its first reads the save as at-or-after itself.
+    // The STAMPING half of #1650's CI failure, which no local kernel produces: a multigrain kernel
+    // stamped the save just before the fence with a FINE time, and the coarse clock -- which lags
+    // real time by up to about two ticks -- moved once and still read BELOW that stamp. A fence
+    // returning the first coarse reading that merely DIFFERS from its first reads the save as
+    // at-or-after itself.
     auto const fineStamp = ScriptBase + ScriptTick + 1'234'567;
     auto const fineAtCall = fineStamp + 65'432;
     auto const laggingTick = ScriptBase + ScriptTick;
     auto const nextTick = ScriptBase + (2 * ScriptTick);
     ScriptedClocks const clocks { fineAtCall, { ScriptBase, ScriptBase, laggingTick, laggingTick, nextTick } };
+    FastCache::Testing::SteppedDrainWait wait;
 
-    auto const fence = FenceOn(clocks);
+    auto const fence = FenceOn(clocks, wait);
 
     CHECK(fence == nextTick);
     CHECK_FALSE(ChangedAtOrAfter(fineStamp, fence));
@@ -198,32 +267,46 @@ TEST_CASE("A fence passes a fine stamp the coarse clock's next tick still lags",
 
 TEST_CASE("A fence whose coarse clock never passes the floor answers a safety tick below it", "[input-files]")
 {
+    // Every sleep costs three times its request, so the bound can tell a MEASURED wait from a
+    // COUNTED one: measured, it stops at the first look at or past 100 ms of what the sleeps COST,
+    // which is under one charged sleep past it; counted (`waited += poll`), it would run 100
+    // requested sleeps -- 300 ms by this clock -- and read the coarse clock about 100 times.
     ScriptedClocks const clocks { ScriptBase + 9, { ScriptBase } };
+    OverchargingDrainWait wait;
+    constexpr auto Bound = std::chrono::milliseconds { 100 };
+    constexpr auto ChargedPoll = std::chrono::milliseconds { 1 } * OverchargingDrainWait::ChargeFactor;
 
-    CHECK(FenceOn(clocks) == ScriptBase - FineClockSafetyTick);
-    CHECK(clocks.Monotonic() >= std::chrono::milliseconds { 100 });
+    CHECK(FenceOn(clocks, wait) == ScriptBase - FineClockSafetyTick);
+    CHECK(wait.Elapsed() >= Bound);
+    CHECK(wait.Elapsed() < Bound + ChargedPoll);
+    // One read at the call, then one per look: a look before each charged sleep and one after the
+    // last.
+    CHECK(clocks.CoarseReads() <= 1 + ((Bound / ChargedPoll) + 2));
 }
 
 TEST_CASE("A fence whose coarse clock stops answering answers a safety tick below its last reading", "[input-files]")
 {
-    ScriptedClocks const clocks { ScriptBase + 9, { ScriptBase, ScriptBase, std::nullopt } };
+    ScriptedClocks const clocks { ScriptBase + 9, { ScriptBase, ScriptBase + 1, std::nullopt } };
+    FastCache::Testing::SteppedDrainWait wait;
 
-    CHECK(FenceOn(clocks) == ScriptBase - FineClockSafetyTick);
+    CHECK(FenceOn(clocks, wait) == ScriptBase + 1 - FineClockSafetyTick);
 }
 
 TEST_CASE("A fence with no coarse clock waits a safety tick and answers the fine clock moved back by it", "[input-files]")
 {
     ScriptedClocks const clocks { ScriptBase, { std::nullopt } };
+    FastCache::Testing::SteppedDrainWait wait;
 
-    CHECK(FenceOn(clocks) == ScriptBase - FineClockSafetyTick);
-    CHECK(clocks.Monotonic() == std::chrono::nanoseconds { FineClockSafetyTick });
+    CHECK(FenceOn(clocks, wait) == ScriptBase - FineClockSafetyTick);
+    CHECK(wait.Elapsed() == std::chrono::nanoseconds { FineClockSafetyTick });
 }
 
 TEST_CASE("A fence with no clock at all answers zero so every input reads as changed", "[input-files]")
 {
     ScriptedClocks const clocks { std::nullopt, { std::nullopt } };
+    FastCache::Testing::SteppedDrainWait wait;
 
-    CHECK(FenceOn(clocks) == 0);
+    CHECK(FenceOn(clocks, wait) == 0);
 }
 
 TEST_CASE("Now reads the coarse clock and falls back to the fine clock moved back and then to zero", "[input-files]")
@@ -275,8 +358,10 @@ TEST_CASE("Setting a file's last-write time back still moves its NTFS change tim
     scratch.Write("a.hpp", "MESSAGE_V1_OLD\n");
     auto const path = scratch / "a.hpp";
     auto const files = MakeDiskInputFiles();
-    auto const before = files->Fence();
     scratch.Write("a.hpp", "MESSAGE_V2_NEW\n");
+    // Fenced AFTER the write, so the write alone cannot satisfy the last check: only the backdate
+    // below can move the change time past this instant.
+    auto const before = files->Fence();
     auto const anHourAgo = std::filesystem::file_time_type::clock::now() - std::chrono::hours { 1 };
     std::filesystem::last_write_time(path, anHourAgo);
     auto const identity = files->Identify(path.string());

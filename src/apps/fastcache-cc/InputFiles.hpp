@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/BoundedDrain.hpp>
+
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -155,16 +156,22 @@ class IInputFiles
     /// An instant meant to ORDER every change against it: one made before this call stamped
     /// strictly below the result, one made after it returns at or above it. Reads the FINE clock
     /// at the call, then blocks until the coarse clock reads strictly above both that and its own
-    /// reading at the call -- typically one tick -- and returns that coarse reading.
+    /// reading at the call -- typically one to two ticks -- and returns that coarse reading.
     ///
-    /// Why the fine clock bounds the past and the coarse one does not: Linux 6.13+ (multigrain
-    /// timestamps, on ext4, xfs, btrfs and tmpfs) stamps a change to a file stat'ed since its last
-    /// change with a FINE time, and the coarse clock lags real time by up to a tick, so its first
-    /// new reading can still lie BELOW a fine stamp written just before this call. MEASURED in CI:
-    /// with a fence that waited only for the coarse clock to change, 57 of 60 changes made just
-    /// before it read as at-or-after it on a `Linux-gcc-release-arm64` runner (#1650). That
-    /// multigrain stamping is the cause is INFERRED; no local kernel here reproduces it, so the
-    /// readings it produces are SCRIPTED through `IRealtimeClocks` instead (`FenceOn`'s cases).
+    /// Why the fine clock bounds the past and the coarse one does not: the coarse clock reads the
+    /// last tick boundary the timekeeper ACCUMULATED, which trails the moment it is published and
+    /// then holds until the next one, so it lags real time by up to about TWO ticks -- measured
+    /// 7.45 ms behind `CLOCK_REALTIME` on WSL's 4 ms tick. Its first new reading can therefore still
+    /// lie at or below a fine-clock instant read before this call: with a fence that waited only for
+    /// the coarse clock to change, that happened in 33 to 100 of 100 runs on WSL (Linux 6.6). A
+    /// FILE STAMP reaches that region only where the kernel stamps with the fine clock -- Linux
+    /// 6.13+ (multigrain timestamps, on ext4, xfs, btrfs and tmpfs) stamps a change to a file
+    /// stat'ed since its last change with a FINE time. MEASURED in CI: under that waiting rule, 57
+    /// of 60 changes made just before the fence read as at-or-after it on a
+    /// `Linux-gcc-release-arm64` runner (#1650). That multigrain stamping is what carried the clock
+    /// lag into the STAMPS there is INFERRED; no local kernel stamps that way, so the stamping half
+    /// is SCRIPTED through `IRealtimeClocks` (`FenceOn`'s cases), while the clock half is asked of
+    /// this machine's own clocks.
     ///
     /// The ordering is a property of the clocks, so it holds only where they behave as assumed --
     /// a later stamp is never below the coarse clock, an earlier one never above the fine clock --
@@ -173,7 +180,8 @@ class IInputFiles
     /// non-decimal grid, a clock stepped backwards between the reads) it is not a guarantee, and
     /// the fail-closed fallback below gives none either, though it can only call MORE changes
     /// recent.
-    /// Where the coarse clock has not passed the floor within 100 ms, or stops answering, the
+    /// The wait is `DrainWithin`'s, so its 100 ms bound is MEASURED on the injected wait, never
+    /// counted. Where the coarse clock has not passed the floor within that bound, or stops answering, the
     /// result is the last coarse reading moved back by a safety tick; where no coarse clock
     /// exists, the fine clock after waiting that tick out, moved back by it.
     ///
@@ -182,7 +190,7 @@ class IInputFiles
     /// invocation started cannot be told from one saved after -- `ChangedAtOrAfter` must call it
     /// "at or after", and the invocation refuses its store. Measured on WSL (4 ms ticks): 5 of 30
     /// compiles launched right after a write refused to store (#1650). Waiting for the next tick
-    /// removes the ambiguity rather than failing closed on it, at the cost of about one tick.
+    /// removes the ambiguity rather than failing closed on it, at the cost of one to two ticks.
     /// @return The fenced instant, on the clock `Now` reads.
     [[nodiscard]] virtual FileInstant Fence() const = 0;
 
@@ -196,10 +204,10 @@ class IInputFiles
     IInputFiles& operator=(IInputFiles&&) = default;
 };
 
-/// The realtime clocks `IInputFiles::Now` and `IInputFiles::Fence` read, and the wait between two
-/// reads: a seam so the fence's ORDERING decision can be driven against clock readings a test host
-/// does not produce -- a coarse clock lagging a fine stamp is what a multigrain kernel shows and no
-/// local kernel here does (#1650).
+/// The realtime clocks `IInputFiles::Now` and `IInputFiles::Fence` read: a seam so the fence's
+/// ORDERING decision can be driven against readings a test host does not produce -- a FILE STAMP
+/// above the coarse clock's next tick is what a multigrain kernel writes and no local kernel here
+/// does (#1650). The wait between two reads is not part of it: that is `IDrainWait`'s.
 class IRealtimeClocks
 {
   public:
@@ -211,13 +219,6 @@ class IRealtimeClocks
 
     /// @return The fine realtime clock, or nullopt where it does not answer.
     [[nodiscard]] virtual std::optional<FileInstant> Fine() const = 0;
-
-    /// Blocks for about @p duration.
-    /// @param duration How long to wait.
-    virtual void Pause(std::chrono::nanoseconds duration) const = 0;
-
-    /// @return A monotonic reading from an arbitrary origin, for bounding a wait.
-    [[nodiscard]] virtual std::chrono::nanoseconds Monotonic() const = 0;
 
   protected:
     /// Protected rather than deleted, for `IInputFiles`' reason.
@@ -235,13 +236,15 @@ class IRealtimeClocks
 [[nodiscard]] FileInstant NowOn(IRealtimeClocks const& clocks);
 
 /// `IInputFiles::Fence` over @p clocks, as that function states it.
-/// @param clocks The clocks to read and wait on.
+/// @param clocks The clocks to read.
+/// @param wait Where the wait between two reads blocks, and the monotonic clock its bound is
+///             measured on.
 /// @return The fenced instant.
-[[nodiscard]] FileInstant FenceOn(IRealtimeClocks const& clocks);
+[[nodiscard]] FileInstant FenceOn(IRealtimeClocks const& clocks, IDrainWait& wait);
 
 /// @return This machine's realtime clocks: `GetSystemTimeAsFileTime` (coarse) and
 ///         `GetSystemTimePreciseAsFileTime` (fine) on Windows; `CLOCK_REALTIME_COARSE` where it
-///         exists and `CLOCK_REALTIME` on POSIX; `std::chrono::steady_clock` for the bound.
+///         exists and `CLOCK_REALTIME` on POSIX.
 [[nodiscard]] std::unique_ptr<IRealtimeClocks> MakeSystemRealtimeClocks();
 
 /// This machine's files.
