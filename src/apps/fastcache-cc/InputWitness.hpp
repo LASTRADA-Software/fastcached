@@ -118,11 +118,16 @@ class StorePermit;
 /// @return A permit when the row allows the object STORE (`StoreObject::Yes`); nullopt otherwise.
 [[nodiscard]] std::optional<StorePermit> PermitStore(StabilityRow const& row) noexcept;
 
-/// What the object STORE takes, by value, so it cannot run without a verdict that allows it
-/// (#1650). Only `PermitStore` makes one, and only for an allowing row: the guard is folded INTO
-/// the operation rather than called beside it, which is what makes it self-enforcing -- a STORE
-/// reached on a path that skipped the verdict does not build. Move-only, so a permit is spent
-/// rather than shared.
+/// What the object STORE (`StoreCompiledObject`) takes, by value, so it cannot run without a
+/// verdict that allows it (#1650). Only `PermitStore` makes one, and only for an allowing row: the
+/// guard is folded INTO that operation rather than called beside it, so an object STORE reached on
+/// a path that skipped the verdict does not build.
+///
+/// What it does NOT enforce: it is move-only, which stops a permit being COPIED, not used twice --
+/// a moved-from permit is still a permit, and nothing marks it spent. Nor does it guard every
+/// write to the cache: `StoreRaw`, the raw write underneath, takes none. The root-bound marker
+/// reaches it only from inside `StoreCompiledObject`; the manifest reaches it gated by the row's
+/// `KeepManifest` column instead, a check called beside the write rather than folded into it.
 class StorePermit
 {
   public:
