@@ -2458,7 +2458,7 @@ four were each wrong in a draft of #1650 before they were right:
   recorded before the fix, and `objkey-v*` deliberately did not move.
 
 **Known limits.** Every one of them is a place where only the clock answers, or nothing does
-([#1654](https://github.com/LASTRADA-Software/fastcached/issues/1654)). The first four fail
+([#1654](https://github.com/LASTRADA-Software/fastcached/issues/1654)). The first five fail
 OPEN -- a wrong object can be stored -- and the last fails CLOSED:
 
 - A header REPLACED during the key's preprocess (T0 to T1′) by a copy that keeps an older change
@@ -2478,6 +2478,12 @@ OPEN -- a wrong object can be stored -- and the last fails CLOSED:
 - FAT and exFAT keep no change time, so their last-write time stands in, and `CopyFile` keeps a
   last-write time (FAT's is 2 s granular): the T0 rule is weaker there. The TU's T0/T1′
   comparison and the identity comparison after T1′ still hold.
+- Where no coarse clock answers -- macOS in practice -- the fence waits a 10 ms margin
+  (`FineClockSafetyTick`) and moves the fine reading back by it. The lag that margin covers was
+  measured on Linux; macOS's stamping lag behind `CLOCK_REALTIME` is INFERRED, and one over 10 ms
+  lets a change made just after the fence read as made before it. The evidence is green CI runs
+  alone (the on-disk fence case on `macOS-clang-release`), an absence of an observed failure, not
+  a bound. [#1659](https://github.com/LASTRADA-Software/fastcached/issues/1659).
 - **The fail-CLOSED direction of the same clock limits.** A filesystem whose clock LEADS this
   machine's (an SMB or NFS share, or `/mnt/<drive>` under a WSL clock that lags the Windows
   host) stamps a fresh file at or above T0, and so does a coarse-grid filesystem (FAT, HFS+,
@@ -2860,6 +2866,16 @@ nobody can account for.
   compile that reads the new header stores its object under a key taken from the shadowed one.
   ccache has the same gap. Not reproduced: derived from the witness's construction (#1650's
   design, Known limits).
+
+- **[#1659](https://github.com/LASTRADA-Software/fastcached/issues/1659)** — the input fence's
+  10 ms margin on a platform with no coarse clock (macOS in practice) is inferred, not measured,
+  and fails OPEN beyond it. `FineClockSafetyTick` covers about two ticks at 200 Hz -- the
+  coarse-clock lag measured on the Linux timekeeper (7.45 ms on WSL's 4 ms tick) -- but on macOS,
+  the one platform where the margin decides correctness, the stamping lag behind
+  `CLOCK_REALTIME` was never measured; a lag over 10 ms there lets a change made just after the
+  fence read as made before it. Evidence so far is green CI runs of the on-disk fence case on
+  `macOS-clang-release`, which bound nothing. See *The key, the object and the manifest describe
+  ONE moment*, Known limits.
 
 - **[#1567](https://github.com/LASTRADA-Software/fastcached/issues/1567)** — `## The digest` has no `AGENT.md`
   tripwire, so the object key being MurmurHash3 x64_128 rather than four CRC32C lanes

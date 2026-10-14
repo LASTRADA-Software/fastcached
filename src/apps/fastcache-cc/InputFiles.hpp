@@ -45,9 +45,9 @@ inline constexpr FileInstant OneSecondOfFileTime = 1'000'000'000;
 /// the fail-closed margin. So the margin decides correctness only on macOS, while the lag above
 /// was measured on Linux: macOS's stamping lag behind `CLOCK_REALTIME` is INFERRED, not measured,
 /// and a lag over 10 ms there fails OPEN -- a change made just after the fence could read as made
-/// before it. The only evidence is one green run: the on-disk fence case passed its 60 iterations
-/// through this path on the `macOS-clang-release` CI leg (run 38446404877, at 7cc6b8cb), which is
-/// an absence of an observed failure, not a bound.
+/// before it (#1659). The evidence is green CI runs alone: the on-disk fence case passed its 60
+/// iterations through this path on the `macOS-clang-release` leg (for example run 38446404877, at
+/// 7cc6b8cb), an absence of an observed failure, not a bound.
 inline constexpr FileInstant FineClockSafetyTick = 10'000'000;
 
 /// The stamp grids `ChangedAtOrAfter` recognises, COARSEST FIRST: FAT's 2 s, then every decimal

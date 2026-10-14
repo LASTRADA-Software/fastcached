@@ -256,8 +256,8 @@ FileInstant FenceOn(IRealtimeClocks const& clocks, IDrainWait& wait)
         // or faster. So wait that margin out and move the reading back by it: every change before
         // this call is then at or below the result, and every change after it at or above. Rounded
         // UP to the wait's unit, so the wait is never shorter than the margin. That two-tick lag
-        // was measured on Linux; on macOS, the one platform that takes this path, it is INFERRED,
-        // and a lag over the margin fails OPEN (see `FineClockSafetyTick`).
+        // was measured on Linux; on macOS, the one platform that takes this path, a lag within the
+        // margin is INFERRED, and one over it fails OPEN (see `FineClockSafetyTick`, #1659).
         wait.Sleep(std::chrono::ceil<std::chrono::milliseconds>(std::chrono::nanoseconds { FineClockSafetyTick }));
         if (auto const fine = clocks.Fine())
             return *fine - FineClockSafetyTick;

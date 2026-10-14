@@ -284,7 +284,8 @@ TEST_CASE("Every verdict decides the STORE and the manifest exactly", "[input-wi
     CHECK(RowOf(InputStability::Unwitnessed).store == StoreObject::No);
     CHECK(RowOf(InputStability::Unwitnessed).manifest == KeepManifest::No);
     // The last real verdict is answered by its own row, not the unknown one: an `index + 1 < size`
-    // bound would hand it `UnknownStabilityRow`, whose store and manifest columns are the same.
+    // bound would hand it `UnknownStabilityRow`, whose store, manifest and outcome columns are all
+    // the same.
     CHECK(&RowOf(InputStability::Unwitnessed) != &UnknownStabilityRow);
     // And what the statistics record when the object is not stored: a race with an editor is
     // INPUTS-MOVED, while an input that could not be observed is usually a lasting condition
