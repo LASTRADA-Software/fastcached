@@ -126,8 +126,12 @@ class StorePermit;
 /// What it does NOT enforce: it is move-only, which stops a permit being COPIED, not used twice --
 /// a moved-from permit is still a permit, and nothing marks it spent. Nor does it guard every
 /// write to the cache: `StoreRaw`, the raw write underneath, takes none. The root-bound marker
-/// reaches it only from inside `StoreCompiledObject`; the manifest reaches it gated by the row's
-/// `KeepManifest` column instead, a check called beside the write rather than folded into it.
+/// reaches it only from inside `StoreCompiledObject`. The manifest reaches it on three paths, and
+/// only two of them read the row's `KeepManifest` column: after a STORED object it is recorded
+/// because the permit was taken, with no `KeepManifest` check (the only allowing row, `Stable`,
+/// also keeps its manifest); after a refused STORE (`GuardStore`) and on a hit's backfill
+/// (`BackfillsManifest`) it is recorded only when that column says `Yes`, a check called beside
+/// the write rather than folded into it.
 class StorePermit
 {
   public:

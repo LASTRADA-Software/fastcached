@@ -35,8 +35,14 @@ inline constexpr FileInstant OneSecondOfFileTime = 1'000'000'000;
 /// How far a FINE clock read is moved back, where no coarse clock answers, and how far `Fence`'s
 /// fail-closed answer lies below its last coarse reading. It bounds the lag of a kernel's
 /// tick-granular file stamping behind a fine clock: a change made just after a fine read can be
-/// stamped up to one tick earlier than that read. 10 ms is one tick at 100 Hz, the coarsest tick in
-/// common use.
+/// stamped up to about TWO ticks earlier than that read, since the coarse time a stamp is taken
+/// from is the last tick boundary the timekeeper accumulated, which trails its publication and
+/// holds until the next one (the Linux timekeeper, measured on WSL 6.6). 10 ms is two ticks at
+/// 200 Hz, so it covers kernels ticking at 200 Hz or faster; a 100 Hz kernel can lag past it.
+///
+/// Where it matters: the no-coarse-clock path is a POSIX system without `CLOCK_REALTIME_COARSE`
+/// -- macOS in practice. Windows and Linux always answer the coarse clock, and there it is only
+/// the fail-closed margin.
 inline constexpr FileInstant FineClockSafetyTick = 10'000'000;
 
 /// The stamp grids `ChangedAtOrAfter` recognises, COARSEST FIRST: FAT's 2 s, then every decimal
@@ -158,12 +164,13 @@ class IInputFiles
     /// at the call, then blocks until the coarse clock reads strictly above both that and its own
     /// reading at the call -- typically one to two ticks -- and returns that coarse reading.
     ///
-    /// Why the fine clock bounds the past and the coarse one does not: the coarse clock reads the
-    /// last tick boundary the timekeeper ACCUMULATED, which trails the moment it is published and
-    /// then holds until the next one, so it lags real time by up to about TWO ticks -- measured
-    /// 7.45 ms behind `CLOCK_REALTIME` on WSL's 4 ms tick. Its first new reading can therefore still
-    /// lie at or below a fine-clock instant read before this call: with a fence that waited only for
-    /// the coarse clock to change, that happened in 25 to 100 of 100 runs on WSL (Linux 6.6). A
+    /// Why the fine clock bounds the past and the coarse one does not: on the Linux timekeeper
+    /// (measured on WSL 6.6), the coarse clock reads the last tick boundary the timekeeper
+    /// ACCUMULATED, which trails the moment it is published and then holds until the next one, so
+    /// it lags real time by up to about TWO ticks -- measured 7.45 ms behind `CLOCK_REALTIME` on
+    /// WSL's 4 ms tick. Its first new reading can therefore still lie at or below a fine-clock
+    /// instant read before this call: with a fence that waited only for the coarse clock to change,
+    /// that happened in about 20 to 100 of 100 runs on WSL, a rate that varies from boot to boot. A
     /// FILE STAMP reaches that region only where the kernel stamps with the fine clock -- Linux
     /// 6.13+ (multigrain timestamps, on ext4, xfs, btrfs and tmpfs) stamps a change to a file
     /// stat'ed since its last change with a FINE time. MEASURED in CI: under that waiting rule, 57

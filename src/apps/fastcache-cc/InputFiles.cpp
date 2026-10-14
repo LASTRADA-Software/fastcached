@@ -211,9 +211,10 @@ FileInstant NowOn(IRealtimeClocks const& clocks)
 FileInstant FenceOn(IRealtimeClocks const& clocks, IDrainWait& wait)
 {
     // The FINE clock is read at the call because it, not the coarse one, bounds every stamp a
-    // change made before this call can carry -- coarse, fine, or a multigrain stamp. The coarse
-    // clock reads the last tick boundary the timekeeper accumulated, which trails its publication
-    // and holds until the next one, so it lags real time by up to about two ticks: its first NEW
+    // change made before this call can carry -- coarse, fine, or a multigrain stamp. On the Linux
+    // timekeeper (measured on WSL 6.6) the coarse clock reads the last tick boundary it
+    // accumulated, which trails its publication and holds until the next one, so it lags real time
+    // by up to about two ticks: its first NEW
     // reading can still lie at or below a fine instant read before this call (#1650). Waiting only
     // for the coarse clock to change returned such an instant, and Linux 6.13+ stamps a file
     // stat'ed since its last change with a FINE time, so a change made before it could read as
@@ -251,10 +252,12 @@ FileInstant FenceOn(IRealtimeClocks const& clocks, IDrainWait& wait)
     }
     if (fineAtCall)
     {
-        // No coarse clock: a fine read can be up to one tick AHEAD of the stamp a change made just
-        // after it receives. So wait that tick out and move the reading back by it: every change
-        // before this call is then at or below the result, and every change after it at or above.
-        wait.Sleep(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::nanoseconds { FineClockSafetyTick }));
+        // No coarse clock (macOS in practice): a fine read can be up to about two ticks AHEAD of
+        // the stamp a change made just after it receives -- within `FineClockSafetyTick` at 200 Hz
+        // or faster. So wait that margin out and move the reading back by it: every change before
+        // this call is then at or below the result, and every change after it at or above. Rounded
+        // UP to the wait's unit, so the wait is never shorter than the margin.
+        wait.Sleep(std::chrono::ceil<std::chrono::milliseconds>(std::chrono::nanoseconds { FineClockSafetyTick }));
         if (auto const fine = clocks.Fine())
             return *fine - FineClockSafetyTick;
     }

@@ -2429,11 +2429,12 @@ four were each wrong in a draft of #1650 before they were right:
   `ChangedAtOrAfter`'s condition, a save made before the fence is stamped below T0 and one made
   after it at or above. That is a property of the clocks, NOT an unconditional fact: see the
   limits below. Waiting only for the coarse clock to CHANGE was wrong, and it is two halves. The
-  CLOCK half is everywhere: the coarse clock reads the last tick boundary the timekeeper
-  accumulated, which trails its publication and holds until the next one, so it lags real time
-  by up to about TWO ticks (7.45 ms on WSL's 4 ms tick), and its first new reading can lie at or
-  below a fine-clock instant read before the fence -- that reproduces on WSL (Linux 6.6) and is
-  asked of the machine's own clocks by a unit case. The STAMPING half is Linux 6.13+, whose
+  CLOCK half is the Linux timekeeper's, measured on WSL 6.6: the coarse clock reads the last tick
+  boundary the timekeeper accumulated, which trails its publication and holds until the next one,
+  so it lags real time by up to about TWO ticks (7.45 ms on WSL's 4 ms tick), and its first new
+  reading can lie at or below a fine-clock instant read before the fence -- in about 20 to 100 of
+  100 runs there, varying per boot. A unit case asks it of the machine's own clocks; on Windows
+  that case checks the property but cannot tell the old fence from the new (0 of 200 there). The STAMPING half is Linux 6.13+, whose
   multigrain timestamps stamp a file stat'ed since its last change with a FINE time, carrying
   that lag into FILE STAMPS -- MEASURED: 57 of 60 such saves read as after the fence on
   `Linux-gcc-release-arm64` in CI; the multigrain cause is INFERRED, no local kernel stamps that
