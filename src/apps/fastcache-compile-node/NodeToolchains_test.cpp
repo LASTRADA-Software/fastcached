@@ -818,7 +818,7 @@ TEST_CASE("NodeToolchains: an unaskable cl is refused even where its layout is l
     // The layout really is there, so the refusal below is the FOLDED tree's doing.
     REQUIRE_FALSE(Cc::MsvcToolsetIncludeRoots(host, std::string { MsvcCompiler }).empty());
 
-    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger).has_value());
+    REQUIRE_FALSE(ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger).has_value());
     CHECK(Logged(logger, std::string { MsvcCompiler }));
     CHECK(Logged(logger, "--toolchain="));
 }

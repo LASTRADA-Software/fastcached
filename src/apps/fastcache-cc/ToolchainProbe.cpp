@@ -1403,9 +1403,11 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     // Not READ, for the same reason from the other end: an earlier failure may
     // already have written one, and the stamp cannot tell it from a good entry.
     //
-    // `NoEvidence` is deliberately still cached. It is a stable property of the
-    // machine rather than an accident of one moment, and re-walking a toolchain that
-    // will reach the same answer buys nothing.
+    // `NoEvidence` decided HERE, on discovery's roots, is deliberately still cached. It
+    // is a stable property of the machine rather than an accident of one moment, and
+    // re-walking a toolchain that will reach the same answer buys nothing. The one
+    // decided on the walk (`foldedNothing` below) is not cached, because a later hit
+    // asks only discovery's roots and would serve it.
     //
     // A cache HIT needs only this test, because a hit did no walk: the entry it
     // returns was written by a run that completed one.

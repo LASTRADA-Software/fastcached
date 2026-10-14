@@ -792,7 +792,9 @@ TEST_CASE("An empty 32-bit KitsRoot10 still reaches the native view", "[toolchai
     // alone never read the native view, and the machine's `cl` lost the whole SDK
     // half of its identity while the VC half kept `MsvcLayout` off its `INCLUDE`
     // fallback too. It then fingerprinted differently from an identically
-    // toolchained peer, with no diagnostic at either end.
+    // toolchained peer, with no diagnostic at either end. (That was before #1656;
+    // those roots now reach only the stamp, so the cost is a re-survey, never a
+    // split.)
     ScriptedToolchainHost host;
     constexpr std::string_view roots = R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)";
     constexpr std::string_view kits = "C:/Program Files (x86)/Windows Kits/10";
@@ -2681,12 +2683,12 @@ constexpr std::string_view Clang22Banner = "clang version 22.1.3";
 
 TEST_CASE("A triple names the MSVC environment or does not", "[toolchain-probe][fingerprint-tree]")
 {
-    CHECK(TargetsMsvc("x86_64-pc-windows-msvc"));
+    REQUIRE(TargetsMsvc("x86_64-pc-windows-msvc"));
     CHECK(TargetsMsvc("x86_64-pc-windows-msvc19.51.36231"));
     CHECK(TargetsMsvc("aarch64-pc-windows-msvc19.44.35207"));
 
     // Windows, but reading headers of their own: MinGW and Cygwin ship them.
-    CHECK_FALSE(TargetsMsvc("x86_64-w64-windows-gnu"));
+    REQUIRE_FALSE(TargetsMsvc("x86_64-w64-windows-gnu"));
     CHECK_FALSE(TargetsMsvc("x86_64-pc-windows-cygnus"));
     CHECK_FALSE(TargetsMsvc("x86_64-pc-linux-gnu"));
     CHECK_FALSE(TargetsMsvc(""));
@@ -2717,9 +2719,9 @@ TEST_CASE("An installed Visual Studio language pack does not split cl", "[toolch
 
     auto const [a, aSpawns] = ClIdentity(englishHost, englishCl, Cl1451Banner);
     auto const [b, bSpawns] = ClIdentity(germanHost, germanCl, Cl1451Banner);
-    CHECK(a.Usable());
-    CHECK(b.Usable());
-    CHECK(a.fingerprint == b.fingerprint);
+    REQUIRE(a.Usable());
+    REQUIRE(b.Usable());
+    REQUIRE(a.fingerprint == b.fingerprint);
 
     // `cl` is asked nothing for its fingerprint: the layout is read, and the tree the
     // row selects is empty by construction.
@@ -2745,7 +2747,7 @@ TEST_CASE("cl is identified without its toolset's and SDK's header contents", "[
 
     auto const [a, aSpawns] = ClIdentity(oneHost, oneCl, Cl1451Banner);
     auto const [b, bSpawns] = ClIdentity(twoHost, twoCl, Cl1451Banner);
-    CHECK(a.fingerprint == b.fingerprint);
+    REQUIRE(a.fingerprint == b.fingerprint);
 
     // The trees are still what discovery reports and what the evidence records, so a
     // node keeps noticing an SDK being installed beside the toolset -- unchanged by
@@ -2775,7 +2777,7 @@ TEST_CASE("Two cl toolsets are told apart by their banners", "[toolchain-probe][
     auto const x86 =
         ClIdentity(host, cl, "Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36231 for x86").first.fingerprint;
 
-    CHECK(x64 != older);
+    REQUIRE(x64 != older);
     CHECK(x64 != x86);
     CHECK(older != x86);
 
@@ -2800,7 +2802,7 @@ TEST_CASE("A cl that cannot be asked its version is no identity, whatever its la
     REQUIRE_FALSE(MsvcToolsetIncludeRoots(host, cl).empty());
 
     auto const identity = ClIdentity(host, cl, NormalizedCompilerName(cl)).first;
-    CHECK(identity.defect == IdentityDefect::NoEvidence);
+    REQUIRE(identity.defect == IdentityDefect::NoEvidence);
 
     // A real banner over the same layout is the control.
     CHECK(ClIdentity(host, cl, Cl1451Banner).first.Usable());
@@ -2830,9 +2832,9 @@ TEST_CASE("A clang targeting MSVC is identified by its own tree, not the MSVC it
 
     auto const first = ClangIdentity(oneRunner, oneHost, a);
     auto const second = ClangIdentity(twoRunner, twoHost, b);
-    CHECK(first.Usable());
-    CHECK(second.Usable());
-    CHECK(first.fingerprint == second.fingerprint);
+    REQUIRE(first.Usable());
+    REQUIRE(second.Usable());
+    REQUIRE(first.fingerprint == second.fingerprint);
 
     // Asked for its resource directory once, on the walk -- the `-v` output already
     // named the target, so that cost no spawn.
@@ -2875,7 +2877,7 @@ TEST_CASE("A clang targeting anything else still folds every tree it searches", 
     ClangProbeRunner threeRunner { ClangVerbose(LinuxTriple, LinuxTriple, c.roots), c.resourceDir };
 
     auto const first = ClangIdentity(oneRunner, oneHost, a);
-    CHECK(first.fingerprint != ClangIdentity(twoRunner, twoHost, b).fingerprint);
+    REQUIRE(first.fingerprint != ClangIdentity(twoRunner, twoHost, b).fingerprint);
 
     // And identical libstdc++ agrees -- the control that the split above is the
     // CONTENT's doing.
@@ -2902,7 +2904,7 @@ TEST_CASE("An MSVC-targeting clang whose resource probe cannot run is refused an
     runner.RefuseResourceProbe();
 
     auto const identity = CachedFingerprintSerially(runner, host, clang.compiler, Clang22Banner, DriverOf(Flavor::Clang));
-    CHECK(identity.defect == IdentityDefect::UnrunProbe);
+    REQUIRE(identity.defect == IdentityDefect::UnrunProbe);
     CHECK_FALSE(identity.evidence.has_value());
     CHECK(runner.ResourceProbes() == 1);
     CHECK(StoredFingerprint(state).empty());
@@ -2933,7 +2935,7 @@ TEST_CASE("cl, clang-cl and an MSVC-targeting clang++ stay three toolchains",
 
     auto const msvc = ClIdentity(host, cl, Clang22Banner).first;
 
-    CHECK(clangxx.fingerprint != clangCl.fingerprint);
+    REQUIRE(clangxx.fingerprint != clangCl.fingerprint);
     CHECK(clangxx.fingerprint != msvc.fingerprint);
     CHECK(clangCl.fingerprint != msvc.fingerprint);
 
@@ -2955,7 +2957,7 @@ TEST_CASE("A stamp names the fingerprint schema it validates", "[toolchain-probe
     auto const current = ComputeToolchainStamp("cc 1.0", compiler, roots);
     REQUIRE_FALSE(current.empty());
     CHECK(current == ComputeToolchainStamp("cc 1.0", compiler, roots, FingerprintSchema));
-    CHECK(current != ComputeToolchainStamp("cc 1.0", compiler, roots, "toolchain-v2"));
+    REQUIRE(current != ComputeToolchainStamp("cc 1.0", compiler, roots, "toolchain-v2"));
 }
 
 TEST_CASE("A cache entry another fingerprint schema wrote is recomputed, not served", "[toolchain-probe][fingerprint-tree]")
@@ -3001,13 +3003,13 @@ TEST_CASE("A cache entry another fingerprint schema wrote is recomputed, not ser
     // The control: planted under THIS schema it is served, so the planting reaches
     // the reader and the case below is not passing by a missed file.
     plant(FingerprintSchema);
-    CHECK(CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang)).fingerprint
-          == "bogus-fingerprint");
+    REQUIRE(CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang)).fingerprint
+            == "bogus-fingerprint");
 
     // Planted under another schema it is a miss: recomputed, and written back.
     plant("toolchain-v2");
     auto const recomputed = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
-    CHECK(recomputed.fingerprint == real.fingerprint);
+    REQUIRE(recomputed.fingerprint == real.fingerprint);
     CHECK(StoredFingerprint(state) == real.fingerprint);
 }
 
@@ -3033,7 +3035,7 @@ TEST_CASE("One MSVC-targeting clang fingerprints alike under the gcc and the cla
     auto const asClang = ClangIdentity(viaClang, host, clang);
 
     CHECK(asGcc.Usable());
-    CHECK(asGcc.fingerprint == asClang.fingerprint);
+    REQUIRE(asGcc.fingerprint == asClang.fingerprint);
     CHECK(viaGcc.ResourceProbes() == 1);
 }
 
@@ -3056,7 +3058,7 @@ TEST_CASE("An MSVC-targeting clang that folds no tree and cannot name itself is 
     auto const fallback = NormalizedCompilerName(clang.compiler);
 
     auto const first = CachedFingerprintSerially(runner, host, clang.compiler, fallback, DriverOf(Flavor::Clang));
-    CHECK(first.defect == IdentityDefect::NoEvidence);
+    REQUIRE(first.defect == IdentityDefect::NoEvidence);
     CHECK(StoredFingerprint(state).empty());
 
     // Asked again with no refresh: still refused, because nothing was cached to hit.
@@ -3069,4 +3071,8 @@ TEST_CASE("An MSVC-targeting clang that folds no tree and cannot name itself is 
     auto const named = CachedFingerprintSerially(
         runner, host, clang.compiler, Clang22Banner, DriverOf(Flavor::Clang), /*forceRefresh=*/true);
     CHECK(named.Usable());
+
+    // And that one IS written, so the empty store asserted above is the refusal's
+    // doing rather than a fixture that could never write one.
+    CHECK_FALSE(StoredFingerprint(state).empty());
 }
