@@ -814,6 +814,33 @@ TEST_CASE("A decline says WHICH kind, from either end of the fleet", "[dispatch]
     CHECK(refused.decline != noWorker);
 }
 
+TEST_CASE("A worker whose in-flight byte budget is full is tallied apart from withdrawn slots", "[dispatch][decline]")
+{
+    // #1667. A granted compile the WORKER refused `endpoint-busy`: it had slots and no memory.
+    // Read as "matching workers had withdrawn their slots" it blamed somebody using the machines
+    // while one worker refused half its leases -- so it is its own cause and its own tally row.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy, "200 of 256 MiB held"));
+    std::vector<std::string> const args { "-O2" };
+    auto const result = Dispatch(fleet, Request(args));
+
+    REQUIRE(result.status == DispatchStatus::Declined);
+    REQUIRE(result.decline == DeclineCause::ByteBudgetFull);
+    CHECK(result.declinedAt
+          == std::optional {
+              ExchangeSite { .endpoint = std::string { Worker }, .opcode = std::to_underlying(Wire::Op::Compile) } });
+
+    // The tally key: its own sentence, and never the withdrawn one.
+    auto const recorded = RecordingFor(result.status, result.decline);
+    CHECK(recorded.outcome == DispatchOutcome::Declined);
+    CHECK(recorded.reason == "a node's in-flight byte budget was full");
+    CHECK(recorded.reason != RecordingFor(DispatchStatus::Declined, DeclineCause::Withdrawn).reason);
+    // The peer's figures change per refusal, so they stay on the verbose line, not the log column.
+    CHECK(SpecificsFor(result).empty());
+    CHECK(result.detail.contains("200 of 256 MiB held"));
+}
+
 TEST_CASE("An argument no worker runs is refused before a lease is asked for", "[dispatch][decline][denied]")
 {
     // The worker refuses these by a row no `--allow-compile-arg` can lift, so asking cost a

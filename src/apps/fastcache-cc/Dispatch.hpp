@@ -455,6 +455,15 @@ enum class DeclineCause : std::uint8_t
     /// somebody is using them, or a scratch disk is full. The fleet is big enough
     /// and unavailable, which is a different purchase from being too small.
     Withdrawn,
+    /// A node had slots free and no MEMORY: its in-flight byte budget, which every compile
+    /// running there holds its whole request against, was full (`EndpointBusy`).
+    ///
+    /// **Its own row, never `Withdrawn`'s**, because the remedy is on the worker and is
+    /// neither of `Withdrawn`'s: raise `--compile-inflight-max` (or the slots it is derived
+    /// from), or look at translation units that preprocess unusually large. Folded into
+    /// "withdrawn their slots" it was invisible -- one worker refused half the leases it was
+    /// granted in a single build and the tally blamed somebody using the machines (#1667).
+    ByteBudgetFull,
     /// Another client already holds the lease for this key.
     ///
     /// **Not a fault, and its own row for exactly that reason.** This is duplicate
@@ -485,11 +494,12 @@ enum class DeclineCause : std::uint8_t
     ArgumentRefused,
     /// The job was larger than a worker's surface takes.
     ///
-    /// A FLEET fact for the same reason `ArgumentRefused` is one: the ceiling is a constant of the
-    /// worker's build (`WorkerMaxRequestBytes`), so every worker of that build refuses the same
-    /// translation unit alike, and "one machine to go and look at" would send an operator to a
-    /// machine for a property of the unit. Nothing to fix on either end; the compile runs here,
-    /// correctly, and the peer's message naming the ceiling rides `DispatchResult::refusal`.
+    /// A FLEET fact for the same reason `ArgumentRefused` is one: the ceiling is the worker's
+    /// `--compile-request-max` (`WorkerMaxRequestBytes` unless raised), which a fleet configures
+    /// alike, so every worker refuses the same translation unit alike, and "one machine to go
+    /// and look at" would send an operator to a machine for a property of the unit. Nothing to
+    /// fix on either end; the compile runs here, correctly, and the peer's message naming the
+    /// ceiling rides `DispatchResult::refusal`.
     TooLarge,
     /// The fleet could not name a leader to ask.
     ///
@@ -579,10 +589,11 @@ inline constexpr std::array DeclineCauseTable {
     // build has never heard of.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ClusterChangeInFlight, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ClusterChangeNotNeeded, .cause = DeclineCause::NotPermitted },
-    // Slots were free and MEMORY was not, which the worker's own rule calls a
-    // momentary fullness the peer retries past -- the same answer as a withdrawn
-    // slot, and not a machine to go and inspect.
-    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EndpointBusy, .cause = DeclineCause::Withdrawn },
+    // Slots were free and MEMORY was not. The launcher still compiles locally, as it does for
+    // a withdrawn slot -- but the remedy is a budget an operator can raise, so it is tallied
+    // apart rather than read as a fleet somebody else is using (#1667). From a scheduler's
+    // endpoint it means the same thing: that node's in-flight byte budget was full.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EndpointBusy, .cause = DeclineCause::ByteBudgetFull },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::MalformedRegistration, .cause = DeclineCause::ProtocolMismatch },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::LeaseUnauthorized, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::LeaseEndpointMismatch, .cause = DeclineCause::NotPermitted },
