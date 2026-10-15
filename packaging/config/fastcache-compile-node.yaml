@@ -163,10 +163,12 @@
 # answers with SIGKILL and no diagnostic.
 #drain_timeout:
 
-# the largest compile request this worker accepts, bounding both the frame and
-# the size its compressed source declares it expands to (default 256m; k/m/g =
-# KiB/MiB/GiB). A larger translation unit is refused payload-too-large and
-# compiled locally. Read at startup only.
+# the largest compile request this worker accepts: the size its compressed
+# source declares it expands to (default 256m, below 4g; k/m/g = KiB/MiB/GiB).
+# Raising it also raises the frame cap of every verb on this node's port, cache
+# stores included; lowering it leaves the frame cap at the cache's 256m. A
+# larger translation unit is refused payload-too-large and compiled locally.
+# Read at startup only.
 #compile_request_max:
 
 # the bytes every compile running here may hold at once, each charged its whole

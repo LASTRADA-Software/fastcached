@@ -667,6 +667,28 @@ namespace
         return static_cast<std::uint64_t>(*parsed);
     }
 
+    /// `--compile-request-max`: `ParseCompileBytes`, and no larger than a frame can say.
+    ///
+    /// A frame declares its payload in a u32 (`CompileCacheWire::MaxFramePayload`), so a
+    /// ceiling past it is one no request could ever reach -- and the derived budget, which
+    /// follows the ceiling, would reserve gigabytes for nothing. Refused by name rather than
+    /// clamped, so the operator sees the figure they typed was not the one in force. The BUDGET
+    /// takes no such bound: it is many requests' worth, and past 4 GiB is a real answer.
+    /// @param sv Text to parse.
+    /// @return The size in bytes, or why it is not one.
+    [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCompileRequestBytes(std::string_view sv)
+    {
+        return ParseCompileBytes(sv).and_then([](std::uint64_t bytes) -> std::expected<std::uint64_t, ConfigError> {
+            if (bytes > CompileCacheWire::MaxFramePayload)
+                return std::unexpected(
+                    ArgvError(ConfigErrorCode::OutOfRange,
+                              std::format("must be at most {} bytes: a frame declares its length in 32 bits, so no request "
+                                          "could ever be larger",
+                                          CompileCacheWire::MaxFramePayload)));
+            return bytes;
+        });
+    }
+
     /// The fleet `--fleet-id` pins this node to: text, then `Cluster::ParsePinnedFleet`'s grammar.
     ///
     /// Refused by name here rather than accepted and matched by nothing: a truncated copy of what
@@ -1234,12 +1256,15 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .primary = "--compile-request-max",
             .arity = Arity::Value,
             .operand = "=<size>",
-            .apply = AssignFrom<&NodeConfig::compileRequestMaxBytes, ParseCompileBytes>(),
-            .description = "the largest compile request this worker accepts,\n"
-                           "bounding both the frame and the size its compressed\n"
-                           "source declares it expands to (default 256m;\n"
-                           "k/m/g = KiB/MiB/GiB). A larger translation unit is\n"
-                           "refused payload-too-large and compiled locally.",
+            .apply = AssignFrom<&NodeConfig::compileRequestMaxBytes, ParseCompileRequestBytes>(),
+            .description = "the largest compile request this worker accepts:\n"
+                           "the size its compressed source declares it expands\n"
+                           "to (default 256m, below 4g; k/m/g = KiB/MiB/GiB).\n"
+                           "Raising it also raises the frame cap of every verb\n"
+                           "on this node's port, cache stores included; lowering\n"
+                           "it leaves the frame cap at the cache's 256m. A larger\n"
+                           "translation unit is refused payload-too-large and\n"
+                           "compiled locally.",
             .yamlKey = "compile_request_max",
             .same = FieldEq<&NodeConfig::compileRequestMaxBytes>(),
             .component = &WorkerComponent,

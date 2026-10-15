@@ -557,8 +557,8 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Operator verbs refused because the surface had no bytes left in flight. These are "
               "the verbs somebody reaches for when a node is in trouble, so this is the node "
               "answering that it is too busy to say what it is. It names the request that was "
-              "refused, not the load that exhausted the budget -- on a node holding a tier that "
-              "is the cache's traffic, the listener's ceiling folding to the largest owner's. "
+              "refused, not the load that exhausted the budget -- usually the cache's traffic or a "
+              "worker's compiles, the listener's ceiling folding to the largest owner's. "
               "Read beside fastcache_node_cache_requests_refused_endpoint_busy_total rather than "
               "summed with it: this says the diagnosis failed, that says why.",
       .type = MetricType::Counter },
@@ -585,8 +585,9 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Cache verbs refused because the request would not fit in the bytes already in "
               "flight on this surface. A slot was free and the memory was not. This is the "
               "byte-budget refusal a node with a cache tier reaches, the listener's in-flight "
-              "ceiling being the largest of the components present and that usually being the "
-              "cache's. Never sum with fastcache_worker_jobs_refused_endpoint_busy_total or "
+              "ceiling being the largest of the components present: the cache's 256 MiB, or on "
+              "a worker of five or more slots its compile budget, which cache reads then share. "
+              "Never sum with fastcache_worker_jobs_refused_endpoint_busy_total or "
               "fastcache_node_frame_connections_refused_at_capacity_total, which share the "
               "endpoint-busy code and nothing else.",
       .type = MetricType::Counter },

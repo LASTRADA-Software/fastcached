@@ -103,10 +103,12 @@ namespace Detail
     ///
     /// The byte budget is the arm #491 was filed about, and the one this surface
     /// counts. `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's
-    /// budget, which on any node holding a tier is this cache's, so the endpoint's
-    /// in-flight ceiling IS the cache's ceiling and the refusal that fires in practice
-    /// is a `STORE`. Answered correctly and counted nowhere, that is #326's scenario
-    /// one surface over: the port is hammered and the graph is flat.
+    /// budget: on a node holding a tier and no worker of five or more slots that is this
+    /// cache's 256 MiB, and on a worker of five or more slots it is the compile budget
+    /// (slots x 64 MiB, #1667), so cache and shared-cache reads may then hold up to THAT.
+    /// Either way a `STORE` is what runs into it on a cache node. Answered correctly and
+    /// counted nowhere, that is #326's scenario one surface over: the port is hammered
+    /// and the graph is flat.
     ///
     /// The earlier position -- that the budget is "a transient the peer retries past"
     /// -- is sound for the SCHEDULER, whose ceiling is kilobytes and whose series is
@@ -637,7 +639,8 @@ class CacheResponder final: public IFrameResponder
     ///
     /// **The byte budget is counted here** (#491), because it is the one a node with a
     /// cache tier actually reaches: the endpoint's in-flight ceiling folds to the
-    /// largest owner's, which is this cache's, so a `STORE` is what runs into it.
+    /// largest owner's -- this cache's, unless the node runs a worker of five or more
+    /// slots, whose compile budget is larger (#1667) -- so a `STORE` is what runs into it.
     /// `Detail::CacheEndpointRefusals` carries that and the two credential arms, which
     /// `MergedResponder` routes to the session component and this surface therefore
     /// never sees.
@@ -697,6 +700,12 @@ class CacheResponder final: public IFrameResponder
     /// That keeps this endpoint's peak footprint where the serialized loop used to
     /// hold it, without reintroducing the serialization -- and since the connection
     /// cap above stopped being a request cap, this is the only thing that does.
+    ///
+    /// **This is the cache's own figure, not necessarily the pool its reads are held
+    /// in.** The listener's pool folds to the LARGEST owner (`MergedResponder`), and on a
+    /// worker of five or more slots that is the compile budget (#1667) -- one pool for the
+    /// listener, because a per-component pool has nowhere to live (#1338) -- so there a
+    /// `STORE` may be read while the pool holds more than 256 MiB.
     [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
     {
         return 256ULL * 1024ULL * 1024ULL;
@@ -1295,8 +1304,12 @@ class MergedResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::MaxInFlightBytes
     ///
-    /// The largest, and in practice the cache's: a scheduler verb's payload is
-    /// kilobytes, so the budget that matters is the one sized for object files.
+    /// The largest. A scheduler verb's payload is kilobytes, so this is the cache's 256 MiB
+    /// on a node without a worker -- and on a worker of five or more slots the compile
+    /// budget (slots x 64 MiB, #1667), which then also governs the reads of
+    /// `Store`/`Fetch`/`SharedStore`/`SharedFetch` and the sealed frames held before their
+    /// tag check. Kept as ONE pool on purpose: a per-component pool has nowhere to live
+    /// (#1338), so the bound a cache read meets grows with the worker's slots.
     [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
     {
         return Largest(&IFrameResponder::MaxInFlightBytes);

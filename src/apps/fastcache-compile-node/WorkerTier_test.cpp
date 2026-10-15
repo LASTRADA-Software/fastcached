@@ -54,6 +54,7 @@
 #include <tests/SteppedDrainWait.hpp>
 #include <tests/SurfaceOwnerFakes.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -969,6 +970,16 @@ TEST_CASE("A worker's in-flight budget follows its slots and admits a slot's wor
     cache.PlaceCeilings(WorkerMaxRequestBytes, 256, 256 * MiB);
     MergedResponder const merged { SurfaceComponents { .cache = &cache, .compile = &tier.Responder() } };
     CHECK(merged.MaxInFlightBytes() == 1920 * MiB);
+
+    namespace Wire = CompileCacheWire;
+    // And the compile responder is now the pool's OWNER (#1667's recorded consequence): a
+    // budget refusal for a verb nobody here owns -- a LEASE, on a node with no scheduler -- is
+    // answered and counted by the owner whose budget ran out, the compile surface, not the cache.
+    auto const busy =
+        merged.EndpointRefusalReply(EndpointRefusal::InFlightBudget, static_cast<std::uint8_t>(Wire::Op::Lease), {});
+    CHECK(Testing::ErrorOf(busy) == Wire::ErrorCode::EndpointBusy);
+    CHECK(cache.Refusals().empty());
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy) == 1);
 }
 
 TEST_CASE("A worker's compile ceilings come from the RESOLVED slots and the options, never a constant",

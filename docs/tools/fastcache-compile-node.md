@@ -3254,8 +3254,8 @@ that compiles run side by side. Two ceilings bound memory, and both are options:
 
 | Option | Default | What it bounds |
 | --- | --- | --- |
-| `--compile-request-max` (`compile_request_max`) | `256m` | One compile request: the frame's length **and** the size its compressed source declares it expands to |
-| `--compile-inflight-max` (`compile_inflight_max`) | slots × `64m`, never below `256m` nor below `--compile-request-max` | Every compile running on this worker at once, each charged its whole request **for the whole compile** — from the moment it arrives until its answer is written, not only while it is being read |
+| `--compile-request-max` (`compile_request_max`) | `256m`, below `4g` | One compile request: the size its compressed source declares it expands to. **Raising** it also raises the frame-length cap of this node's whole `0xFC` port — the listener takes the largest of its components' caps — so `STORE`, `FETCH` and the shared-cache verbs may then carry frames that large too; **lowering** it leaves the frame cap at the cache's `256m` and bounds only the declared expansion |
+| `--compile-inflight-max` (`compile_inflight_max`) | slots × `64m`, never below `256m` nor below `--compile-request-max` | Every compile running on this worker at once, each charged its whole request **for the whole compile** — from the moment the compile is admitted until it answers, not only while it is being read. (The read itself is charged to the listener's pool below; only the slot, not the bytes, is held until the answer is written.) |
 
 The budget is derived from the slot count the worker actually runs — the one
 `--slots` names, or the one it derives when `--slots` is omitted — so a 1-slot
@@ -3279,7 +3279,8 @@ fastcache-compile-node --compile-inflight-max=4g ...
 ```
 
 Both take `k`/`m`/`g`; zero is refused, since a zero ceiling would admit no compile
-at all. A `--compile-inflight-max` below `--compile-request-max` is refused at
+at all, and so is a `--compile-request-max` of `4g` or more, which no frame's 32-bit
+length could ever reach. A `--compile-inflight-max` below `--compile-request-max` is refused at
 startup — and at `--install-service` — because one request of the size the worker
 promises to accept could then never be admitted. Both are **restart-only**: the
 request ceiling and the budget are fixed when the worker tier starts, and compiles
@@ -3294,12 +3295,15 @@ on the client. A compile refused by the budget is told `endpoint-busy` rather th
 `no-capacity`, and counted as
 `fastcache_worker_jobs_refused_endpoint_busy_total`: slots were free and memory was
 not, so more machines would not have helped. `fastcache-cc --show-stats` tallies it
-as `a node's in-flight byte budget was full`, apart from withdrawn slots. A rising
+as `a node had no room for another request (endpoint-busy)`, apart from withdrawn slots. A rising
 count is the signal to raise `--compile-inflight-max`.
 
 The node's one `0xFC` listener holds its own pool of bytes for frames still being
 read, sized to the largest budget any of its components declares — so it follows the
-compile budget and never undercuts it.
+compile budget and never undercuts it. It is ONE pool: the cache and shared-cache
+surfaces share it too, so on a worker of five or more slots, whose compile budget is
+the largest, a `STORE` or `FETCH` being read may hold up to that budget rather than
+the cache's own `256m`.
 
 Because the compiles now outlive the accept loop, stopping the node waits for
 them. A stop closes the listener first, so nothing new is admitted, and then waits

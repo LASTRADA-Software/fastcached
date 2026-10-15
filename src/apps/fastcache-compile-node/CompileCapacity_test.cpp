@@ -467,11 +467,17 @@ TEST_CASE("The default in-flight compile budget follows the slots, above a floor
           "[node][worker][capacity]")
 {
     // #1667. Distinct inputs, distinct answers: a budget that ignored the slots reads 256 MiB for
-    // all three counts, and one with no floor reads 64 MiB for the one-slot worker.
+    // all three counts.
     constexpr auto MiB = std::size_t { 1024 } * 1024;
-    REQUIRE(DefaultCompileByteBudget(1, WorkerMaxRequestBytes) == 256 * MiB);
-    CHECK(DefaultCompileByteBudget(8, WorkerMaxRequestBytes) == 512 * MiB);
+    REQUIRE(DefaultCompileByteBudget(8, WorkerMaxRequestBytes) == 512 * MiB);
+    CHECK(DefaultCompileByteBudget(1, WorkerMaxRequestBytes) == 256 * MiB);
     CHECK(DefaultCompileByteBudget(30, WorkerMaxRequestBytes) == 1920 * MiB);
+
+    // The 256 MiB FLOOR, asked below the default ceiling: at 256 MiB the request term equals
+    // the floor, so only a SMALLER ceiling shows whether the floor is there at all -- without it
+    // a one-slot worker with a 64 MiB ceiling would hold 64 MiB.
+    REQUIRE(DefaultCompileByteBudget(1, 64 * MiB) == 256 * MiB);
+    CHECK(DefaultCompileByteBudget(8, 64 * MiB) == 512 * MiB);
 
     // Never below the per-request ceiling, which `IsChargeable` needs: a raised ceiling the
     // derived budget could not hold once would be `endpoint-busy` on an idle worker.

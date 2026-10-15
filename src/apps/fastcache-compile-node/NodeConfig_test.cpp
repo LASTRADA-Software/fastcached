@@ -7043,12 +7043,38 @@ TEST_CASE("NodeConfig: the worker's compile ceilings are options, derived from t
     // count the worker RUNS -- which the caller hands in from `WorkerSlotsOf`, never the flag.
     constexpr auto MiB = std::uint64_t { 1024 } * 1024;
     auto const unnamed = Testing::FirstStart(NodeConfig {});
-    REQUIRE_FALSE(unnamed.compileInflightMaxBytes.has_value());
-    CHECK_FALSE(unnamed.compileRequestMaxBytes.has_value());
-    CHECK(CompileRequestMaxOf(unnamed) == WorkerMaxRequestBytes);
-    CHECK(CompileByteBudgetOf(unnamed, 1) == 256 * MiB);
-    CHECK(CompileByteBudgetOf(unnamed, 8) == 512 * MiB);
-    CHECK(CompileByteBudgetOf(unnamed, 30) == 1920 * MiB);
+
+    SECTION("unnamed, the budget is derived from the slot count handed in")
+    {
+        REQUIRE(CompileByteBudgetOf(unnamed, 8) == 512 * MiB);
+        CHECK_FALSE(unnamed.compileInflightMaxBytes.has_value());
+        CHECK_FALSE(unnamed.compileRequestMaxBytes.has_value());
+        CHECK(CompileRequestMaxOf(unnamed) == WorkerMaxRequestBytes);
+        CHECK(CompileByteBudgetOf(unnamed, 1) == 256 * MiB);
+        CHECK(CompileByteBudgetOf(unnamed, 30) == 1920 * MiB);
+    }
+
+    SECTION("a lowered request ceiling keeps the 256 MiB floor")
+    {
+        auto const lowered = ParseNodeArgv({ "--compile-request-max=64m" });
+        REQUIRE(lowered.has_value());
+        REQUIRE(CompileByteBudgetOf(*lowered, 1) == 256 * MiB);
+        CHECK(CompileRequestMaxOf(*lowered) == 64 * MiB);
+    }
+
+    SECTION("a request ceiling a frame could never reach is refused, the budget is not")
+    {
+        auto const tooLarge = ParseNodeArgv({ "--compile-request-max=4g" });
+        REQUIRE_FALSE(tooLarge.has_value());
+        CHECK(tooLarge.error().context.contains("32 bits"));
+        auto const largest = ParseNodeArgv({ "--compile-request-max=4194303k" });
+        REQUIRE(largest.has_value());
+        CHECK(CompileRequestMaxOf(*largest) == std::size_t { 4194303 } * 1024);
+        // The budget is many requests' worth, so past 4 GiB is a real answer.
+        auto const budget = ParseNodeArgv({ "--compile-inflight-max=8g" });
+        REQUIRE(budget.has_value());
+        CHECK(budget->compileInflightMaxBytes == std::optional<std::uint64_t> { 8192 * MiB });
+    }
 
     SECTION("from the command line, a named budget overrides the derivation")
     {

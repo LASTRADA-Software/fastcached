@@ -2634,7 +2634,16 @@ spelled it the same way, which is what makes this a drift rather than a discover
     exactly as it did for `FrameEndpoint`, and the byte budget had to land in the
     same commit rather than after it. Serving one at a time bounded peak memory to a
     single `MaxRequestBytes` by accident; `slots` jobs each declaring the maximum is
-    `slots` times it -- 8 GiB on a 32-slot node, asked for by any cluster member.
+    `slots` times it -- 8 GiB on a 32-slot node, asked for by any cluster member. The
+    budget still grows with `slots`, but by a chosen per-slot figure rather than by the
+    ceiling (#1667): `slots` times 64 MiB (a quarter of the default per-request ceiling),
+    never below 256 MiB nor below the ceiling, inside the 1 GiB per slot the slot clamp
+    already assumes -- because a flat 256 MiB refused half the leases a 30-slot worker
+    was granted on 12-22 MiB translation units. Both are options
+    (`--compile-request-max`, `--compile-inflight-max`, restart-only). And the
+    listener's one pool folds to the LARGEST owner, so on a worker of five or more slots
+    the cache and shared-cache reads share the compile budget (#1338 is why there is one
+    pool).
     Checked on the DECLARED length before a payload byte is read, and refused with
     `EndpointBusy` and its own counter: slots were free and memory was not, so
     reporting it as `NoCapacity` would send an operator to buy machines that would
@@ -3992,6 +4001,14 @@ half from passing. The in-process fleet asserts it from addresses nobody listed
 ## Open work
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
+- **[#1667](https://github.com/LASTRADA-Software/fastcached/issues/1667)** — a worker's
+  memory ceilings are options now (`--compile-request-max`, `--compile-inflight-max`) and
+  the budget follows the slots, but three parts stay open there: `fastcache-cli node`
+  (NODE-STATUS) does not carry the two figures, because its runtime record is a positional
+  field list rather than a table, so only the worker's startup line states them; the
+  SCHEDULER does not know a worker's byte budget nor hear of its `EndpointBusy` refusals
+  (no RELEASE outcome, no heartbeat field), so it keeps granting leases a full worker will
+  refuse; and `CompileCapacity::Bytes::TryRaiseTo` has no caller.
 - **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
   has no cancellable seam, so a compile whose client has GONE runs to completion and this
   machine pays for an object nobody will read. The departure is already detected and

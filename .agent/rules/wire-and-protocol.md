@@ -293,7 +293,14 @@ Every rule below has already been a bug.
       copies of the same bytes. The sum would buy a number that still is not the peak,
       at the price of refusing one honest maximal translation unit on an idle worker —
       which is dividing the per-request cap by the slot count, arrived at from the
-      other side. What matters is that the bound does not grow with `slots`.
+      other side. What matters is that the bound grows with `slots` by a figure CHOSEN
+      for what a compile holds, never by the per-request ceiling: since #1667 the
+      default budget is `slots` times 64 MiB (`WorkerInFlightBytesPerSlot`, a quarter of
+      the default per-request ceiling, sized from measured translation units), never
+      below 256 MiB nor below the per-request ceiling -- inside the 1 GiB per slot the
+      slot clamp already assumes a compile may cost. `slots` times the CEILING is what
+      #241 closed and stays closed. An operator names another budget with
+      `--compile-inflight-max`, refused at startup below `--compile-request-max`.
     - **A price nothing could ever pay is not charged at all.** A footprint above the
       *whole* budget is the per-request ceiling, which `Unenvelope` answers by name
       with `payload-too-large` and without allocating. Reserved for, it comes back
