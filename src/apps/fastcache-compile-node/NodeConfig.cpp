@@ -1260,11 +1260,12 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .description = "the largest compile request this worker accepts:\n"
                            "the size its compressed source declares it expands\n"
                            "to (default 256m, below 4g; k/m/g = KiB/MiB/GiB).\n"
-                           "Raising it also raises the frame cap of every verb\n"
-                           "on this node's port, cache stores included; lowering\n"
-                           "it leaves the frame cap at the cache's 256m. A larger\n"
-                           "translation unit is refused payload-too-large and\n"
-                           "compiled locally.",
+                           "Raising it also raises this port's frame cap for\n"
+                           "the verbs the session cap governs -- compile, store,\n"
+                           "fetch, shared-store, shared-fetch -- and no other;\n"
+                           "lowering it leaves that cap at the cache's 256m. A\n"
+                           "larger translation unit is refused\n"
+                           "payload-too-large and compiled locally.",
             .yamlKey = "compile_request_max",
             .same = FieldEq<&NodeConfig::compileRequestMaxBytes>(),
             .component = &WorkerComponent,
@@ -1280,8 +1281,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "answers; k/m/g = KiB/MiB/GiB. Default: 64m per slot,\n"
                            "never below 256m nor below --compile-request-max.\n"
                            "Full, a compile is refused endpoint-busy and runs on\n"
-                           "the client. A value below --compile-request-max is\n"
-                           "refused at startup.",
+                           "the client. It also sizes this port's ONE pool of\n"
+                           "bytes being read, which cache and shared-cache\n"
+                           "reads share, so a large value loosens that bound\n"
+                           "too. A value below --compile-request-max is refused\n"
+                           "at startup.",
             .yamlKey = "compile_inflight_max",
             .same = FieldEq<&NodeConfig::compileInflightMaxBytes>(),
             .component = &WorkerComponent,

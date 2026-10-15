@@ -699,7 +699,7 @@ class IMetricsSink
         /// am*. It names the REQUEST that was refused rather than the load that
         /// exhausted the budget -- usually the cache's traffic on a node holding a tier,
         /// or the compiles on a worker, since the listener's ceiling folds to the
-        /// largest owner's (the compile budget on a worker of five or more slots, #1667).
+        /// largest owner's (the compile budget wherever it exceeds the cache's 256 MiB, #1667).
         ///
         /// A rise here is therefore read together with
         /// `NodeCacheRequestsRefusedEndpointBusy` rather than summed with it: this one
@@ -743,9 +743,10 @@ class IMetricsSink
         ///
         /// **The byte-budget refusal a node with a tier actually reaches.**
         /// `MergedResponder::MaxInFlightBytes()` folds to the largest owner's budget:
-        /// the cache's 256 MiB on a node without a big worker, and the compile budget on
-        /// a worker of five or more slots (slots x 64 MiB, #1667), where cache reads may
-        /// hold up to that. Either way a `STORE` is what runs into it.
+        /// the cache's 256 MiB, or a worker's compile budget wherever that exceeds it --
+        /// five or more slots, a raised `--compile-request-max`, or a typed
+        /// `--compile-inflight-max` (#1667) -- where cache reads may hold up to that. Either way a `STORE` is what runs into
+        /// it.
         ///
         /// **Never summed with `WorkerJobsRefusedEndpointBusy` or
         /// `NodeFrameConnectionsRefusedAtCapacity`.** Three refusals answer

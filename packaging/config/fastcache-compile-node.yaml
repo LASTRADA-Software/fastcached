@@ -165,17 +165,20 @@
 
 # the largest compile request this worker accepts: the size its compressed
 # source declares it expands to (default 256m, below 4g; k/m/g = KiB/MiB/GiB).
-# Raising it also raises the frame cap of every verb on this node's port, cache
-# stores included; lowering it leaves the frame cap at the cache's 256m. A
-# larger translation unit is refused payload-too-large and compiled locally.
+# Raising it also raises this port's frame cap for the verbs the session cap
+# governs -- compile, store, fetch, shared-store, shared-fetch -- and no other;
+# lowering it leaves that cap at the cache's 256m. A larger translation unit is
+# refused payload-too-large and compiled locally.
 # Read at startup only.
 #compile_request_max:
 
 # the bytes every compile running here may hold at once, each charged its whole
 # request until it answers; k/m/g = KiB/MiB/GiB. Default: 64m per slot, never
 # below 256m nor below compile_request_max. Full, a compile is refused
-# endpoint-busy and runs on the client. A value below compile_request_max is
-# refused at startup. Read at startup only.
+# endpoint-busy and runs on the client. It also sizes this port's ONE pool of
+# bytes being read, which cache and shared-cache reads share, so a large value
+# loosens that bound too. A value below compile_request_max is refused at
+# startup. Read at startup only.
 #compile_inflight_max:
 
 # cores never offered to the fleet, overriding what the node class reserves.

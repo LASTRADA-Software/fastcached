@@ -535,9 +535,9 @@ TEST_CASE("(#491) the cache surface counts the frame ceiling and the byte budget
     SECTION("the in-flight byte budget, which is the one a node with a tier reaches")
     {
         // `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's budget,
-        // which on a node holding a cache tier and no worker of five or more slots is this
-        // cache's (on such a worker it is the compile budget, #1667) -- so a `STORE` is
-        // what runs into it, and this surface is where it is counted.
+        // which on a node holding a cache tier is this cache's unless a worker's compile
+        // budget exceeds it (#1667) -- so a `STORE` is what runs into it, and this surface
+        // is where it is counted.
         auto const before = AllCounters(fixture.metrics);
         auto const reply = responder.EndpointRefusalReply(EndpointRefusal::InFlightBudget, fetch, "full");
 

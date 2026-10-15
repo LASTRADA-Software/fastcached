@@ -201,8 +201,9 @@ namespace
     constexpr EnumTable<EndpointRefusal, EndpointRefusalRow> EndpointRefusals { {
         { .refusal = EndpointRefusal::InFlightBudget,
           // Counted, and it names the REQUEST that was refused rather than the load that
-          // exhausted the budget: on any node holding a tier the surface ceiling folds to
-          // the cache's, so what a rise here says is that the DIAGNOSIS failed. That is
+          // exhausted the budget: the surface ceiling folds to the largest owner's -- the
+          // cache's, or a worker's compile budget wherever that is larger (#1667) -- so what a
+          // rise here says is that the DIAGNOSIS failed. That is
           // exactly when an operator is reaching for these verbs, so a flat graph would
           // be the worst possible moment to have one.
           .policy = { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedEndpointBusy, .rationale = {} } },

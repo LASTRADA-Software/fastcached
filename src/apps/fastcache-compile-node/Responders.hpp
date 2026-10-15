@@ -103,9 +103,10 @@ namespace Detail
     ///
     /// The byte budget is the arm #491 was filed about, and the one this surface
     /// counts. `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's
-    /// budget: on a node holding a tier and no worker of five or more slots that is this
-    /// cache's 256 MiB, and on a worker of five or more slots it is the compile budget
-    /// (slots x 64 MiB, #1667), so cache and shared-cache reads may then hold up to THAT.
+    /// budget: this cache's 256 MiB, unless the node runs a worker whose compile budget
+    /// EXCEEDS 256 MiB -- five or more slots, a raised `--compile-request-max`, or a typed
+    /// `--compile-inflight-max` (#1667) -- when it is that budget, and cache and
+    /// shared-cache reads may then hold up to THAT.
     /// Either way a `STORE` is what runs into it on a cache node. Answered correctly and
     /// counted nowhere, that is #326's scenario one surface over: the port is hammered
     /// and the graph is flat.
@@ -165,7 +166,8 @@ namespace Detail
             case CompileCacheWire::PrePayloadDecision::PayloadTooLarge:
                 // **The arm #491 names.** Twenty-four bytes and no body is the cheapest
                 // probe there is, and the surface-wide frame ceiling on a node holding
-                // a tier is this cache's -- so an operator alerting on the compile
+                // a tier is at least this cache's (a raised `--compile-request-max` lifts
+                // it, #1667) -- so an operator alerting on the compile
                 // surface's series watches a flat graph while the port is hammered.
                 //
                 // The position this replaces -- that the framing arms are "already
@@ -639,8 +641,8 @@ class CacheResponder final: public IFrameResponder
     ///
     /// **The byte budget is counted here** (#491), because it is the one a node with a
     /// cache tier actually reaches: the endpoint's in-flight ceiling folds to the
-    /// largest owner's -- this cache's, unless the node runs a worker of five or more
-    /// slots, whose compile budget is larger (#1667) -- so a `STORE` is what runs into it.
+    /// largest owner's -- this cache's, unless the node runs a worker whose compile budget
+    /// exceeds 256 MiB, which is then the pool (#1667) -- so a `STORE` is what runs into it.
     /// `Detail::CacheEndpointRefusals` carries that and the two credential arms, which
     /// `MergedResponder` routes to the session component and this surface therefore
     /// never sees.
@@ -703,7 +705,9 @@ class CacheResponder final: public IFrameResponder
     ///
     /// **This is the cache's own figure, not necessarily the pool its reads are held
     /// in.** The listener's pool folds to the LARGEST owner (`MergedResponder`), and on a
-    /// worker of five or more slots that is the compile budget (#1667) -- one pool for the
+    /// worker whose compile budget exceeds 256 MiB -- five or more slots, a raised
+    /// `--compile-request-max`, or a typed `--compile-inflight-max` -- that is the compile
+    /// budget (#1667) -- one pool for the
     /// listener, because a per-component pool has nowhere to live (#1338) -- so there a
     /// `STORE` may be read while the pool holds more than 256 MiB.
     [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
@@ -1271,7 +1275,8 @@ class MergedResponder final: public IFrameResponder
     /// property of the VERB: this is the session cap, and the session cap governs
     /// exactly the three payload-bearing verbs. Every scheduler verb declares
     /// `BoundedTo(MaxControlPayload)` in the wire table and stays bounded in kilobytes
-    /// on a surface whose session cap is the cache's 256 MiB. Without that column this
+    /// on a surface whose session cap is at least the cache's 256 MiB (more where a worker's
+    /// `--compile-request-max` is raised, #1667). Without that column this
     /// number could not exist, which is why #284 was a blocker rather than a nicety.
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
     {
@@ -1305,11 +1310,12 @@ class MergedResponder final: public IFrameResponder
     /// @copydoc IFrameResponder::MaxInFlightBytes
     ///
     /// The largest. A scheduler verb's payload is kilobytes, so this is the cache's 256 MiB
-    /// on a node without a worker -- and on a worker of five or more slots the compile
-    /// budget (slots x 64 MiB, #1667), which then also governs the reads of
+    /// unless the node runs a worker whose compile budget exceeds it -- five or more slots,
+    /// a raised `--compile-request-max`, or a typed `--compile-inflight-max` (#1667) -- when
+    /// it is that budget, which then also governs the reads of
     /// `Store`/`Fetch`/`SharedStore`/`SharedFetch` and the sealed frames held before their
     /// tag check. Kept as ONE pool on purpose: a per-component pool has nowhere to live
-    /// (#1338), so the bound a cache read meets grows with the worker's slots.
+    /// (#1338), so the bound a cache read meets follows the worker's budget.
     [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
     {
         return Largest(&IFrameResponder::MaxInFlightBytes);

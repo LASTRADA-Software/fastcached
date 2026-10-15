@@ -2641,9 +2641,10 @@ spelled it the same way, which is what makes this a drift rather than a discover
     already assumes -- because a flat 256 MiB refused half the leases a 30-slot worker
     was granted on 12-22 MiB translation units. Both are options
     (`--compile-request-max`, `--compile-inflight-max`, restart-only). And the
-    listener's one pool folds to the LARGEST owner, so on a worker of five or more slots
-    the cache and shared-cache reads share the compile budget (#1338 is why there is one
-    pool).
+    listener's one pool folds to the LARGEST owner, so wherever the compile budget
+    exceeds the cache's 256 MiB -- five or more slots, a raised `--compile-request-max`, a
+    typed `--compile-inflight-max` -- the cache and shared-cache reads share it (#1338 is
+    why there is one pool).
     Checked on the DECLARED length before a payload byte is read, and refused with
     `EndpointBusy` and its own counter: slots were free and memory was not, so
     reporting it as `NoCapacity` would send an operator to buy machines that would

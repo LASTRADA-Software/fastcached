@@ -585,8 +585,8 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Cache verbs refused because the request would not fit in the bytes already in "
               "flight on this surface. A slot was free and the memory was not. This is the "
               "byte-budget refusal a node with a cache tier reaches, the listener's in-flight "
-              "ceiling being the largest of the components present: the cache's 256 MiB, or on "
-              "a worker of five or more slots its compile budget, which cache reads then share. "
+              "ceiling being the largest of the components present: the cache's 256 MiB, or a "
+              "worker's compile budget wherever that is larger, which cache reads then share. "
               "Never sum with fastcache_worker_jobs_refused_endpoint_busy_total or "
               "fastcache_node_frame_connections_refused_at_capacity_total, which share the "
               "endpoint-busy code and nothing else.",

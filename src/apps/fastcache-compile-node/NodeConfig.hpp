@@ -267,9 +267,11 @@ struct NodeConfig
 
     /// The largest compile request this worker accepts, when the operator named one.
     ///
-    /// Bounds both the frame's declared length and the size its codec envelope declares it
-    /// expands to, which is ONE value handed to `Cc::WorkerProtocol` and read back by the
-    /// surface (`CompileRequestMaxOf`). Absent is `WorkerMaxRequestBytes`, 256 MiB.
+    /// Bounds the size a compile's codec envelope declares it expands to, ONE value handed to
+    /// `Cc::WorkerProtocol` and read back by the compile surface (`CompileRequestMaxOf`).
+    /// It reaches the listener's FRAME cap only when RAISED: that cap is the largest of the
+    /// components', and every node carries the shared cache's 256 MiB, so a lower value
+    /// bounds the envelope alone. Absent is `WorkerMaxRequestBytes`, 256 MiB.
     ///
     /// An `optional` for `slots`' reason: it is this row's provenance, so a registration
     /// replays a value the operator typed and never bakes in today's default (#1667).

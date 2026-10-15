@@ -434,8 +434,12 @@ inline constexpr std::chrono::seconds DrainReportInterval { 2 };
 /// exceeds this surface's ceiling, and it cannot see the listener that enforced the
 /// frame length — so the surface has to hand it the number. Since #1667 that number is
 /// the RESOLVED `--compile-request-max` (`CompileRequestMaxOf`), handed to the protocol
-/// once and read back from it by `CompileResponder::MaxRequestBytes`, so the frame cap and
-/// the envelope cap are still one value rather than two that must agree.
+/// once and read back from it by `CompileResponder::MaxRequestBytes`, so the compile
+/// surface's frame cap and the envelope cap are still one value rather than two that must
+/// agree. The listener's EFFECTIVE frame cap for a COMPILE is the merged fold, the largest
+/// of its components' (`MergedResponder::MaxRequestBytes`), and every node carries the
+/// shared-cache owner at 256 MiB -- so it is never below 256 MiB, and a lowered ceiling
+/// bounds the envelope only.
 inline constexpr std::size_t WorkerMaxRequestBytes = 256ULL * 1024ULL * 1024ULL;
 
 /// What a worker's in-flight compile budget grows by for each slot, when no

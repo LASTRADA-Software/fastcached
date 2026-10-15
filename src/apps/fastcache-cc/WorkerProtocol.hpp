@@ -414,7 +414,9 @@ class WorkerProtocol
 /// still is not the peak, at the price of refusing one honest maximal translation
 /// unit on an idle worker -- which is the same mistake as dividing the per-request
 /// cap by the slot count, arrived at from the other side. What matters, and what
-/// this restores, is that the bound does not grow with `slots`.
+/// this restores, is that the bound does not grow by the per-request CEILING per slot:
+/// it grows by a chosen per-slot figure (64 MiB since #1667, `DefaultCompileByteBudget`),
+/// or is the operator's `--compile-inflight-max`.
 ///
 /// Lives HERE, beside the code that spends it, rather than in the accept loop that
 /// charges it: which field of which verb carries an envelope is `Compile`'s own
