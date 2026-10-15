@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "TicketCredentials.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 
 #include <algorithm>
@@ -18,6 +19,29 @@ namespace Wire = CompileCacheWire;
 
 namespace
 {
+    /// What a failed mint means for the exchanges after it, per `MintRetry`.
+    struct MintConsequenceRow
+    {
+        MintRetry retry;              ///< Whether the node is asked again.
+        std::string_view consequence; ///< What is KNOWN about the exchanges, and nothing more.
+    };
+
+    /// Says only what is KNOWN (#1664): an exchange asked again may yet carry a ticket, so a
+    /// per-exchange failure speaks for its own exchange alone; and whether an exchange without one is
+    /// refused is its audience's decision -- a cache with authentication off serves it.
+    constexpr EnumTable<MintRetry, MintConsequenceRow> MintConsequenceTable { {
+        { .retry = MintRetry::PerExchange,
+          .consequence = "this exchange carries no ticket, and if its cache or scheduler requires one it will be "
+                         "refused and its compile run locally" },
+        { .retry = MintRetry::NotAgain,
+          .consequence = "the node is not asked again by this process, so every exchange with another machine "
+                         "carries no ticket from here on, and one whose cache or scheduler requires a ticket will "
+                         "be refused and its compile run locally" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(MintConsequenceTable, &MintConsequenceRow::retry),
+                  "MintConsequenceTable must hold one row per MintRetry, in enumerator order");
+
     /// @param missing Why an exchange presented no ticket, if it did not.
     /// @param cause What its refusal means to an operator.
     /// @return The missing ticket's reason when a ticket would have answered the refusal.
@@ -107,15 +131,14 @@ PresentedCredential TicketCredentials::MintedCredential(std::string_view audienc
 
 PresentedCredential TicketCredentials::Failed(MintFailure failure, std::string_view detail)
 {
-    // Says only what is KNOWN: no ticket. Whether an exchange without one is refused is its
-    // audience's decision -- a cache with authentication off serves it (#1664).
-    if (!_said && _sink)
-        _sink(std::format("{} ({}); exchanges with other machines carry no ticket, and one whose cache or "
-                          "scheduler requires a ticket will be refused and its compile run locally",
-                          ReasonFor(failure),
-                          detail));
+    // Said on the first failure, and again when a failure is REMEMBERED: that is new information
+    // about every later exchange, which a first per-exchange line did not claim. At most twice.
+    auto const retry = RetryFor(failure);
+    if ((!_said || retry == MintRetry::NotAgain) && _sink)
+        _sink(std::format(
+            "{} ({}); {}", ReasonFor(failure), detail, MintConsequenceTable[static_cast<std::size_t>(retry)].consequence));
     _said = true;
-    if (RetryFor(failure) == MintRetry::NotAgain)
+    if (retry == MintRetry::NotAgain)
         _remembered = failure;
     return PresentedCredential { .credential = {}, .missing = failure };
 }

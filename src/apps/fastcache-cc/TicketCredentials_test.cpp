@@ -12,7 +12,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -70,6 +69,7 @@ class RecordingExchange final: public IEndpointExchange
         Ticket,
         Refused,
         Unreachable,
+        Stalled, ///< Accepted, then outran the budget (`TransportFailure::Expired`).
         Empty,
     };
 
@@ -92,6 +92,11 @@ class RecordingExchange final: public IEndpointExchange
                 return RefusalOf(Wire::ErrorCode::NotAMember);
             case Mint::Unreachable:
                 return OutcomeOf(CacheOutcomeKind::Transport);
+            case Mint::Stalled: {
+                auto stalled = OutcomeOf(CacheOutcomeKind::Transport);
+                stalled.transportFailure = TransportFailure::Expired;
+                return stalled;
+            }
             case Mint::Empty:
                 return OutcomeOf(CacheOutcomeKind::Hit);
         }
@@ -333,20 +338,25 @@ TEST_CASE("A node that answers is asked once per exchange, a refusal included", 
         { .what = "refusing", .mint = RecordingExchange::Mint::Refused, .expectedMints = 3 },
         { .what = "answering with no ticket", .mint = RecordingExchange::Mint::Empty, .expectedMints = 3 },
         { .what = "not answering", .mint = RecordingExchange::Mint::Unreachable, .expectedMints = 1 },
+        // Accepted and then stalled: asking again would charge the exchange's whole TOTAL each time,
+        // so it is remembered although `MarksUnreachable` would not remember it.
+        { .what = "accepting and then stalling", .mint = RecordingExchange::Mint::Stalled, .expectedMints = 1 },
     });
     for (auto const& row: rows)
     {
         INFO(row.what);
         Minting fix;
         fix.raw.mint = row.mint;
-        auto presented = std::vector<PresentedCredential> {};
+        auto secrets = std::vector<std::string> {};
+        auto expected = std::vector<std::string> {};
         for (auto const audience: audiences)
-            presented.push_back(fix.tickets.Present(audience));
+        {
+            secrets.emplace_back(fix.tickets.Present(audience).credential.secret.View());
+            expected.push_back("ticket-for:" + std::string { audience });
+        }
         REQUIRE(fix.Mints() == row.expectedMints);
-        if (row.mint != RecordingExchange::Mint::Ticket)
-            continue;
-        for (auto const& [audience, each]: std::views::zip(audiences, presented))
-            CHECK(each.credential.secret.View() == "ticket-for:" + std::string { audience });
+        if (row.mint == RecordingExchange::Mint::Ticket)
+            CHECK(secrets == expected);
     }
 }
 
@@ -401,20 +411,61 @@ TEST_CASE("A mint connects under the loopback bound and keeps the exchange's tot
     STATIC_REQUIRE(LoopbackConnectBound < ExchangeBudget {}.connect);
 }
 
-TEST_CASE("A failed mint says no ticket was minted, never that the exchanges are refused", "[cc][ticket]")
+TEST_CASE("A failed mint says what is known about the exchanges, never that they are refused", "[cc][ticket]")
 {
     // #1664: against a cache with authentication off, the exchanges were served while the line said
-    // they "go unauthenticated and are refused". Only the audience knows whether it refuses.
+    // they "go unauthenticated and are refused". Only the audience knows whether it refuses; and a
+    // failure asked again speaks for its own exchange alone, since the next may yet carry a ticket.
+    struct Row
+    {
+        char const* what;
+        RecordingExchange::Mint mint;
+        MintFailure failure;
+        std::string_view says;
+        std::string_view mustNotSay;
+    };
+    auto const rows = std::to_array<Row>({
+        { .what = "remembered",
+          .mint = RecordingExchange::Mint::Unreachable,
+          .failure = MintFailure::Unreachable,
+          .says = "not asked again by this process, so every exchange with another machine carries no ticket from here on",
+          .mustNotSay = "this exchange carries no ticket" },
+        { .what = "asked again",
+          .mint = RecordingExchange::Mint::Refused,
+          .failure = MintFailure::Refused,
+          .says = "this exchange carries no ticket, and if its cache or scheduler requires one it will be refused",
+          .mustNotSay = "every exchange" },
+    });
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        Minting fix;
+        fix.raw.mint = row.mint;
+        std::ignore = fix.tickets.Present("office.corp:6674");
+        REQUIRE(fix.said.size() == 1);
+        auto const& line = fix.said.front();
+        REQUIRE(line.contains(row.says));
+        CHECK(line.starts_with(ReasonFor(row.failure)));
+        CHECK_FALSE(line.contains(row.mustNotSay));
+        CHECK_FALSE(line.contains("are refused"));
+        CHECK_FALSE(line.contains("go unauthenticated"));
+    }
+}
+
+TEST_CASE("A failure asked again and a later one remembered are each said", "[cc][ticket]")
+{
+    // The first line spoke for one exchange; the remembered failure is news about every later one.
     Minting fix;
-    fix.raw.mint = RecordingExchange::Mint::Unreachable;
+    fix.raw.mint = RecordingExchange::Mint::Refused;
     std::ignore = fix.tickets.Present("office.corp:6674");
+    std::ignore = fix.tickets.Present("10.0.0.7:6676");
     REQUIRE(fix.said.size() == 1);
-    auto const& line = fix.said.front();
-    CHECK(line.starts_with(ReasonFor(MintFailure::Unreachable)));
-    REQUIRE(line.contains("carry no ticket"));
-    CHECK(line.contains("one whose cache or scheduler requires a ticket will be refused"));
-    CHECK_FALSE(line.contains("are refused"));
-    CHECK_FALSE(line.contains("go unauthenticated"));
+    fix.raw.mint = RecordingExchange::Mint::Unreachable;
+    std::ignore = fix.tickets.Present("10.0.0.8:6676");
+    std::ignore = fix.tickets.Present("cache.corp:11211");
+    REQUIRE(fix.said.size() == 2);
+    CHECK(fix.said.back().starts_with(ReasonFor(MintFailure::Unreachable)));
+    CHECK(fix.said.back().contains("from here on"));
 }
 
 TEST_CASE("The recorded reason names a missing ticket only for a refusal a ticket would have answered",

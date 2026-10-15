@@ -101,10 +101,15 @@ enum class MintRetry : std::uint8_t
     /// Asked again: the node ANSWERED, so asking cost a loopback round trip, and its answer can
     /// differ per audience or per draw -- a malformed audience, a nonce it could not draw.
     PerExchange,
-    /// Remembered for the process: asking again costs the same bound and cannot learn anything the
-    /// first attempt did not. Stale for at most one compile, and it fails CLOSED -- no ticket, which
-    /// a node-backed cache refuses and the launcher answers by compiling locally.
+    /// Remembered for the process: asking again costs at least the connect bound -- and the
+    /// exchange's whole total for a node that accepted and then stalled -- and cannot learn anything
+    /// the first attempt did not. Stale for the life of the object that remembers it, which every
+    /// owner keeps one-shot (a launcher's one compile, a node's one operator verb; see
+    /// `TicketCredentials`), and it fails CLOSED -- no ticket, which a node-backed cache refuses and
+    /// the launcher answers by compiling locally.
     NotAgain,
+
+    Last, ///< Enumerator count.
 };
 
 /// One row of `MintFailureTable`.
@@ -121,6 +126,10 @@ inline constexpr EnumTable<MintFailure, MintFailureRow> MintFailureTable { {
       .reason = "no machine ticket: nothing configured names the port this machine's node answers on, so it could "
                 "not be asked",
       .retry = MintRetry::NotAgain },
+    // EVERY transport failure, deliberately broader than `MarksUnreachable`, which remembers only a
+    // connect that never completed: that memo steers a FLEET away from a machine for a TTL, so it
+    // errs narrow, while this one lasts one compile and fails closed. A node that accepted and then
+    // stalled (`Expired`) would otherwise charge the exchange's whole total to every exchange.
     { .failure = MintFailure::Unreachable,
       .reason = "no machine ticket: this machine's node did not answer MINT-TICKET",
       .retry = MintRetry::NotAgain },

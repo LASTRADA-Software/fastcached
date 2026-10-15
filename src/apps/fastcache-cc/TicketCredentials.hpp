@@ -116,8 +116,8 @@ inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };
 /// audience, so the lease's would be refused at the worker. Minting is a loopback round trip, far
 /// below the exchange it admits.
 ///
-/// **A mint that fails leaves that exchange unauthenticated, and says why twice**: once per process
-/// through `sink` (one process serves one compile), and as the `missing` half of that exchange's
+/// **A mint that fails leaves that exchange unauthenticated, and says why twice**: through `sink`
+/// on the first failure (and once more if a later one is remembered), and as the `missing` half of that exchange's
 /// `PresentedCredential`, which `RecordedReason` records in place of a refusal it causes. Whether
 /// the exchange IS refused is its audience's decision: a cache with authentication off serves it,
 /// one backed by a node refuses it `NotAMember`, and every refusal ends in a local compile, so a
@@ -127,6 +127,12 @@ inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };
 /// (#1664): without a node, every exchange used to wait out a connect of its own before it went
 /// anywhere. Each later exchange still carries the failure as its `missing`, so a refusal it causes
 /// is explained exactly as the first one's is.
+///
+/// **Precondition: every owner is ONE-SHOT.** The memo never expires, which is sound only because
+/// each object lives for one short unit of work -- the launcher's one compile, a node's one operator
+/// verb -- so a node started meanwhile is asked by the next. A long-lived owner would hold a stale
+/// "no node" for its whole life and must not reuse this object: it would need the memo refreshed on
+/// an interval or a host event, never on a miss (AGENT.md, "Caching an expensive repeated answer").
 class TicketCredentials final: public ICredentialFor
 {
   public:
@@ -137,7 +143,8 @@ class TicketCredentials final: public ICredentialFor
     /// @param passwordFor The endpoint @p password belongs to (`FASTCACHE_ADDR`); ignored when
     ///        @p password is not configured.
     /// @param budget The launcher's exchange budget; a mint runs under `MintBudget` of it.
-    /// @param sink Where a failed mint is said, once; may be empty.
+    /// @param sink Where a failed mint is said: on the first failure, and again if one is remembered;
+    ///        may be empty.
     TicketCredentials(IEndpointExchange& exchange,
                       std::optional<std::string> mintFrom,
                       Credential password,
