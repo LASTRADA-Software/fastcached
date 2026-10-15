@@ -1271,9 +1271,9 @@ TEST_CASE("A founder pinned to its own cluster and its own key is shaped before 
     CHECK(judged.cfg.clusterId == Testing::FoundedClusterId);
     CHECK(judged.report.text.contains("mode: voter"));
     INFO(judged.report.refusal.value_or(std::string {}));
-    CHECK_FALSE(judged.report.refusal.value_or(std::string {}).contains("formation record commits"));
+    CHECK_FALSE(judged.report.refusal.has_value());
     // `--install-service` judges this same shaped configuration before it registers anything.
-    CHECK_FALSE(NodeInstallRejection(judged.cfg).value_or(std::string {}).contains("formation record commits"));
+    CHECK_FALSE(NodeInstallRejection(judged.cfg).has_value());
     // Read, never written: the key on disk is the one minted, and it is the only one.
     auto const reread = ReadHeldNodeKey(scratch.Path());
     REQUIRE(reread.has_value());
@@ -1296,7 +1296,7 @@ TEST_CASE("A founder pinned under another key or to another cluster is still ref
     CHECK(rogue.kept.error().reason.contains(PinRefusal));
     CHECK(rogue.kept.error().stage == StartStage::Formation);
     // The key the record IS committed under, where it said "none".
-    CHECK(rogue.kept.error().reason.contains(std::format("under key {}", ownKeyText)));
+    REQUIRE(rogue.kept.error().reason.contains(std::format("under key {}", ownKeyText)));
     CHECK_FALSE(rogue.kept.error().reason.contains("under key none"));
     CHECK(rogue.report.refusal.has_value());
 
@@ -1325,10 +1325,27 @@ TEST_CASE("A pinned founder's key file that cannot be used is refused by name an
     auto const damaged = JudgeFounderLine(scratch.Path(), pin);
     REQUIRE_FALSE(damaged.kept.has_value());
     INFO(damaged.kept.error().reason);
-    CHECK(damaged.kept.error().reason.contains("but that key cannot be read to compare"));
+    REQUIRE(damaged.kept.error().reason.contains("but that key cannot be read to compare"));
     CHECK(damaged.kept.error().reason.contains(keyFile.string()));
     CHECK_FALSE(damaged.kept.error().reason.contains("reset its state directory"));
     CHECK(TextOf(keyFile) == "not a key file");
+
+    // And it ends a start as that key file ends one -- a verdict on the bytes, `Refused` and never
+    // retried -- not as a transient formation reading the supervisor would restart forever.
+    auto const keyFault = ReadHeldNodeKey(scratch.Path());
+    REQUIRE_FALSE(keyFault.has_value());
+    REQUIRE(damaged.kept.error().stage == StageOf(keyFault.error().fault));
+    CHECK(UnreadStateStage(damaged.cfg) == std::optional { StageOf(keyFault.error().fault) });
+    CHECK(ExitOf(StageOf(keyFault.error().fault)) == ProcessExit::Refused);
+    CHECK(damaged.report.ending == CommandEnding::Declined);
+
+    // A pin naming ANOTHER cluster is refused whatever the key holds, so the key file is not named.
+    auto const elsewhere = JudgeFounderLine(scratch.Path(), PinText("fedcba9876543210fedcba9876543210", ownKey));
+    REQUIRE_FALSE(elsewhere.kept.has_value());
+    INFO(elsewhere.kept.error().reason);
+    REQUIRE_FALSE(elsewhere.kept.error().reason.contains("cannot be read to compare"));
+    CHECK(elsewhere.kept.error().reason.contains(PinRefusal));
+    CHECK(elsewhere.kept.error().stage == StartStage::Formation);
 
     // The same file decides nothing for a founder no pin asks about: no refusal where there was none.
     auto const unpinned = JudgeFounderLine(scratch.Path(), {});

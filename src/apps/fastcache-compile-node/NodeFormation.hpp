@@ -94,8 +94,10 @@ struct NodeFormationView
                                                               Cluster::FleetEndpoints const& remembered);
 
 /// This node's own identity key as its state directory holds it, read and never minted: the key,
-/// nothing when the directory holds none, or why it could not be read.
-using HeldNodeKey = std::expected<std::optional<Ed25519PublicKey>, std::string>;
+/// nothing when the directory holds none, or why it could not be read -- with the key fault's own
+/// stage, so a pinned founder whose key file is damaged ends a start as that file does (`Refused`),
+/// never as a transient formation reading the supervisor retries.
+using HeldNodeKey = std::expected<std::optional<Ed25519PublicKey>, FormationUnread>;
 
 /// `ApplyFormation`, with this node's own key STATED rather than read from @p cfg (#1663).
 ///
@@ -109,11 +111,12 @@ using HeldNodeKey = std::expected<std::optional<Ed25519PublicKey>, std::string>;
 /// @param record The formation record, as loaded or minted.
 /// @param remembered The fleet endpoints this node last knew; empty when there is no file.
 /// @param ownKey This node's own key; its error is why it could not be read, which a refusal names.
-/// @return Nothing, or why the record cannot shape a configuration.
-[[nodiscard]] std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
-                                                              Cluster::FormationRecord const& record,
-                                                              Cluster::FleetEndpoints const& remembered,
-                                                              HeldNodeKey const& ownKey);
+/// @return Nothing, or why the record cannot shape a configuration and the step a start gives up at:
+///         `Formation`, or the key fault's own stage when the key a pin needed could not be read.
+[[nodiscard]] std::expected<void, FormationUnread> ApplyFormation(NodeConfig& cfg,
+                                                                  Cluster::FormationRecord const& record,
+                                                                  Cluster::FleetEndpoints const& remembered,
+                                                                  HeldNodeKey const& ownKey);
 
 /// Whether @p record commits this node to a cluster under this node's OWN key: one it founded and
 /// runs fleet consensus in. A pin judges such a record by that key, so only such a record needs it.
@@ -341,6 +344,15 @@ inline constexpr std::string_view FormationRecordGone =
 /// @return The record to apply.
 [[nodiscard]] Cluster::FormationRecord ProspectiveRecord(KeptFormation const& kept);
 
+/// `ApplyFormation` of @p kept's `ProspectiveRecord`, as every configuration shaped from a READING
+/// is: a record committed under this node's own key is judged by @p cfg's key when the start has
+/// resolved one, and else by the key the reading found (`KeptFormation::ownKey`).
+/// @param cfg The configuration to shape.
+/// @param kept What the state directory holds.
+/// @return Nothing, or why the record cannot shape a configuration and the step a start gives up at:
+///         `Formation`, or the key fault's own stage when the key a pin needed could not be read.
+[[nodiscard]] std::expected<void, FormationUnread> ApplyKeptFormation(NodeConfig& cfg, KeptFormation const& kept);
+
 /// Shape @p cfg by what its state directory keeps, as `main` shapes every configuration before any
 /// verb or rule is asked: by the `ProspectiveRecord` of @p kept.
 ///
@@ -351,14 +363,6 @@ inline constexpr std::string_view FormationRecordGone =
 /// @param cfg The configuration to shape.
 /// @param kept What `ReadStateDirectoryFormation` read, or why it could not.
 /// @return Nothing, or why no record shaped @p cfg.
-/// `ApplyFormation` of @p kept's `ProspectiveRecord`, as every configuration shaped from a READING
-/// is: a record committed under this node's own key is judged by @p cfg's key when the start has
-/// resolved one, and else by the key the reading found (`KeptFormation::ownKey`).
-/// @param cfg The configuration to shape.
-/// @param kept What the state directory holds.
-/// @return Nothing, or why the record cannot shape a configuration.
-[[nodiscard]] std::expected<void, std::string> ApplyKeptFormation(NodeConfig& cfg, KeptFormation const& kept);
-
 [[nodiscard]] std::expected<void, FormationUnread> ShapeByKeptFormation(
     NodeConfig& cfg, std::expected<KeptFormation, FormationUnread> const& kept);
 

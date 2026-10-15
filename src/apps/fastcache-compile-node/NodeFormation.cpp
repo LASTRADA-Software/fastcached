@@ -87,11 +87,13 @@ namespace
     ///         key, the one that would name it, could not be read.
     [[nodiscard]] HeldNodeKey CommitmentSigner(Cluster::FormationRecord const& record, HeldNodeKey const& ownKey)
     {
+        if (CommittedUnderOwnKey(record))
+            return ownKey;
         if (record.joining.has_value())
             return record.joining->provenKey;
         if (record.fleet.has_value())
             return record.fleet->admittedBy;
-        return ownKey;
+        return std::optional<Ed25519PublicKey> {};
     }
 } // namespace
 
@@ -99,7 +101,8 @@ std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
                                                 Cluster::FormationRecord const& record,
                                                 Cluster::FleetEndpoints const& remembered)
 {
-    return ApplyFormation(cfg, record, remembered, HeldNodeKey { cfg.identityPublicKey });
+    return ApplyFormation(cfg, record, remembered, HeldNodeKey { cfg.identityPublicKey })
+        .transform_error([](FormationUnread unread) { return std::move(unread.reason); });
 }
 
 bool CommittedUnderOwnKey(Cluster::FormationRecord const& record) noexcept
@@ -107,38 +110,44 @@ bool CommittedUnderOwnKey(Cluster::FormationRecord const& record) noexcept
     return Cluster::CommittedClusterId(record).has_value() && !record.joining.has_value() && !record.fleet.has_value();
 }
 
-std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
-                                                Cluster::FormationRecord const& record,
-                                                Cluster::FleetEndpoints const& remembered,
-                                                HeldNodeKey const& ownKey)
+std::expected<void, FormationUnread> ApplyFormation(NodeConfig& cfg,
+                                                    Cluster::FormationRecord const& record,
+                                                    Cluster::FleetEndpoints const& remembered,
+                                                    HeldNodeKey const& ownKey)
 {
+    auto const refused = [](std::string reason) {
+        return std::unexpected { FormationUnread { .reason = std::move(reason), .stage = StartStage::Formation } };
+    };
     // Before anything is shaped: a record the pin refuses describes a node this one must not be.
     if (auto const committed = Cluster::CommittedClusterId(record); committed.has_value())
     {
         auto const held = CommitmentSigner(record, ownKey);
-        // A key that could not be read decides nothing until a pin asks for it. Then the refusal is
-        // the reading's, never the remedy below: resetting the state directory would discard the
-        // very key the pin may name.
-        if (!held.has_value() && FleetPinOf(cfg).fleet.has_value())
-            return std::unexpected { std::format(
-                "the formation record commits this node to cluster {1} (it is {0}) under its own key, and --fleet-id "
-                "pins it to {2}, but that key cannot be read to compare: {3}",
-                Cluster::NodeModeRowFor(record.mode).name,
-                *committed,
-                Cluster::PinText(FleetPinOf(cfg)),
-                held.error()) };
+        // A key that could not be read decides nothing until a pin naming THIS cluster asks for it --
+        // a pin naming another is refused whatever the key holds, and the key file is not its problem.
+        // Then the refusal is the reading's, at the key fault's own stage, never the remedy below:
+        // resetting the state directory would discard the very key the pin may name.
+        auto const pin = FleetPinOf(cfg);
+        if (!held.has_value() && pin.fleet.has_value() && pin.fleet->clusterId == *committed)
+            return std::unexpected { FormationUnread {
+                .reason = std::format("the formation record commits this node to cluster {1} (it is {0}) under its own "
+                                      "key, and --fleet-id pins it to {2}, but that key cannot be read to compare: {3}",
+                                      Cluster::NodeModeRowFor(record.mode).name,
+                                      *committed,
+                                      Cluster::PinText(pin),
+                                      held.error().reason),
+                .stage = held.error().stage } };
         auto const signer = held.value_or(std::nullopt);
         auto const signers =
             signer.has_value() ? std::span<Ed25519PublicKey const> { &*signer, 1 } : std::span<Ed25519PublicKey const> {};
-        if (!Cluster::AdmitsFleet(FleetPinOf(cfg), *committed, signers))
-            return std::unexpected { std::format(
+        if (!Cluster::AdmitsFleet(pin, *committed, signers))
+            return refused(std::format(
                 "the formation record commits this node to cluster {1} (it is {0}) under key {3}, which --fleet-id "
                 "does not name, and --fleet-id pins it to {2}: if that is the fleet this node belongs to, reset its "
                 "state directory so it starts alone and joins it; if {1} is, change --fleet-id",
                 Cluster::NodeModeRowFor(record.mode).name,
                 *committed,
                 Cluster::PinText(FleetPinOf(cfg)),
-                signer.has_value() ? FormatEd25519PublicKey(*signer) : std::string { "none" }) };
+                signer.has_value() ? FormatEd25519PublicKey(*signer) : std::string { "none" }));
     }
 
     auto view = NodeFormationView { .mode = record.mode,
@@ -151,7 +160,7 @@ std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
     {
         auto members = FleetMembersOf(*record.fleet, cfg.nodeId);
         if (!members.has_value())
-            return std::unexpected { std::move(members).error() };
+            return refused(std::move(members).error());
         view.fleetMembers = *std::move(members);
     }
 
@@ -365,7 +374,7 @@ Cluster::FormationRecord ProspectiveRecord(KeptFormation const& kept)
     return kept.record.value_or(Cluster::FormationRecord {});
 }
 
-std::expected<void, std::string> ApplyKeptFormation(NodeConfig& cfg, KeptFormation const& kept)
+std::expected<void, FormationUnread> ApplyKeptFormation(NodeConfig& cfg, KeptFormation const& kept)
 {
     // The start's own reading of the key, once it has one, over the reading beside the record: the
     // key this process proves itself with is the one it is judged by.
@@ -377,11 +386,7 @@ std::expected<void, FormationUnread> ShapeByKeptFormation(NodeConfig& cfg,
                                                           std::expected<KeptFormation, FormationUnread> const& kept)
 {
     // A record that was read and that `ApplyFormation` refuses is the formation's own step.
-    auto shaped = kept.and_then([&cfg](KeptFormation const& held) {
-        return ApplyKeptFormation(cfg, held).transform_error([](std::string reason) {
-            return FormationUnread { .reason = std::move(reason), .stage = StartStage::Formation };
-        });
-    });
+    auto shaped = kept.and_then([&cfg](KeptFormation const& held) { return ApplyKeptFormation(cfg, held); });
     if (!shaped.has_value())
         cfg.formationUnread = shaped.error();
     return shaped;

@@ -430,8 +430,9 @@ std::expected<KeptFormation, FormationUnread> ReadStateDirectoryFormation(std::f
 KeptFormation WithHeldNodeKey(KeptFormation kept, std::filesystem::path const& stateDirectory)
 {
     if (kept.record.has_value() && CommittedUnderOwnKey(*kept.record))
-        kept.ownKey =
-            ReadHeldNodeKey(stateDirectory).transform_error([](NodeKeyRefusal const& refusal) { return refusal.message; });
+        kept.ownKey = ReadHeldNodeKey(stateDirectory).transform_error([](NodeKeyRefusal refusal) {
+            return FormationUnread { .reason = std::move(refusal.message), .stage = StageOf(refusal.fault) };
+        });
     return kept;
 }
 

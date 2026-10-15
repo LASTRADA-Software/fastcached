@@ -122,7 +122,7 @@ std::expected<NodeConfig, std::string> ShapedForService(NodeConfig const& cfg, I
         return std::unexpected { std::move(kept).error() };
     auto shaped = cfg;
     if (auto applied = ApplyKeptFormation(shaped, *kept); !applied.has_value())
-        return std::unexpected { std::move(applied).error() };
+        return std::unexpected { std::move(applied).error().reason };
     return shaped;
 }
 
