@@ -663,6 +663,19 @@ std::expected<void, NodeKeyRefusal> JudgeStateDirectory(std::filesystem::path co
     return RefuseForeignStateFiles(stateDirectory, guard);
 }
 
+std::expected<std::optional<Ed25519PublicKey>, NodeKeyRefusal> ReadHeldNodeKey(std::filesystem::path const& stateDirectory)
+{
+    auto const path = stateDirectory / NodeKeyFileName;
+    auto recorded = ReadKeyFile(path);
+    if (!recorded.has_value())
+        return std::unexpected { std::move(recorded).error() };
+    if (!recorded->has_value())
+        return std::optional<Ed25519PublicKey> {};
+    return DecodeNodeKeyFile(**recorded, path).transform([](Ed25519KeyPair const& pair) {
+        return std::optional { pair.PublicKey() };
+    });
+}
+
 std::expected<NodeKey, NodeKeyRefusal> ResolveNodeKey(std::filesystem::path const& stateDirectory,
                                                       ISecureRandom& random,
                                                       INodeKeyFileGuard& guard)

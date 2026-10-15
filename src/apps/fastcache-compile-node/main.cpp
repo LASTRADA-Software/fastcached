@@ -2528,7 +2528,9 @@ int main(int argc, char** argv)
 
     // Shaped by what was read; where nothing could shape it, told WHY (`ShapeByKeptFormation`), so the
     // mode line and the `--raft-self` row name the reading's refusal -- that row told an operator who
-    // had typed `--listen-raft` that its absence was the cause.
+    // had typed `--listen-raft` that its absence was the cause. A record this node FOUNDED is judged
+    // against `--fleet-id` by its own key, which no identity has resolved yet here: the reading
+    // read it beside the record, minting nothing (`WithHeldNodeKey`, #1663).
     auto shaped = Node::ShapeByKeptFormation(cfg, keptFormation).and_then([&] {
         return Node::ShapeByKeptFormation(cliOnly, keptFormation);
     });

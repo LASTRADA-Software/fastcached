@@ -108,9 +108,11 @@ std::expected<KeptFormation, std::string> StateDirectoryFormationReader::Read() 
     auto const& directory = *_directory;
     Cluster::FileFormationStore const store { directory };
     Cluster::FleetEndpointsFile endpoints { directory };
-    return ReadKeptFormation(store, endpoints).transform_error([&directory](std::string const& error) {
-        return error + StateFileUnreadableHint(directory / Cluster::FormationRecordFileName);
-    });
+    return ReadKeptFormation(store, endpoints)
+        .transform([&directory](KeptFormation kept) { return WithHeldNodeKey(std::move(kept), directory); })
+        .transform_error([&directory](std::string const& error) {
+            return error + StateFileUnreadableHint(directory / Cluster::FormationRecordFileName);
+        });
 }
 
 std::expected<NodeConfig, std::string> ShapedForService(NodeConfig const& cfg, IKeptFormationReader const& formation)
@@ -119,7 +121,7 @@ std::expected<NodeConfig, std::string> ShapedForService(NodeConfig const& cfg, I
     if (!kept.has_value())
         return std::unexpected { std::move(kept).error() };
     auto shaped = cfg;
-    if (auto applied = ApplyFormation(shaped, ProspectiveRecord(*kept), kept->remembered); !applied.has_value())
+    if (auto applied = ApplyKeptFormation(shaped, *kept); !applied.has_value())
         return std::unexpected { std::move(applied).error() };
     return shaped;
 }

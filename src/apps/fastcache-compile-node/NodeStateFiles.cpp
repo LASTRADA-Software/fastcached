@@ -418,11 +418,21 @@ std::expected<KeptFormation, FormationUnread> ReadStateDirectoryFormation(std::f
     }
     Cluster::FileFormationStore const store { stateDirectory };
     Cluster::FleetEndpointsFile endpoints { stateDirectory };
-    return ReadKeptFormation(store, endpoints).transform_error([&stateDirectory](std::string const& error) {
-        return FormationUnread { .reason =
-                                     error + StateFileUnreadableHint(stateDirectory / Cluster::FormationRecordFileName),
-                                 .stage = StartStage::Formation };
-    });
+    return ReadKeptFormation(store, endpoints)
+        .transform([&stateDirectory](KeptFormation kept) { return WithHeldNodeKey(std::move(kept), stateDirectory); })
+        .transform_error([&stateDirectory](std::string const& error) {
+            return FormationUnread { .reason =
+                                         error + StateFileUnreadableHint(stateDirectory / Cluster::FormationRecordFileName),
+                                     .stage = StartStage::Formation };
+        });
+}
+
+KeptFormation WithHeldNodeKey(KeptFormation kept, std::filesystem::path const& stateDirectory)
+{
+    if (kept.record.has_value() && CommittedUnderOwnKey(*kept.record))
+        kept.ownKey =
+            ReadHeldNodeKey(stateDirectory).transform_error([](NodeKeyRefusal const& refusal) { return refusal.message; });
+    return kept;
 }
 
 std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,

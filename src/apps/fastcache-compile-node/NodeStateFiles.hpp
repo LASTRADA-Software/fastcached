@@ -148,6 +148,15 @@ struct NodeStateFileRow
 /// @return A clause to append, opening with its own separator, or empty.
 [[nodiscard]] std::string StateFileUnreadableHint(std::filesystem::path const& path);
 
+/// @p kept with this node's own key read beside it, when its record is committed under that key
+/// (`CommittedUnderOwnKey`, #1663): read from @p stateDirectory and never minted (`ReadHeldNodeKey`).
+/// Both readings a configuration is shaped from before its start resolves the key pass through here
+/// -- `main`'s and the install's -- so the two judge a founder's pin by the same key.
+/// @param kept What the state directory holds.
+/// @param stateDirectory The directory it was read from.
+/// @return @p kept, its `ownKey` read where its record needs it.
+[[nodiscard]] KeptFormation WithHeldNodeKey(KeptFormation kept, std::filesystem::path const& stateDirectory);
+
 /// What @p stateDirectory holds about this node's formation, read the way a start reads it.
 ///
 /// The directory's writers are judged first, then who owns each file (`JudgeStateDirectory`), and
