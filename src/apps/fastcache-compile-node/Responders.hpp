@@ -1273,7 +1273,7 @@ class MergedResponder final: public IFrameResponder
     ///
     /// The largest of the owners', which is safe only because #284 made the ceiling a
     /// property of the VERB: this is the session cap, and the session cap governs
-    /// exactly the three payload-bearing verbs. Every scheduler verb declares
+    /// exactly the five payload-bearing verbs. Every scheduler verb declares
     /// `BoundedTo(MaxControlPayload)` in the wire table and stays bounded in kilobytes
     /// on a surface whose session cap is at least the cache's 256 MiB (more where a worker's
     /// `--compile-request-max` is raised, #1667). Without that column this

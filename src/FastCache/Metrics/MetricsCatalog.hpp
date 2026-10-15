@@ -557,8 +557,8 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Operator verbs refused because the surface had no bytes left in flight. These are "
               "the verbs somebody reaches for when a node is in trouble, so this is the node "
               "answering that it is too busy to say what it is. It names the request that was "
-              "refused, not the load that exhausted the budget -- usually the cache's traffic or a "
-              "worker's compiles, the listener's ceiling folding to the largest owner's. "
+              "refused, not the load that exhausted the budget -- usually the cache's traffic or "
+              "compile uploads still being read, the listener's ceiling folding to the largest owner's. "
               "Read beside fastcache_node_cache_requests_refused_endpoint_busy_total rather than "
               "summed with it: this says the diagnosis failed, that says why.",
       .type = MetricType::Counter },

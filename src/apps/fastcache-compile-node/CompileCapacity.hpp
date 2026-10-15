@@ -453,11 +453,16 @@ inline constexpr std::size_t WorkerMaxRequestBytes = 256ULL * 1024ULL * 1024ULL;
 /// |---|---|---|---|---|
 /// | 12.5 MiB | 14.5 MiB | 18.5 MiB | 20.8 MiB | 21.6 MiB |
 ///
+/// **Measured with `/EP`, which is not what a worker is sent.** `/EP` suppresses line markers
+/// (the cache KEY's preprocess); dispatch preprocesses again with `/E`, `#line` markers kept
+/// (`Cc::CmdLine`), and that text is larger by an amount NOT measured. The per-slot figure's
+/// headroom -- about three times the p99 -- is what absorbs it.
+///
 /// A worker charges each compile its whole request for the whole compile, so a 30-slot
-/// worker needs ~375 MiB (median) to ~555 MiB (p90) in flight to fill its slots -- and at
-/// the flat 256 MiB this budget used to be, one such worker refused 2,246 of 4,274 granted
-/// leases `endpoint-busy` in a single `-j 60` build. 64 MiB is about three times that p99,
-/// and a sixteenth of the 1 GiB per slot (`Distributed::MemoryBudgetPerJobBytes`) the slot
+/// worker needs ~375 MiB (median) to ~555 MiB (p90), ~648 MiB at the max, in flight to fill
+/// its slots -- and at the flat 256 MiB this budget used to be, one such worker refused 2,246
+/// of 4,274 granted leases `endpoint-busy` in a single `-j 60` build. 64 MiB is about three
+/// times that p99, and a sixteenth of the 1 GiB per slot (`Distributed::MemoryBudgetPerJobBytes`) the slot
 /// derivation already assumes a compile may cost, so it adds no memory the slot count had
 /// not already promised.
 inline constexpr std::size_t WorkerInFlightBytesPerSlot = 64ULL * 1024ULL * 1024ULL;

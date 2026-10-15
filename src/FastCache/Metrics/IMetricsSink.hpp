@@ -698,7 +698,8 @@ class IMetricsSink
         /// trouble, and this is the node answering *I am too busy to tell you what I
         /// am*. It names the REQUEST that was refused rather than the load that
         /// exhausted the budget -- usually the cache's traffic on a node holding a tier,
-        /// or the compiles on a worker, since the listener's ceiling folds to the
+        /// or compile uploads still being read on a worker (a running compile has handed its
+        /// reservation to the compile budget by then), since the listener's ceiling folds to the
         /// largest owner's (the compile budget wherever it exceeds the cache's 256 MiB, #1667).
         ///
         /// A rise here is therefore read together with

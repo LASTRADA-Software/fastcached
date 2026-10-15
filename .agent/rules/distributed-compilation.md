@@ -2639,7 +2639,7 @@ spelled it the same way, which is what makes this a drift rather than a discover
     ceiling (#1667): `slots` times 64 MiB (a quarter of the default per-request ceiling),
     never below 256 MiB nor below the ceiling, inside the 1 GiB per slot the slot clamp
     already assumes -- because a flat 256 MiB refused half the leases a 30-slot worker
-    was granted on 12-22 MiB translation units. Both are options
+    was granted on translation units of median 12.5 MiB, max 21.6 MiB. Both are options
     (`--compile-request-max`, `--compile-inflight-max`, restart-only). And the
     listener's one pool folds to the LARGEST owner, so wherever the compile budget
     exceeds the cache's 256 MiB -- five or more slots, a raised `--compile-request-max`, a
