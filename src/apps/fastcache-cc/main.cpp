@@ -1326,8 +1326,9 @@ void ReportVerification(InvocationRecord const& record, Cc::HitComparison const&
 /// node mints for that exchange alone.
 ///
 /// A function-local `static` for `Notice`'s reason: one process serves one compile, so the
-/// first call's configuration is the only one there is. A failed mint is said once through
-/// `Note`, and travels with the exchange it failed for (`PresentedCredential::missing`) into
+/// first call's configuration is the only one there is. A failed mint is said through `Note`
+/// at most twice -- on the first failure, and again if a later one is remembered for the process
+/// (`Cc::MintRetry::NotAgain`) -- and travels with the exchange it failed for (`PresentedCredential::missing`) into
 /// `RecordedReason`, so the record names it only against a refusal it caused. The mint runs
 /// over its own RAW exchange, under `Cc::MintBudget` of the cache's budget: the round trip keeps
 /// the cache's total, the connect is bounded by loopback (#1664).

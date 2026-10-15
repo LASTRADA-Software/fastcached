@@ -116,8 +116,10 @@ inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };
 /// audience, so the lease's would be refused at the worker. Minting is a loopback round trip, far
 /// below the exchange it admits.
 ///
-/// **A mint that fails leaves that exchange unauthenticated, and says why twice**: through `sink`
-/// on the first failure (and once more if a later one is remembered), and as the `missing` half of that exchange's
+/// **A mint that fails leaves that exchange unauthenticated, and says why on two channels.** One is
+/// `sink`, which prints at most two lines per process: one on the first failure, and one more if a
+/// later failure is remembered (`MintRetry::NotAgain`), since that says something new about every
+/// later exchange. The other is the `missing` half of each failed exchange's
 /// `PresentedCredential`, which `RecordedReason` records in place of a refusal it causes. Whether
 /// the exchange IS refused is its audience's decision: a cache with authentication off serves it,
 /// one backed by a node refuses it `NotAMember`, and every refusal ends in a local compile, so a

@@ -423,8 +423,16 @@ TEST_CASE("A failed mint says what is known about the exchanges, never that they
         MintFailure failure;
         std::string_view says;
         std::string_view mustNotSay;
+        std::optional<std::string> mintFrom = std::string { "127.0.0.1:6674" };
     };
     auto const rows = std::to_array<Row>({
+        // Remembered too, but nothing was ever ASKED: no line may say the node is "not asked again".
+        { .what = "no source",
+          .mint = RecordingExchange::Mint::Ticket,
+          .failure = MintFailure::NoSource,
+          .says = "no exchange of this process with another machine carries a ticket",
+          .mustNotSay = "asked again",
+          .mintFrom = std::nullopt },
         { .what = "remembered",
           .mint = RecordingExchange::Mint::Unreachable,
           .failure = MintFailure::Unreachable,
@@ -439,7 +447,7 @@ TEST_CASE("A failed mint says what is known about the exchanges, never that they
     for (auto const& row: rows)
     {
         INFO(row.what);
-        Minting fix;
+        Minting fix { row.mintFrom };
         fix.raw.mint = row.mint;
         std::ignore = fix.tickets.Present("office.corp:6674");
         REQUIRE(fix.said.size() == 1);

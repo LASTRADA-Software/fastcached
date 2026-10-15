@@ -101,10 +101,10 @@ enum class MintRetry : std::uint8_t
     /// Asked again: the node ANSWERED, so asking cost a loopback round trip, and its answer can
     /// differ per audience or per draw -- a malformed audience, a nonce it could not draw.
     PerExchange,
-    /// Remembered for the process: asking again costs at least the connect bound -- and the
-    /// exchange's whole total for a node that accepted and then stalled -- and cannot learn anything
-    /// the first attempt did not. Stale for the life of the object that remembers it, which every
-    /// owner keeps one-shot (a launcher's one compile, a node's one operator verb; see
+    /// Remembered for the process: asking again costs up to the connect bound (nothing where a
+    /// closed loopback port is refused at once, as Linux does), and the exchange's whole total for a
+    /// node that accepted and then stalled -- and cannot learn anything the first attempt did not. Stale for the life of the
+    /// object that remembers it, which every owner keeps one-shot (a launcher's one compile, a node's one operator verb; see
     /// `TicketCredentials`), and it fails CLOSED -- no ticket, which a node-backed cache refuses and
     /// the launcher answers by compiling locally.
     NotAgain,

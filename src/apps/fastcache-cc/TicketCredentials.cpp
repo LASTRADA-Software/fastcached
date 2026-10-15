@@ -19,28 +19,36 @@ namespace Wire = CompileCacheWire;
 
 namespace
 {
-    /// What a failed mint means for the exchanges after it, per `MintRetry`.
+    /// What a failed mint means for the exchanges after it, per `MintFailure`.
     struct MintConsequenceRow
     {
-        MintRetry retry;              ///< Whether the node is asked again.
+        MintFailure failure;          ///< Which failure.
         std::string_view consequence; ///< What is KNOWN about the exchanges, and nothing more.
     };
 
-    /// Says only what is KNOWN (#1664): an exchange asked again may yet carry a ticket, so a
-    /// per-exchange failure speaks for its own exchange alone; and whether an exchange without one is
-    /// refused is its audience's decision -- a cache with authentication off serves it.
-    constexpr EnumTable<MintRetry, MintConsequenceRow> MintConsequenceTable { {
-        { .retry = MintRetry::PerExchange,
-          .consequence = "this exchange carries no ticket, and if its cache or scheduler requires one it will be "
-                         "refused and its compile run locally" },
-        { .retry = MintRetry::NotAgain,
+    /// A failure asked again (`MintRetry::PerExchange`) speaks for its own exchange alone: the next
+    /// may yet carry a ticket.
+    constexpr std::string_view ThisExchangeOnly = "this exchange carries no ticket, and if its cache or scheduler "
+                                                  "requires one it will be refused and its compile run locally";
+
+    /// Says only what is KNOWN (#1664), per failure rather than per `MintRetry`, because two
+    /// remembered failures know different things: a node that did not answer was ASKED, while with no
+    /// source configured nothing ever was. And whether an exchange without a ticket is refused is its
+    /// audience's decision -- a cache with authentication off serves it.
+    constexpr EnumTable<MintFailure, MintConsequenceRow> MintConsequenceTable { {
+        { .failure = MintFailure::NoSource,
+          .consequence = "no exchange of this process with another machine carries a ticket, and one whose cache "
+                         "or scheduler requires a ticket will be refused and its compile run locally" },
+        { .failure = MintFailure::Unreachable,
           .consequence = "the node is not asked again by this process, so every exchange with another machine "
                          "carries no ticket from here on, and one whose cache or scheduler requires a ticket will "
                          "be refused and its compile run locally" },
+        { .failure = MintFailure::Refused, .consequence = ThisExchangeOnly },
+        { .failure = MintFailure::NoTicket, .consequence = ThisExchangeOnly },
     } };
 
-    static_assert(RowsInEnumeratorOrder(MintConsequenceTable, &MintConsequenceRow::retry),
-                  "MintConsequenceTable must hold one row per MintRetry, in enumerator order");
+    static_assert(RowsInEnumeratorOrder(MintConsequenceTable, &MintConsequenceRow::failure),
+                  "MintConsequenceTable must hold one row per MintFailure, in enumerator order");
 
     /// @param missing Why an exchange presented no ticket, if it did not.
     /// @param cause What its refusal means to an operator.
@@ -132,11 +140,12 @@ PresentedCredential TicketCredentials::MintedCredential(std::string_view audienc
 PresentedCredential TicketCredentials::Failed(MintFailure failure, std::string_view detail)
 {
     // Said on the first failure, and again when a failure is REMEMBERED: that is new information
-    // about every later exchange, which a first per-exchange line did not claim. At most twice.
+    // about every later exchange, which a first per-exchange line did not claim. At most twice, since
+    // a remembered failure ends the asking.
     auto const retry = RetryFor(failure);
     if ((!_said || retry == MintRetry::NotAgain) && _sink)
         _sink(std::format(
-            "{} ({}); {}", ReasonFor(failure), detail, MintConsequenceTable[static_cast<std::size_t>(retry)].consequence));
+            "{} ({}); {}", ReasonFor(failure), detail, MintConsequenceTable[static_cast<std::size_t>(failure)].consequence));
     _said = true;
     if (retry == MintRetry::NotAgain)
         _remembered = failure;
