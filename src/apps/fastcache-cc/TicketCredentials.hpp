@@ -72,17 +72,21 @@ class ICredentialFor
 /// budget (a second) on every mint.
 ///
 /// **The figures it was chosen from, and their conditions** -- 32-thread hosts, each sampled idle and
-/// under 64 CPU-bound processes, 3,000 connects per row, timed in Python (`asyncio`):
+/// under 64 CPU-bound processes, 3,000 connects per row (closed port on Windows: 5), timed in Python
+/// around the connect alone, the worse of idle and loaded shown:
 ///
-/// | host | path | live listener, max (p99.9) | closed port |
+/// | host | instrument | live listener, max (p99.9) | closed port |
 /// |---|---|---|---|
-/// | Windows 11 26200 | Proactor (IOCP `ConnectEx`) | 0.76 ms (0.60 ms) | 2,016--2,042 ms, refused |
-/// | WSL2 Ubuntu 24.04, kernel 6.6 | selector (`epoll`) | 13.5 ms (7.2 ms) | 0.15--0.47 ms, refused |
+/// | Windows 11 26200 | `asyncio` Proactor (IOCP `ConnectEx`) | 0.76 ms (0.60 ms) | 2,016--2,042 ms, refused |
+/// | Windows 11 26200 | blocking `socket.connect` | 0.58 ms (0.58 ms) | 2,031--2,056 ms, refused |
+/// | WSL2 Ubuntu 24.04, kernel 6.6 | `asyncio` selector (`epoll`) | 13.5 ms (7.2 ms) | 0.15--0.47 ms, refused |
+/// | WSL2 Ubuntu 24.04, kernel 6.6 | blocking `socket.connect` | 1.45 ms (0.44 ms) | 0.14 ms max, refused |
 ///
-/// The Linux tail is the interpreter's as much as the kernel's -- a measurement of the instrument,
-/// which inflates it -- and Linux refuses a closed port at once, so there the bound is never paid.
-/// Fifty milliseconds is over 60 times the Windows maximum and over three times the inflated Linux
-/// one, and it is what a machine with no node pays, ONCE per invocation (`MintRetry::NotAgain`).
+/// The `asyncio` Linux tail is the interpreter's event loop as much as the kernel's -- the blocking
+/// connect on the same host and load tops out at 1.45 ms -- and Linux refuses a closed port at once,
+/// so there the bound is never paid. Fifty milliseconds is over 60 times the Windows maximum and over
+/// 30 times the blocking Linux one, and it is what a machine with no node pays, ONCE per invocation
+/// (`MintRetry::NotAgain`).
 /// A live node slower than this to ACCEPT costs no build: the exchange goes without a ticket, which
 /// a node-backed cache refuses and the launcher answers by compiling locally.
 inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };

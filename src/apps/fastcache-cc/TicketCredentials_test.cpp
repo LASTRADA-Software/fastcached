@@ -359,7 +359,7 @@ TEST_CASE("A node that answered once is asked again when it stops answering, and
     fix.raw.mint = RecordingExchange::Mint::Unreachable;
     CHECK(fix.tickets.Present("10.0.0.7:6676").missing == std::optional { MintFailure::Unreachable });
     CHECK(fix.tickets.Present("10.0.0.8:6676").missing == std::optional { MintFailure::Unreachable });
-    CHECK(fix.Mints() == 2);
+    REQUIRE(fix.Mints() == 2);
 }
 
 TEST_CASE("A mint connects under the loopback bound and keeps the exchange's total", "[cc][ticket]")
