@@ -265,6 +265,26 @@ struct NodeConfig
     /// turn off.
     std::chrono::seconds drainTimeout { 30 };
 
+    /// The largest compile request this worker accepts, when the operator named one.
+    ///
+    /// Bounds both the frame's declared length and the size its codec envelope declares it
+    /// expands to, which is ONE value handed to `Cc::WorkerProtocol` and read back by the
+    /// surface (`CompileRequestMaxOf`). Absent is `WorkerMaxRequestBytes`, 256 MiB.
+    ///
+    /// An `optional` for `slots`' reason: it is this row's provenance, so a registration
+    /// replays a value the operator typed and never bakes in today's default (#1667).
+    std::optional<std::uint64_t> compileRequestMaxBytes;
+
+    /// The in-flight compile budget, when the operator named one.
+    ///
+    /// What every compile running on this worker may hold at once, each charged its whole
+    /// request for the whole compile. Absent DERIVES it from the resolved slot count
+    /// (`CompileByteBudgetOf`, `DefaultCompileByteBudget`): slots times 64 MiB, never below
+    /// 256 MiB nor below the per-request ceiling -- a flat 256 MiB refused half the leases a
+    /// 30-slot worker was granted on a codebase whose translation units preprocess to 12-22
+    /// MiB (#1667). An `optional` for the reason the field above is one.
+    std::optional<std::uint64_t> compileInflightMaxBytes;
+
     /// Where the admin endpoint listens, or empty to leave it off.
     ///
     /// One string rather than the daemon's address/port/enabled triple, because a
@@ -953,6 +973,42 @@ struct NodeConfig
 /// @return The count to advertise and enforce, or absent when `RunsWorker` is false.
 [[nodiscard]] std::optional<std::uint32_t> WorkerSlotsOf(NodeConfig const& cfg,
                                                          Distributed::NodeCapacity const& capacity) noexcept;
+
+/// The largest compile request this worker accepts: `--compile-request-max`, or
+/// `WorkerMaxRequestBytes` when it names none.
+///
+/// The one door from the option to the value, asked by the worker tier when it builds its
+/// protocol and by the startup rule comparing it with the budget, so the two cannot read
+/// the default differently.
+/// @param cfg The parsed configuration.
+/// @return The ceiling, in bytes.
+[[nodiscard]] std::size_t CompileRequestMaxOf(NodeConfig const& cfg) noexcept;
+
+/// The in-flight compile budget this worker runs with: `--compile-inflight-max`, or
+/// `DefaultCompileByteBudget` over the RESOLVED slot count when it names none (#1667).
+/// @param cfg The parsed configuration.
+/// @param slots What `WorkerSlotsOf` answered -- the count the worker runs, never the flag.
+/// @return The budget, in bytes.
+[[nodiscard]] std::size_t CompileByteBudgetOf(NodeConfig const& cfg, std::uint32_t slots) noexcept;
+
+/// Whether a typed in-flight compile budget is smaller than the per-request ceiling.
+///
+/// Such a worker could never admit one request of the size it promises to accept: the budget
+/// would answer `endpoint-busy` ("come back shortly") on an idle worker, and the client would
+/// retry a frame that can never fit (`CompileCapacity::IsChargeable`). Only a TYPED budget can
+/// be: a derived one is never below the ceiling (`DefaultCompileByteBudget`).
+///
+/// A worker-scoped row of `StartupPolicyRejection` rather than a check where `CompileCapacity` is
+/// built, for that table's standing reason: an install returns long before any tier exists, and a
+/// registration replaying the mistake would refuse every compile of that size at every boot.
+/// @param cfg The parsed configuration.
+/// @return True when `StartupPolicyRejection` must refuse it.
+[[nodiscard]] bool CompileBudgetBelowRequestMax(NodeConfig const& cfg) noexcept;
+
+/// What a start refused by `CompileBudgetBelowRequestMax` is told, naming both figures.
+/// @param cfg The parsed configuration.
+/// @return The refusal, with its remedy.
+[[nodiscard]] std::string CompileBudgetBelowRequestMaxRefusal(NodeConfig const& cfg);
 
 /// Build a configuration from a file and a command line, in that order.
 ///

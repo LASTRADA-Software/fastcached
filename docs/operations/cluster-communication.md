@@ -289,7 +289,7 @@ answer a client that already holds a valid grant:
 | Refusal | What it means | What to do |
 |---|---|---|
 | `no-capacity` | Every slot on this worker is busy | Nothing at once; the client compiles locally. Persistent means the fleet is small |
-| `endpoint-busy` | Slots were free but the payloads already being read fill this worker's memory budget | Nothing to buy — more machines would not have helped |
+| `endpoint-busy` | Slots were free but the compiles already running fill this worker's in-flight byte budget — each holds its whole request until it answers, not only while it is read | Nothing to buy — more machines would not have helped. Raise the worker's `--compile-inflight-max` if it persists |
 
 Neither is queued, and that is deliberate: the client has a local compile waiting
 either way, while queueing would hide the overload from the scheduler that is

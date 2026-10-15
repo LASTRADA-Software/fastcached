@@ -237,13 +237,14 @@ class CompileResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::MaxRequestBytes
     ///
-    /// The worker's own ceiling, and the same constant `Cc::WorkerProtocol` was built
-    /// with -- which is why it is exported from `WorkerServer.hpp` rather than spelled
-    /// again here. A surface that buffered more than the decoder's ceiling would accept,
-    /// and allocate, precisely the frames the budget skips.
+    /// The worker's own ceiling, READ OFF the `Cc::WorkerProtocol` it was built into
+    /// rather than restated. A surface that buffered more than the decoder's ceiling would
+    /// accept, and allocate, precisely the frames the budget skips -- and since #1667 the
+    /// ceiling is `--compile-request-max`, so a constant spelled here would be a second
+    /// answer that agrees only while nobody sets the option.
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
     {
-        return WorkerMaxRequestBytes;
+        return _protocol.MaxDecompressedBytes();
     }
 
     /// @copydoc IFrameResponder::MaxOpenConnections

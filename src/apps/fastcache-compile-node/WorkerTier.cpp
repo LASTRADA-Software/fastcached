@@ -6,6 +6,7 @@
 #include "NodeIoLoop.hpp"
 #include "WorkerTier.hpp"
 
+#include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 
@@ -347,15 +348,20 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     // records at registration and names in each grant -- so a launcher can tell this worker from
     // whatever else answers at its address (W-4). None where nothing proves: such a worker
     // registers nowhere, so no grant names it.
-    _protocol {
-        _jobs,         std::move(validator), Cc::AvailableCodecs(), parts.prover != nullptr ? &parts.prover->Key() : nullptr,
-        parts.metrics, _refusedArguments,    WorkerMaxRequestBytes
-    },
+    _protocol { _jobs,
+                std::move(validator),
+                Cc::AvailableCodecs(),
+                parts.prover != nullptr ? &parts.prover->Key() : nullptr,
+                parts.metrics,
+                _refusedArguments,
+                CompileRequestMaxOf(parts.cfg) },
     _slots { slots },
     // Sized to the slot cap, which is what makes an admitted job always find a thread,
     // and declared before the capacity and the responder, so neither outlives it.
     _pool { slots },
-    _capacity { slots, WorkerMaxRequestBytes, parts.cfg.drainTimeout, parts.logger },
+    // The budget follows the RESOLVED slot count unless the operator named one (#1667): a
+    // flat 256 MiB refused half the leases a 30-slot worker was granted.
+    _capacity { slots, CompileByteBudgetOf(parts.cfg, slots), parts.cfg.drainTimeout, parts.logger },
     // The compile verbs on the node's own `0xFC` listener. A frame arrives on the reactor;
     // the compile leaves it for the pool and the reply comes BACK to it, which is why
     // `CompileResponder_test.cpp` asserts the thread identities (#213, #290).
@@ -377,6 +383,17 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     // nodes are dying rather than stopping.
     if (_scratchClaim != nullptr && _scratchClaim->Reclaimed())
         _metrics.Increment(IMetricsSink::Counter::WorkerScratchRootsReclaimed);
+
+    // The two memory ceilings, stated once at startup because `fastcache-cli node` does not
+    // carry them yet (#1667): an operator reading `endpoint-busy` refusals needs the budget
+    // they ran into, and a derived one is a figure nobody typed. In the spelling the options
+    // take, so it can be handed straight back.
+    _logger.Logf(LogLevel::Info,
+                 "worker: {} slot(s), in-flight compile budget {}{}, largest request {}",
+                 _slots,
+                 FormatByteSize(_capacity.ByteBudget()),
+                 parts.cfg.compileInflightMaxBytes.has_value() ? "" : " (derived from the slots)",
+                 FormatByteSize(_protocol.MaxDecompressedBytes()));
 
     // The operator's additions to the compile-argument allowlist, applied before the
     // surface opens so no job is ever judged by a half-applied set -- and announced at

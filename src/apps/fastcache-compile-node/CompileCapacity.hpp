@@ -7,6 +7,7 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -274,7 +275,9 @@ class CompileCapacity
     ///
     /// The hand-off is sound only while the decoder's ceiling is no larger than this
     /// budget, which is why `WorkerMaxRequestBytes` is one exported constant rather
-    /// than a literal per side.
+    /// than a literal per side -- and, since both became options (#1667), why the
+    /// derived budget is never below the per-request ceiling (`DefaultCompileByteBudget`)
+    /// and a typed one below it is refused at startup.
     ///
     /// Both doors into this worker ask it -- the accept loop and the merged surface's
     /// responder -- and that is the whole reason it is here rather than spelled at each.
@@ -419,7 +422,7 @@ inline constexpr std::chrono::seconds DrainReportInterval { 2 };
                                           std::chrono::steady_clock::duration waited,
                                           std::chrono::seconds timeout) noexcept;
 
-/// Largest request this worker surface will buffer.
+/// Largest request this worker surface will buffer, unless `--compile-request-max` names another.
 ///
 /// A COMPILE carries a preprocessed translation unit, which for real C++ runs to
 /// several megabytes; 256 MiB is far above any of them and matches the daemon's own
@@ -429,10 +432,57 @@ inline constexpr std::chrono::seconds DrainReportInterval { 2 };
 /// **Exported rather than file-local because a second party needs the same figure.**
 /// `Cc::WorkerProtocol` refuses a codec envelope whose *declared decompressed* size
 /// exceeds this surface's ceiling, and it cannot see the listener that enforced the
-/// frame length — so the surface has to hand it the number. Left to each side's own
-/// constant, the two are two literals that must agree forever, and lowering one
-/// silently stops bounding the other.
+/// frame length — so the surface has to hand it the number. Since #1667 that number is
+/// the RESOLVED `--compile-request-max` (`CompileRequestMaxOf`), handed to the protocol
+/// once and read back from it by `CompileResponder::MaxRequestBytes`, so the frame cap and
+/// the envelope cap are still one value rather than two that must agree.
 inline constexpr std::size_t WorkerMaxRequestBytes = 256ULL * 1024ULL * 1024ULL;
+
+/// What a worker's in-flight compile budget grows by for each slot, when no
+/// `--compile-inflight-max` names the budget.
+///
+/// **Sized from a measurement, and the measurement is the reason** (#1667). Preprocessed
+/// with `cl /EP`, 120 random translation units of the Lastrada `win64-cl-ninja-release`
+/// build (MFC-heavy C++, cl 19.51, 2026-10-15) ran:
+///
+/// | median | p75 | p90 | p99 | max |
+/// |---|---|---|---|---|
+/// | 12.5 MiB | 14.5 MiB | 18.5 MiB | 20.8 MiB | 21.6 MiB |
+///
+/// A worker charges each compile its whole request for the whole compile, so a 30-slot
+/// worker needs ~375 MiB (median) to ~555 MiB (p90) in flight to fill its slots -- and at
+/// the flat 256 MiB this budget used to be, one such worker refused 2,246 of 4,274 granted
+/// leases `endpoint-busy` in a single `-j 60` build. 64 MiB is about three times that p99,
+/// and a sixteenth of the 1 GiB per slot (`Distributed::MemoryBudgetPerJobBytes`) the slot
+/// derivation already assumes a compile may cost, so it adds no memory the slot count had
+/// not already promised.
+inline constexpr std::size_t WorkerInFlightBytesPerSlot = 64ULL * 1024ULL * 1024ULL;
+
+/// The least in-flight compile budget a worker derives, whatever its slot count.
+///
+/// The flat budget every worker had before #1667, kept as the floor so a worker with few
+/// slots is never given LESS room than it had: one request's worth at the default
+/// `WorkerMaxRequestBytes`, so a single maximal translation unit is admissible on a one-slot
+/// worker.
+inline constexpr std::size_t WorkerMinInFlightBytes = 256ULL * 1024ULL * 1024ULL;
+
+/// The in-flight compile budget a worker derives when no `--compile-inflight-max` names one.
+///
+/// `slots` times `WorkerInFlightBytesPerSlot`, never below `WorkerMinInFlightBytes` -- and never
+/// below @p requestMax either, which is not a third policy but the soundness condition
+/// `CompileCapacity::IsChargeable` states: a budget smaller than the per-request ceiling would
+/// answer `endpoint-busy` ("come back shortly") on an idle worker to a request the decoder
+/// would have accepted, and the client would retry it forever. An operator who raises
+/// `--compile-request-max` past the derived figure therefore gets a budget that still admits
+/// one such request, rather than a startup refusal for a budget they never typed.
+/// @param slots The RESOLVED slot count (`WorkerSlotsOf`), never the `--slots` flag: an
+///        absent flag derives a count, and that count is what the worker runs.
+/// @param requestMax The resolved per-request ceiling (`CompileRequestMaxOf`).
+/// @return The budget, in bytes.
+[[nodiscard]] constexpr std::size_t DefaultCompileByteBudget(std::uint32_t slots, std::size_t requestMax) noexcept
+{
+    return std::max({ std::size_t { slots } * WorkerInFlightBytesPerSlot, WorkerMinInFlightBytes, requestMax });
+}
 
 /// What a compile surface refuses with, each pairing the wire code with its counter.
 ///

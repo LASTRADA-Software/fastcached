@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CompileCapacity.hpp"
 #include "EnrollAutoApprove.hpp"
 #include "LauncherCli.hpp"
 #include "NodeConfig.hpp"
@@ -530,6 +531,8 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.logTimestamps = !FastCache::DefaultLogTimestamps;
     cfg.pidfile = "worker.pid";
     cfg.drainTimeout = std::chrono::seconds { 90 };
+    cfg.compileRequestMaxBytes = 512ULL * 1024 * 1024;
+    cfg.compileInflightMaxBytes = 4ULL * 1024 * 1024 * 1024;
     // Worker state like any other, and the one that supplies most of the rest: a
     // registration that dropped it would come back at every boot knowing only what
     // was typed alongside --install-service, which for a package install is close
@@ -6053,6 +6056,8 @@ constexpr auto WorkerSettingSamples = std::to_array<WorkerSettingSample>({
     // provenance case below.
     { .flag = "--drain-timeout", .value = "45s" },
     { .flag = "--reserve-cores", .value = "2" },
+    { .flag = "--compile-request-max", .value = "128m" },
+    { .flag = "--compile-inflight-max", .value = "1g" },
 });
 
 /// @p flag spelled on a command line, with its sample value when it takes one.
@@ -7029,4 +7034,122 @@ TEST_CASE("Raft self is reloadable", "[node][config][reload][advertise]")
     INFO("refusal: " << (outcome.has_value() ? std::string { "(none)" } : outcome.error().context));
     CHECK(outcome.has_value());
     CHECK(reloader.Current()->raftSelf == "peer.lan");
+}
+
+TEST_CASE("NodeConfig: the worker's compile ceilings are options, derived from the RESOLVED slots when unnamed",
+          "[node][config][capacity]")
+{
+    // #1667. Unnamed, the request ceiling is today's constant and the budget follows the slot
+    // count the worker RUNS -- which the caller hands in from `WorkerSlotsOf`, never the flag.
+    constexpr auto MiB = std::uint64_t { 1024 } * 1024;
+    auto const unnamed = Testing::FirstStart(NodeConfig {});
+    REQUIRE_FALSE(unnamed.compileInflightMaxBytes.has_value());
+    CHECK_FALSE(unnamed.compileRequestMaxBytes.has_value());
+    CHECK(CompileRequestMaxOf(unnamed) == WorkerMaxRequestBytes);
+    CHECK(CompileByteBudgetOf(unnamed, 1) == 256 * MiB);
+    CHECK(CompileByteBudgetOf(unnamed, 8) == 512 * MiB);
+    CHECK(CompileByteBudgetOf(unnamed, 30) == 1920 * MiB);
+
+    SECTION("from the command line, a named budget overrides the derivation")
+    {
+        auto const typed = ParseNodeArgv({ "--compile-request-max=512m", "--compile-inflight-max=4g" });
+        REQUIRE(typed.has_value());
+        CHECK(typed->compileRequestMaxBytes == std::optional<std::uint64_t> { 512 * MiB });
+        CHECK(typed->compileInflightMaxBytes == std::optional<std::uint64_t> { 4096 * MiB });
+        CHECK(CompileRequestMaxOf(*typed) == 512 * MiB);
+        // The same figure whatever the slots: the operator's answer, not a per-slot rate.
+        CHECK(CompileByteBudgetOf(*typed, 1) == 4096 * MiB);
+        CHECK(CompileByteBudgetOf(*typed, 30) == 4096 * MiB);
+    }
+
+    SECTION("from a file, through the same appliers, and the command line still wins")
+    {
+        auto const fromFile =
+            FromFileAndArgv({ Setting("compile_request_max", { "300m" }), Setting("compile_inflight_max", { "2g" }) }, {});
+        REQUIRE(fromFile.has_value());
+        CHECK(fromFile->compileRequestMaxBytes == std::optional<std::uint64_t> { 300 * MiB });
+        CHECK(fromFile->compileInflightMaxBytes == std::optional<std::uint64_t> { 2048 * MiB });
+
+        auto const overridden =
+            FromFileAndArgv({ Setting("compile_inflight_max", { "2g" }) }, { "--compile-inflight-max=3g" });
+        REQUIRE(overridden.has_value());
+        CHECK(overridden->compileInflightMaxBytes == std::optional<std::uint64_t> { 3072 * MiB });
+    }
+
+    SECTION("a raised request ceiling raises the derived budget with it")
+    {
+        auto const raised = ParseNodeArgv({ "--compile-request-max=1g" });
+        REQUIRE(raised.has_value());
+        CHECK(CompileByteBudgetOf(*raised, 1) == 1024 * MiB);
+        CHECK(CompileByteBudgetOf(*raised, 30) == 1920 * MiB);
+    }
+
+    SECTION("zero and a share of RAM are refused by the row's grammar")
+    {
+        for (auto const* const argument: { "--compile-request-max=0",
+                                           "--compile-inflight-max=0",
+                                           "--compile-inflight-max=50%",
+                                           "--compile-request-max=lots" })
+        {
+            INFO("argument: " << argument);
+            CHECK_FALSE(ParseNodeArgv({ argument }).has_value());
+        }
+        auto const zero = ParseNodeArgv({ "--compile-inflight-max=0" });
+        REQUIRE_FALSE(zero.has_value());
+        CHECK(zero.error().context.contains("more than zero"));
+    }
+}
+
+TEST_CASE("NodeConfig: a typed compile budget below the request ceiling is refused at startup and install",
+          "[node][config][policy][capacity]")
+{
+    // #1667. Such a worker could never admit one request of the size it promises to take: the
+    // budget answers `endpoint-busy` on an idle worker and the client retries forever.
+    auto const below = ParseNodeArgv({ "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", "--compile-inflight-max=128m" });
+    REQUIRE(below.has_value());
+    auto const refusal = StartupPolicyRejection(*below);
+    REQUIRE(refusal.has_value());
+    // WHICH refusal: this rule's, naming both figures.
+    CHECK(Unwrap(refusal) == CompileBudgetBelowRequestMaxRefusal(*below));
+    CHECK(Unwrap(refusal).contains("128M"));
+    CHECK(Unwrap(refusal).contains("256M"));
+    CHECK(NodeInstallRejection(*below) == refusal);
+
+    // Against a RAISED ceiling the default budget is now the one below it.
+    auto const raised = ParseNodeArgv(
+        { "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", "--compile-request-max=1g", "--compile-inflight-max=512m" });
+    REQUIRE(raised.has_value());
+    CHECK(StartupPolicyRejection(*raised) == std::optional { CompileBudgetBelowRequestMaxRefusal(*raised) });
+
+    // The controls: equal is admissible, and a raised ceiling with the budget left to derive is
+    // never refused -- the derivation follows it.
+    for (auto const& admissible: std::vector<std::vector<char const*>> {
+             { "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", "--compile-inflight-max=256m" },
+             { "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", "--compile-request-max=1g" },
+         })
+    {
+        auto const cfg = ParseNodeArgv(admissible);
+        REQUIRE(cfg.has_value());
+        CHECK_FALSE(StartupPolicyRejection(*cfg).has_value());
+    }
+}
+
+TEST_CASE("NodeConfig: the compile ceilings are registered when typed and left to derive when not", "[node][service]")
+{
+    // On presence, `--slots`' rule: a registration that baked in today's derived budget would
+    // stop following the slot count at every later start.
+    auto cfg = Installable();
+    cfg.compileRequestMaxBytes = 512ULL * 1024 * 1024;
+    cfg.compileInflightMaxBytes = 3ULL * 1024 * 1024 * 1024;
+    auto const reparsed = ReparseSpec(
+        MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg, Testing::InstallerPathProbe()));
+    REQUIRE(reparsed.has_value());
+    CHECK(reparsed->compileRequestMaxBytes == cfg.compileRequestMaxBytes);
+    CHECK(reparsed->compileInflightMaxBytes == cfg.compileInflightMaxBytes);
+
+    auto const quietSpec = MakeNodeServiceSpec(
+        std::filesystem::path { "fastcache-compile-node" }, Installable(), Testing::InstallerPathProbe());
+    CHECK(std::ranges::none_of(quietSpec.arguments, [](std::string const& arg) {
+        return FlagMatches(arg, "--compile-request-max") || FlagMatches(arg, "--compile-inflight-max");
+    }));
 }

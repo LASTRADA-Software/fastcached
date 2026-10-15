@@ -3141,7 +3141,9 @@ endpoint-mismatch refusals in the minutes after it.
 ### Why the capacity flags still need a restart
 
 `slots`, `node_class` and `reserve_cores` are resolved against what the cache tier
-actually holds, which is decided when that tier starts. Re-deriving them safely means
+actually holds, which is decided when that tier starts. `compile_request_max` and
+`compile_inflight_max` are fixed when the worker starts, because the compiles already
+running hold reservations against them. Re-deriving them safely means
 re-establishing that ordering on a running node, which is a larger change than it
 looks.
 
@@ -3245,21 +3247,67 @@ the fleet's own busy/free arithmetic. Its `fastcache_node_slots_configured` gaug
 does read 0, which is a different question with a different right answer -- that one
 is this node's configured capacity, and zero is what it is.
 
+### Memory: what a compile may hold
+
 Slots bound CPU; they do not bound memory, and the two are separate questions now
-that compiles run side by side. A worker also caps the payload bytes all its jobs
-are reading at once at 256 MiB — one request's worth, so ordinary translation units
-run together and a single enormous one cannot be joined by a second. A job refused
-by that budget is told `endpoint-busy` rather than `no-capacity`, and counted as
+that compiles run side by side. Two ceilings bound memory, and both are options:
+
+| Option | Default | What it bounds |
+| --- | --- | --- |
+| `--compile-request-max` (`compile_request_max`) | `256m` | One compile request: the frame's length **and** the size its compressed source declares it expands to |
+| `--compile-inflight-max` (`compile_inflight_max`) | slots × `64m`, never below `256m` nor below `--compile-request-max` | Every compile running on this worker at once, each charged its whole request **for the whole compile** — from the moment it arrives until its answer is written, not only while it is being read |
+
+The budget is derived from the slot count the worker actually runs — the one
+`--slots` names, or the one it derives when `--slots` is omitted — so a 1-slot
+worker keeps `256m`, an 8-slot one gets `512m` and a 30-slot one `1920m`. The
+figure is sized from a measurement: preprocessed, the translation units of a large
+MFC-heavy Windows codebase run 12.5 MiB at the median and 21.6 MiB at the largest,
+so a 30-slot worker needs roughly 375–555 MiB in flight just to keep its slots busy.
+At the flat 256 MiB this budget used to be, one such worker refused 2,246 of the
+4,274 compiles it was granted in a single build
+([#1667](https://github.com/LASTRADA-Software/fastcached/issues/1667)). `64m` per slot
+is about three times the largest of those units, and a sixteenth of the gigabyte per
+slot the memory clamp above already assumes a compile may cost.
+
+```sh
+# Translation units larger than 256 MiB once preprocessed: raise the request
+# ceiling. The derived budget follows it, so one such unit is always admissible.
+fastcache-compile-node --compile-request-max=512m ...
+
+# A worker that should hold more than 64 MiB per slot in flight.
+fastcache-compile-node --compile-inflight-max=4g ...
+```
+
+Both take `k`/`m`/`g`; zero is refused, since a zero ceiling would admit no compile
+at all. A `--compile-inflight-max` below `--compile-request-max` is refused at
+startup — and at `--install-service` — because one request of the size the worker
+promises to accept could then never be admitted. Both are **restart-only**: the
+request ceiling and the budget are fixed when the worker tier starts, and compiles
+already running hold reservations against them. The worker states both at startup:
+
+```
+[INFO] worker: 30 slot(s), in-flight compile budget 1920M (derived from the slots), largest request 256M
+```
+
+A request over `--compile-request-max` is refused `payload-too-large` and compiled
+on the client. A compile refused by the budget is told `endpoint-busy` rather than
+`no-capacity`, and counted as
 `fastcache_worker_jobs_refused_endpoint_busy_total`: slots were free and memory was
-not, so more machines would not have helped.
+not, so more machines would not have helped. `fastcache-cc --show-stats` tallies it
+as `a node's in-flight byte budget was full`, apart from withdrawn slots. A rising
+count is the signal to raise `--compile-inflight-max`.
+
+The node's one `0xFC` listener holds its own pool of bytes for frames still being
+read, sized to the largest budget any of its components declares — so it follows the
+compile budget and never undercuts it.
 
 Because the compiles now outlive the accept loop, stopping the node waits for
-them. A stop closes the listener first, so nothing new is admitted, and then
-blocks until every compile still running has finished and answered its client.
-There is no deadline on that wait: a compile is a client's answer, and abandoning
-one would hand that client a broken connection to save a few seconds of shutdown.
+them. A stop closes the listener first, so nothing new is admitted, and then waits
+for every compile still running to finish and answer its client — for at most
+`--drain-timeout`, `30s` by default, after which it names what it abandons and ends
+itself ([Stopping one, and what a stop waits for](#stopping-one-and-what-a-stop-waits-for)).
 A node stopping while it is full therefore takes as long as its longest running
-translation unit.
+translation unit, up to that bound.
 
 ### Withdrawing while the machine is busy
 

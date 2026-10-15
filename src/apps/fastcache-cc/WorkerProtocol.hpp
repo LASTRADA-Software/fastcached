@@ -371,6 +371,16 @@ class WorkerProtocol
     ///         closing rather than replying.
     [[nodiscard]] std::optional<std::vector<std::byte>> Answer(std::span<std::byte const> frame);
 
+    /// The ceiling a request's codec envelope may declare it expands to.
+    ///
+    /// Read back by the surface that frames this protocol, so its frame-length cap is the
+    /// value this was built with rather than a second copy of it (#1667).
+    /// @return What the constructor was given as `maxDecompressedBytes`.
+    [[nodiscard]] std::size_t MaxDecompressedBytes() const noexcept
+    {
+        return _maxDecompressedBytes;
+    }
+
   private:
     /// Handle a decoded COMPILE payload.
     [[nodiscard]] std::vector<std::byte> Compile(std::span<std::byte const> payload);

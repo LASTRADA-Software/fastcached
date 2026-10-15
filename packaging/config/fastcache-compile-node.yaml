@@ -163,6 +163,19 @@
 # answers with SIGKILL and no diagnostic.
 #drain_timeout:
 
+# the largest compile request this worker accepts, bounding both the frame and
+# the size its compressed source declares it expands to (default 256m; k/m/g =
+# KiB/MiB/GiB). A larger translation unit is refused payload-too-large and
+# compiled locally. Read at startup only.
+#compile_request_max:
+
+# the bytes every compile running here may hold at once, each charged its whole
+# request until it answers; k/m/g = KiB/MiB/GiB. Default: 64m per slot, never
+# below 256m nor below compile_request_max. Full, a compile is refused
+# endpoint-busy and runs on the client. A value below compile_request_max is
+# refused at startup. Read at startup only.
+#compile_inflight_max:
+
 # cores never offered to the fleet, overriding what the node class reserves.
 # 0 is a real answer and is not the same as omitting the flag. Ignored when
 # --slots names a number, which is the operator's answer already.

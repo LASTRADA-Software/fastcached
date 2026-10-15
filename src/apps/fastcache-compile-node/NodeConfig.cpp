@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheTier.hpp"
+#include "CompileCapacity.hpp"
 #include "EnrollAutoApprove.hpp"
 #include "NodeConfig.hpp"
 #include "NodeFormation.hpp"
@@ -642,6 +643,30 @@ namespace
         return static_cast<std::uint64_t>(*parsed);
     }
 
+    /// A worker's compile ceiling: `--compile-request-max` or `--compile-inflight-max`.
+    ///
+    /// `--cache-disk`'s grammar, `k`/`m`/`g` and no `N%` -- these bound what one process
+    /// buffers, so a share of host RAM would be a different number on every machine one
+    /// registration is replayed on. **Zero is refused here, in the row's grammar**, rather
+    /// than meaning "unbounded" as it does for a cache: a zero ceiling admits no request at
+    /// all, and a zero budget would turn every compile away `endpoint-busy` on an idle worker
+    /// -- a worker that registers, is leased out and never compiles anything (#1667). Whether
+    /// the two agree with EACH OTHER is a cross-flag rule, `StartupPolicyRejection`'s.
+    /// @param sv Text to parse.
+    /// @return The size in bytes, or why it is not one.
+    [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCompileBytes(std::string_view sv)
+    {
+        auto const parsed = ParseByteSize(sv);
+        if (!parsed.has_value())
+            return std::unexpected(parsed.error());
+        if (*parsed == 0)
+            return std::unexpected(ArgvError(
+                ConfigErrorCode::OutOfRange,
+                "must be more than zero: a zero ceiling admits no compile at all, so the worker would register, be "
+                "leased out and refuse every job"));
+        return static_cast<std::uint64_t>(*parsed);
+    }
+
     /// The fleet `--fleet-id` pins this node to: text, then `Cluster::ParsePinnedFleet`'s grammar.
     ///
     /// Refused by name here rather than accepted and matched by nothing: a truncated copy of what
@@ -1194,6 +1219,48 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .yamlKey = "drain_timeout",
             .same = FieldEq<&NodeConfig::drainTimeout>(),
             .component = &WorkerComponent,
+        },
+        // The worker's two memory ceilings (#1667), named for what they bound rather than
+        // after the cache flags: `--cache-memory` is a tier's SIZE, these are a compile
+        // surface's MAXIMA, so `compile-` groups them with the surface they cap and `-max`
+        // says each is a ceiling a request is refused at, never an allocation.
+        //
+        // Restart-only (`Reloadable::No`, the default), deliberately: the request ceiling is
+        // handed to `Cc::WorkerProtocol` and the budget to `CompileCapacity` once, at
+        // construction, and both are read by compiles already in flight. Moving either live
+        // needs a budget that can shrink under reservations it already granted, which is a
+        // larger change than a reload row -- the reason `--slots` is a restart as well.
+        {
+            .primary = "--compile-request-max",
+            .arity = Arity::Value,
+            .operand = "=<size>",
+            .apply = AssignFrom<&NodeConfig::compileRequestMaxBytes, ParseCompileBytes>(),
+            .description = "the largest compile request this worker accepts,\n"
+                           "bounding both the frame and the size its compressed\n"
+                           "source declares it expands to (default 256m;\n"
+                           "k/m/g = KiB/MiB/GiB). A larger translation unit is\n"
+                           "refused payload-too-large and compiled locally.",
+            .yamlKey = "compile_request_max",
+            .same = FieldEq<&NodeConfig::compileRequestMaxBytes>(),
+            .component = &WorkerComponent,
+            .present = PresentIn<&NodeConfig::compileRequestMaxBytes>(),
+        },
+        {
+            .primary = "--compile-inflight-max",
+            .arity = Arity::Value,
+            .operand = "=<size>",
+            .apply = AssignFrom<&NodeConfig::compileInflightMaxBytes, ParseCompileBytes>(),
+            .description = "the bytes every compile running here may hold at\n"
+                           "once, each charged its whole request until it\n"
+                           "answers; k/m/g = KiB/MiB/GiB. Default: 64m per slot,\n"
+                           "never below 256m nor below --compile-request-max.\n"
+                           "Full, a compile is refused endpoint-busy and runs on\n"
+                           "the client. A value below --compile-request-max is\n"
+                           "refused at startup.",
+            .yamlKey = "compile_inflight_max",
+            .same = FieldEq<&NodeConfig::compileInflightMaxBytes>(),
+            .component = &WorkerComponent,
+            .present = PresentIn<&NodeConfig::compileInflightMaxBytes>(),
         },
         {
             .primary = "--reserve-cores",
@@ -2491,6 +2558,10 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // different instructions. The `optional` is this row's provenance bit, and it
     // predates the ones the other rows now carry.
     emitIfPresent("reserve-cores", cfg.reservedCores);
+    // On presence, for `--slots`' reason: absent DERIVES the budget from the slot count at
+    // every start, and a registration that baked today's figure in would stop following it.
+    emitIfPresent("compile-request-max", cfg.compileRequestMaxBytes);
+    emitIfPresent("compile-inflight-max", cfg.compileInflightMaxBytes);
     emitIfExplicit("admin-listen", cfg.adminListen, cfg.adminListenExplicit);
     if (cfg.dashboard)
         argv.emplace_back("--dashboard");
@@ -2804,6 +2875,34 @@ std::optional<std::uint32_t> WorkerSlotsOf(NodeConfig const& cfg, Distributed::N
     if (!RunsWorker(cfg))
         return std::nullopt;
     return Distributed::OfferableSlots(capacity, cfg.slots);
+}
+
+std::size_t CompileRequestMaxOf(NodeConfig const& cfg) noexcept
+{
+    return cfg.compileRequestMaxBytes.has_value() ? static_cast<std::size_t>(*cfg.compileRequestMaxBytes)
+                                                  : WorkerMaxRequestBytes;
+}
+
+std::size_t CompileByteBudgetOf(NodeConfig const& cfg, std::uint32_t slots) noexcept
+{
+    return cfg.compileInflightMaxBytes.has_value() ? static_cast<std::size_t>(*cfg.compileInflightMaxBytes)
+                                                   : DefaultCompileByteBudget(slots, CompileRequestMaxOf(cfg));
+}
+
+bool CompileBudgetBelowRequestMax(NodeConfig const& cfg) noexcept
+{
+    return cfg.compileInflightMaxBytes.has_value() && *cfg.compileInflightMaxBytes < CompileRequestMaxOf(cfg);
+}
+
+std::string CompileBudgetBelowRequestMaxRefusal(NodeConfig const& cfg)
+{
+    return std::format("--compile-inflight-max={} is smaller than the largest compile request this worker accepts "
+                       "(--compile-request-max, {}): one request of that size could never be admitted, and would be "
+                       "told endpoint-busy -- come back shortly -- on an idle worker forever. Raise "
+                       "--compile-inflight-max to at least --compile-request-max, or drop it to derive one from the "
+                       "slot count.",
+                       FormatByteSize(static_cast<std::size_t>(cfg.compileInflightMaxBytes.value_or(0))),
+                       FormatByteSize(CompileRequestMaxOf(cfg)));
 }
 
 bool RunsConsensus(NodeConfig const& cfg) noexcept
@@ -3987,6 +4086,9 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .refuses = [](NodeConfig const& c) { return c.toolchains.empty() && !c.toolchainDiscovery; },
           .message = "--no-toolchain-discovery was given and no --toolchain: a worker with none would register "
                      "and then refuse every job the scheduler sent it." },
+        { .scope = &WorkerComponent,
+          .refuses = CompileBudgetBelowRequestMax,
+          .explain = CompileBudgetBelowRequestMaxRefusal },
         // A cache the operator NAMED, on a node that serves no surface to reach it
         // through. The tier already says so at Info and names the flags, which is
         // better than the silence #229 was filed about -- but an operator who

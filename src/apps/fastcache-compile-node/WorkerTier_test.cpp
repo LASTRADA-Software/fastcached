@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CompileCapacity.hpp"
 #include "HostEventInbox.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
 #include "NodeFormation.hpp"
 #include "NodeIoLoop.hpp"
 #include "PeerIdentity.hpp"
+#include "Responders.hpp"
 #include "SchedulerReachability.hpp"
 #include "ScratchClaim.hpp"
 #include "WorkerTier.hpp"
@@ -50,6 +52,7 @@
 #include <tests/BoundedWait.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SteppedDrainWait.hpp>
+#include <tests/SurfaceOwnerFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -912,4 +915,99 @@ TEST_CASE("A move published off the heartbeat wakes it to re-register, and the l
     }
     // The tier stopped watching when it went.
     CHECK(fixture.endpoints.WatcherCount() == 0);
+}
+
+TEST_CASE("A worker's in-flight budget follows its slots and admits a slot's worth of real translation units",
+          "[node][worker-tier][capacity]")
+{
+    // #1667, through the production path: the tier builds its own `CompileCapacity` from the
+    // configuration, and the sizes are REAL -- the Lastrada median of 12.5 MiB preprocessed,
+    // rounded up. At the flat 256 MiB this budget used to be, a 30-slot worker refused the 20th
+    // of them `endpoint-busy` with eleven slots still free.
+    constexpr auto MiB = std::size_t { 1024 } * 1024;
+    constexpr auto MedianUnit = 13 * MiB;
+    constexpr std::uint32_t Slots = 30;
+
+    WorkerTierFixture fixture;
+    fixture.cfg.slots = Slots;
+    auto started = fixture.Start();
+    REQUIRE(started.has_value());
+    REQUIRE(started.value() != nullptr);
+    auto& tier = *started.value();
+    REQUIRE(tier.Capacity().ByteBudget() == 1920 * MiB);
+
+    // Every slot's compile holds its whole request at once, as it does for the whole compile.
+    std::vector<CompileCapacity::Bytes> held;
+    for ([[maybe_unused]] auto const slot: std::views::iota(std::uint32_t { 0 }, Slots))
+    {
+        auto reservation = tier.Capacity().TryTakeBytes(tier.Capacity().ChargeFor(MedianUnit, MedianUnit));
+        if (!reservation.has_value())
+            break;
+        held.push_back(std::move(*reservation));
+    }
+    CHECK(held.size() == Slots);
+
+    // The control, at the same sizes: the old flat budget admits nineteen and refuses the
+    // twentieth. Without it the count above could be a budget nothing bounds.
+    CompileCapacity flat { Slots, WorkerMinInFlightBytes, std::chrono::seconds { 5 }, fixture.logger };
+    std::vector<CompileCapacity::Bytes> flatHeld;
+    for ([[maybe_unused]] auto const slot: std::views::iota(std::uint32_t { 0 }, Slots))
+    {
+        auto reservation = flat.TryTakeBytes(flat.ChargeFor(MedianUnit, MedianUnit));
+        if (!reservation.has_value())
+            break;
+        flatHeld.push_back(std::move(*reservation));
+    }
+    CHECK(flatHeld.size() == 19);
+
+    // And the surface reports the budget it spends, so the node's one listener -- whose own
+    // pool is the LARGEST component's figure -- cannot undercut it: beside a cache component's
+    // fixed 256 MiB, the fold answers the compile budget.
+    CHECK(tier.Responder().MaxInFlightBytes() == 1920 * MiB);
+    CHECK(tier.Responder().MaxRequestBytes() == WorkerMaxRequestBytes);
+    SurfaceFakes::NamedResponder cache { "cache" };
+    cache.PlaceCeilings(WorkerMaxRequestBytes, 256, 256 * MiB);
+    MergedResponder const merged { SurfaceComponents { .cache = &cache, .compile = &tier.Responder() } };
+    CHECK(merged.MaxInFlightBytes() == 1920 * MiB);
+}
+
+TEST_CASE("A worker's compile ceilings come from the RESOLVED slots and the options, never a constant",
+          "[node][worker-tier][capacity]")
+{
+    // #1667. No `--slots`: the budget is derived from the count the machine resolves to, which a
+    // derivation from the FLAG could not see at all.
+    constexpr auto MiB = std::size_t { 1024 } * 1024;
+    SECTION("derived from the slot count the worker runs")
+    {
+        WorkerTierFixture fixture;
+        REQUIRE_FALSE(fixture.cfg.slots.has_value());
+        auto started = fixture.Start();
+        REQUIRE(started.has_value());
+        REQUIRE(started.value() != nullptr);
+        auto& tier = *started.value();
+        REQUIRE(tier.Slots() > 4);
+        CHECK(tier.Capacity().ByteBudget() == DefaultCompileByteBudget(tier.Slots(), WorkerMaxRequestBytes));
+        CHECK(tier.Capacity().ByteBudget() == std::size_t { tier.Slots() } * 64 * MiB);
+    }
+
+    SECTION("named by the operator, both reach the surface and the decoder")
+    {
+        WorkerTierFixture fixture;
+        fixture.cfg.slots = 4;
+        fixture.cfg.compileRequestMaxBytes = 512 * MiB;
+        fixture.cfg.compileInflightMaxBytes = 3072 * MiB;
+        auto started = fixture.Start();
+        REQUIRE(started.has_value());
+        REQUIRE(started.value() != nullptr);
+        auto& tier = *started.value();
+        CHECK(tier.Capacity().ByteBudget() == 3072 * MiB);
+        CHECK(tier.Responder().MaxInFlightBytes() == 3072 * MiB);
+        CHECK(tier.Responder().MaxRequestBytes() == 512 * MiB);
+        // And it is said at startup, since `fastcache-cli node` does not carry it.
+        auto const records = fixture.logger.Snapshot();
+        CHECK(std::ranges::any_of(records, [](CapturingLogger::Record const& record) {
+            return record.level == LogLevel::Info
+                   && record.message.contains("in-flight compile budget 3G, largest request 512M");
+        }));
+    }
 }
