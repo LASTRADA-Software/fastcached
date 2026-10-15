@@ -4,6 +4,7 @@
 #include "NodeReload.hpp"
 #include "WorkerLease.hpp"
 
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Logger.hpp>
 
@@ -178,6 +179,47 @@ TEST_CASE("A reload candidate is shaped by the formation, the names and the iden
     auto const reloaded = reloader.Reload();
     INFO((reloaded.has_value() ? std::string {} : reloaded.error().context));
     CHECK(reloaded.has_value());
+}
+
+TEST_CASE("A reload of a founder pinned to its own cluster and key is judged by the key the start resolved",
+          "[node][reload][formation][pin]")
+{
+    // #1663: the candidate was shaped by the formation BEFORE the identity was applied to it, so a
+    // record this node founded -- committed under its own key -- met the pin holding no key, and every
+    // reload of a pinned founder was declined "under key none".
+    Testing::ScratchDirectory const scratch { "node-reload-founder-pin" };
+    auto const ownKey = Testing::TestKeyPair("n1").PublicKey();
+    constexpr std::string_view OwnCluster = "0123456789abcdef0123456789abcdef";
+    auto const pinText = Cluster::FormatPinnedFleet(
+        Cluster::PinnedFleet { .clusterId = std::string { OwnCluster }, .voterKeys = { ownKey } });
+    auto const path = WriteFile(
+        scratch.Path(), std::format("cluster_dir: {}\nfleet_id: \"{}\"\n", (scratch / "state").generic_string(), pinText));
+    auto const record =
+        Cluster::FormationRecord { .mode = Cluster::NodeMode::Voter,
+                                   .own = { .clusterId = std::string { OwnCluster }, .createdAtUnixSeconds = 100 },
+                                   .joining = std::nullopt,
+                                   .fleet = std::nullopt,
+                                   .archivePending = std::nullopt,
+                                   .rejectedBy = std::nullopt,
+                                   .askedJoins = {} };
+    auto const read = ReloadCandidateReader(
+        {},
+        ReloadBasis {
+            .stateDirectory = NodeStateDirectoryChoice { .path = scratch / "state", .origin = StateDirectoryOrigin::Named },
+            .hostNames = NodeHostNames { .fqdn = "box.corp.example", .dnsSuffix = "corp.example", .withheld = {} },
+            .formation =
+                [&record] {
+                    return std::expected<KeptFormation, std::string> { KeptFormation { .record = record,
+                                                                                       .remembered = {} } };
+                },
+            .identity = NodeIdentity { .id = "n1", .origin = NodeIdentityOrigin::Recorded, .publicKey = ownKey },
+        });
+
+    auto const candidate = read(path);
+    INFO((candidate.has_value() ? std::string {} : candidate.error().context));
+    REQUIRE(candidate.has_value());
+    CHECK(Testing::Unwrap(candidate->formation).mode == Cluster::NodeMode::Voter);
+    CHECK(candidate->identityPublicKey == std::optional { ownKey });
 }
 
 TEST_CASE("A reload candidate carries the route host the running node derives its endpoints from",
