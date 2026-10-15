@@ -3754,10 +3754,14 @@ rather than one row each, because a cache `STORE` that overran its ceiling count
 against the compile surface names the wrong subsystem, and naming the subsystem is
 what these series are read for.
 
-The **scheduler** surface is the one where they still move nothing
-([#494](https://github.com/LASTRADA-Software/fastcached/issues/494)). That is a
-known gap rather than a claim about that surface being quiet. The cache surface was
-the same until
+The **scheduler** surface is the one where they move nothing, and on purpose: its
+frame ceiling says the peer is confused about the framing rather than about the
+fleet, and its byte budget says the surface is momentarily full, which the peer sees
+and retries — summed into the scheduler's security series, either would make that
+series unreadable. Each uncounted row states that reason in the code, and a
+`static_assert` refuses a row that states neither a counter nor a reason. So a flat
+scheduler graph is not a claim that the surface is quiet. The cache surface was
+uncounted until
 [#491](https://github.com/LASTRADA-Software/fastcached/issues/491), and it was the
 gap that mattered most: the listener's in-flight ceiling is the largest of the
 components present — the cache's 256 MiB, or a worker's compile budget wherever that

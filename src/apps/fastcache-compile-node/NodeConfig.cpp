@@ -1281,11 +1281,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "answers; k/m/g = KiB/MiB/GiB. Default: 64m per slot,\n"
                            "never below 256m nor below --compile-request-max.\n"
                            "Full, a compile is refused endpoint-busy and runs on\n"
-                           "the client. It also sizes this port's ONE pool of\n"
-                           "bytes being read, which cache and shared-cache\n"
-                           "reads share, so a large value loosens that bound\n"
-                           "too. A value below --compile-request-max is refused\n"
-                           "at startup.",
+                           "the client. Above 256m it also sizes this port's\n"
+                           "one pool of bytes being read, which cache and\n"
+                           "shared-cache reads share, so a large value loosens\n"
+                           "that bound too. A value below --compile-request-max\n"
+                           "is refused at startup.",
             .yamlKey = "compile_inflight_max",
             .same = FieldEq<&NodeConfig::compileInflightMaxBytes>(),
             .component = &WorkerComponent,

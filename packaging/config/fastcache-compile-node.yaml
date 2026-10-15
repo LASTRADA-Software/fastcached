@@ -175,9 +175,9 @@
 # the bytes every compile running here may hold at once, each charged its whole
 # request until it answers; k/m/g = KiB/MiB/GiB. Default: 64m per slot, never
 # below 256m nor below compile_request_max. Full, a compile is refused
-# endpoint-busy and runs on the client. It also sizes this port's ONE pool of
-# bytes being read, which cache and shared-cache reads share, so a large value
-# loosens that bound too. A value below compile_request_max is refused at
+# endpoint-busy and runs on the client. Above 256m it also sizes this port's
+# one pool of bytes being read, which cache and shared-cache reads share, so a
+# large value loosens that bound too. A value below compile_request_max is refused at
 # startup. Read at startup only.
 #compile_inflight_max:
 

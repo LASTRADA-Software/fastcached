@@ -745,8 +745,8 @@ class IMetricsSink
         /// `MergedResponder::MaxInFlightBytes()` folds to the largest owner's budget:
         /// the cache's 256 MiB, or a worker's compile budget wherever that exceeds it --
         /// five or more slots, a raised `--compile-request-max`, or a typed
-        /// `--compile-inflight-max` (#1667) -- where cache reads may hold up to that. Either way a `STORE` is what runs into
-        /// it.
+        /// `--compile-inflight-max` (#1667) -- where cache reads may hold up to that.
+        /// Either way a `STORE` is what runs into it.
         ///
         /// **Never summed with `WorkerJobsRefusedEndpointBusy` or
         /// `NodeFrameConnectionsRefusedAtCapacity`.** Three refusals answer
