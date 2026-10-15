@@ -82,7 +82,7 @@ constexpr auto ThisNode = "this-pc";
 {
     auto cfg = NodeConfig {};
     cfg.nodeId = ThisNode;
-    auto const applied = ApplyFormation(cfg, record, remembered);
+    auto const applied = ApplyFormation(cfg, record, remembered, ResolvedNodeKey(cfg));
     REQUIRE(applied.has_value());
     return cfg;
 }
@@ -398,10 +398,10 @@ TEST_CASE("A record whose roster does not decode refuses rather than forming an 
                                               .createdAtUnixSeconds = 0,
                                               .admittedBy = Testing::TestKeyPair("office").PublicKey() };
     auto cfg = NodeConfig {};
-    auto const applied = ApplyFormation(cfg, record, {});
+    auto const applied = ApplyFormation(cfg, record, {}, ResolvedNodeKey(cfg));
     REQUIRE_FALSE(applied.has_value());
-    CHECK(applied.error().contains("fleet-c"));
-    CHECK(applied.error().contains("roster"));
+    CHECK(applied.error().reason.contains("fleet-c"));
+    CHECK(applied.error().reason.contains("roster"));
     // Nothing half-applied: a configuration the start refuses is not one anything reads.
     CHECK_FALSE(cfg.formation.has_value());
 }
@@ -652,7 +652,7 @@ TEST_CASE("The surface map says when no record shaped the configuration and when
 
     // The view `main` applies before the first start has minted anything: solitary, no cluster id.
     auto prospective = NodeConfig {};
-    REQUIRE(ApplyFormation(prospective, Cluster::FormationRecord {}, {}).has_value());
+    REQUIRE(ApplyFormation(prospective, Cluster::FormationRecord {}, {}, ResolvedNodeKey(prospective)).has_value());
     auto const text = RenderSurfaces(prospective);
     CHECK(text.starts_with("mode: solitary (no cluster minted yet"));
     CHECK_FALSE(text.contains("not served (no formation record yet)"));
@@ -702,13 +702,13 @@ TEST_CASE("A record committing this node to a cluster the pin does not name refu
         // Unpinned, the control: every record shapes a configuration.
         auto unpinned = NodeConfig {};
         unpinned.nodeId = ThisNode;
-        CHECK(ApplyFormation(unpinned, row.record, {}).has_value());
+        CHECK(ApplyFormation(unpinned, row.record, {}, ResolvedNodeKey(unpinned)).has_value());
 
         // Pinned to the cluster it commits the node to, under the key that vouches for it: shaped.
         if (!row.committed.empty())
         {
             auto there = pinned(row.committed, row.signer);
-            CHECK(ApplyFormation(there, row.record, {}).has_value());
+            CHECK(ApplyFormation(there, row.record, {}, ResolvedNodeKey(there)).has_value());
         }
 
         // Pinned elsewhere, and pinned to the right cluster under a key nothing in the record vouches
@@ -719,16 +719,16 @@ TEST_CASE("A record committing this node to a cluster the pin does not name refu
         {
             INFO("pinned to " << clusterId << " under " << voter << "'s key");
             auto refusedCfg = pinned(clusterId, voter);
-            auto const applied = ApplyFormation(refusedCfg, row.record, {});
+            auto const applied = ApplyFormation(refusedCfg, row.record, {}, ResolvedNodeKey(refusedCfg));
             if (row.committed.empty())
             {
                 CHECK(applied.has_value());
                 continue;
             }
             REQUIRE_FALSE(applied.has_value());
-            CHECK(applied.error().contains(std::format("commits this node to cluster {}", row.committed)));
-            CHECK(applied.error().contains(std::format("--fleet-id pins it to {}@", clusterId)));
-            CHECK(applied.error().contains("reset its state directory"));
+            CHECK(applied.error().reason.contains(std::format("commits this node to cluster {}", row.committed)));
+            CHECK(applied.error().reason.contains(std::format("--fleet-id pins it to {}@", clusterId)));
+            CHECK(applied.error().reason.contains("reset its state directory"));
             CHECK_FALSE(refusedCfg.formation.has_value()); // nothing shaped from a record the pin refuses
         }
     }
@@ -761,10 +761,10 @@ TEST_CASE("A joined record is judged by the key that signed its admission, never
     forged.fleet = fleet;
 
     auto refusedCfg = pinnedToOffice();
-    auto const refused = ApplyFormation(refusedCfg, forged, {});
+    auto const refused = ApplyFormation(refusedCfg, forged, {}, ResolvedNodeKey(refusedCfg));
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("commits this node to cluster fleet-c"));
-    CHECK(refused.error().contains(
+    CHECK(refused.error().reason.contains("commits this node to cluster fleet-c"));
+    CHECK(refused.error().reason.contains(
         std::format("under key {}", FormatEd25519PublicKey(Testing::TestKeyPair("n-rogue").PublicKey()))));
     CHECK_FALSE(refusedCfg.formation.has_value());
 
@@ -773,7 +773,7 @@ TEST_CASE("A joined record is judged by the key that signed its admission, never
     fleet.admittedBy = Testing::TestKeyPair("office").PublicKey();
     genuine.fleet = fleet;
     auto genuineCfg = pinnedToOffice();
-    CHECK(ApplyFormation(genuineCfg, genuine, {}).has_value());
+    CHECK(ApplyFormation(genuineCfg, genuine, {}, ResolvedNodeKey(genuineCfg)).has_value());
 }
 
 TEST_CASE("The surface map names the cluster this node is in and the pin, or says there is none",
@@ -788,13 +788,13 @@ TEST_CASE("The surface map names the cluster this node is in and the pin, or say
     pinned.nodeId = ThisNode;
     pinned.fleetPin =
         Cluster::PinnedFleet { .clusterId = "fleet-c", .voterKeys = { Testing::TestKeyPair("office").PublicKey() } };
-    REQUIRE(ApplyFormation(pinned, RecordIn(Cluster::NodeMode::Learner), {}).has_value());
+    REQUIRE(ApplyFormation(pinned, RecordIn(Cluster::NodeMode::Learner), {}, ResolvedNodeKey(pinned)).has_value());
     CHECK(RenderSurfaces(pinned).contains(
         std::format("  pinned to  {}\n", Cluster::FormatPinnedFleet(Unwrap(pinned.fleetPin)))));
 
     // Before the first start has minted anything, the cluster is said to be none yet, never blank.
     auto prospective = NodeConfig {};
-    REQUIRE(ApplyFormation(prospective, Cluster::FormationRecord {}, {}).has_value());
+    REQUIRE(ApplyFormation(prospective, Cluster::FormationRecord {}, {}, ResolvedNodeKey(prospective)).has_value());
     CHECK(RenderSurfaces(prospective).contains("  cluster    none minted yet\n"));
 }
 

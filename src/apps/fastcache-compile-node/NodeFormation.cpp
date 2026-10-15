@@ -97,12 +97,9 @@ namespace
     }
 } // namespace
 
-std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
-                                                Cluster::FormationRecord const& record,
-                                                Cluster::FleetEndpoints const& remembered)
+HeldNodeKey ResolvedNodeKey(NodeConfig const& cfg)
 {
-    return ApplyFormation(cfg, record, remembered, HeldNodeKey { cfg.identityPublicKey })
-        .transform_error([](FormationUnread unread) { return std::move(unread.reason); });
+    return HeldNodeKey { cfg.identityPublicKey };
 }
 
 bool CommittedUnderOwnKey(Cluster::FormationRecord const& record) noexcept
@@ -388,7 +385,7 @@ std::expected<void, FormationUnread> ApplyKeptFormation(NodeConfig& cfg, KeptFor
 {
     // The start's own reading of the key, once it has one, over the reading beside the record: the
     // key this process proves itself with is the one it is judged by.
-    auto const ownKey = cfg.identityPublicKey.has_value() ? HeldNodeKey { cfg.identityPublicKey } : kept.ownKey;
+    auto const ownKey = cfg.identityPublicKey.has_value() ? ResolvedNodeKey(cfg) : kept.ownKey;
     return ApplyFormation(cfg, ProspectiveRecord(kept), kept.remembered, ownKey);
 }
 

@@ -2754,9 +2754,12 @@ int main(int argc, char** argv)
     if (!adopted.has_value())
         return RefuseStart(
             startHost, logger, std::format("{}; refusing to start", adopted.error()), ExitCodeFor(StartStage::Formation));
-    if (auto applied = Node::ApplyFormation(cliOnly, adopted->record, adopted->remembered); !applied.has_value())
-        return RefuseStart(
-            startHost, logger, std::format("{}; refusing to start", applied.error()), ExitCodeFor(StartStage::Formation));
+    if (auto applied = Node::ApplyFormation(cliOnly, adopted->record, adopted->remembered, Node::ResolvedNodeKey(cliOnly));
+        !applied.has_value())
+        return RefuseStart(startHost,
+                           logger,
+                           std::format("{}; refusing to start", applied.error().reason),
+                           ExitCodeFor(StartStage::Formation));
     logger.Logf(LogLevel::Info, "{}, cluster {}", Node::DescribeFormationMode(cfg), cfg.clusterId);
 
     // Built only when there IS a file, and holding the SAME argv the startup parse

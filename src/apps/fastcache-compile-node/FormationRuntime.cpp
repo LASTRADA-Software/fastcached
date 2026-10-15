@@ -93,8 +93,8 @@ std::optional<std::string> StartupShapeJudge::RefusalOf(Cluster::FormationRecord
 {
     auto shaped = _config.Current();
     auto const remembered = _endpoints.Load();
-    if (auto applied = ApplyFormation(shaped, next, remembered.endpoints); !applied.has_value())
-        return std::move(applied).error();
+    if (auto applied = ApplyFormation(shaped, next, remembered.endpoints, ResolvedNodeKey(shaped)); !applied.has_value())
+        return std::move(applied).error().reason;
     return _rules(shaped);
 }
 

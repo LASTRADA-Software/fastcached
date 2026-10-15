@@ -161,9 +161,10 @@ struct NodeStateFileRow
 ///
 /// The directory's writers are judged first, then who owns each file (`JudgeStateDirectory`), and
 /// only then the record and the remembered endpoints (`ReadKeptFormation`), so a record another
-/// account could have written is never read. A refusal carries `StateFileUnreadableHint`'s remedy
-/// for the record. The one reading `main` makes for every invocation, judged from the account
-/// running it -- through @p guard, which carries the accounts that caller counts as the node's own
+/// account could have written is never read. Beside a record committed under this node's own key,
+/// the key that judges it is read too, never minted (`WithHeldNodeKey`, #1663). A refusal carries
+/// `StateFileUnreadableHint`'s remedy for the record. The one reading `main` makes for every invocation, judged from the
+/// account running it -- through @p guard, which carries the accounts that caller counts as the node's own
 /// (`OwnStateAccountsGuard`); `--install-service` reads the record again after its handover, without
 /// the owner judgement whose answer depends on that account (`StateDirectoryFormationReader`).
 /// @param stateDirectory The directory the node resolved (`ChosenStateDirectory`).

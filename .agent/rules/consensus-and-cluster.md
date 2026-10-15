@@ -304,6 +304,13 @@ Every rule below has already been a bug.
       another), and of the record (`ApplyFormation`, judged by ONE key this node PROVED: the asked
       fleet's proven key, the key that SIGNED the admission -- `FleetMembership::admittedBy`, never
       the voters the stored roster CLAIMS, which a forged approval lists as easily -- or its own).
+    - **A founder's own key is READ, never minted, wherever a configuration is judged before its
+      start resolves the key** -- `WithHeldNodeKey` in `main`'s reading and in the install's after its
+      handover, and a reload applies the identity BEFORE the formation; a key that cannot be read is
+      refused in its own words at its own stage, never judged as `none` (#1663). `ApplyFormation`
+      therefore has ONE overload and takes the key as a REQUIRED argument: `ApplyKeptFormation` hands
+      over the key a reading found, `ResolvedNodeKey` the one a start resolved, and nothing reads it
+      out of a configuration that may not hold it yet -- the overload that did was how the reload met it.
     - **The pin anchors the JOIN; from then on the fleet's applied state is the authority.**
       After the join nothing asks the pin: Raft takes `AppendEntries` from whoever the
       configuration counts, the lease roster verifies grants against the APPLIED voters, and a

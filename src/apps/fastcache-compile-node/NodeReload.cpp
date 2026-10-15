@@ -66,8 +66,9 @@ NodeReloader::Reparse ReloadCandidateReader(std::span<char const* const> args, R
             return formationRefusal(kept.error());
         if (!kept->record.has_value())
             return formationRefusal(std::string { FormationRecordGone });
-        if (auto applied = ApplyFormation(candidate, *kept->record, kept->remembered); !applied.has_value())
-            return formationRefusal(applied.error());
+        if (auto applied = ApplyFormation(candidate, *kept->record, kept->remembered, ResolvedNodeKey(candidate));
+            !applied.has_value())
+            return formationRefusal(std::move(applied).error().reason);
         return candidate;
     };
 }

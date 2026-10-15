@@ -67,6 +67,12 @@ struct NodeFormationView
     [[nodiscard]] friend bool operator==(NodeFormationView const&, NodeFormationView const&) = default;
 };
 
+/// This node's own identity key as its state directory holds it, read and never minted: the key,
+/// nothing when the directory holds none, or why it could not be read -- with the key fault's own
+/// stage, so a pinned founder whose key file is damaged ends a start as that file does (`Refused`),
+/// never as a transient formation reading the supervisor retries.
+using HeldNodeKey = std::expected<std::optional<Ed25519PublicKey>, FormationUnread>;
+
 /// Shape @p cfg from the formation record.
 ///
 /// Fills `cfg.formation` from @p record and writes `cfg.clusterId` from it as well -- the lease
@@ -85,28 +91,15 @@ struct NodeFormationView
 /// because every shape the node takes passes through: the start refuses it by name with the remedy,
 /// a reload cannot reach it (the pin is `Reloadable::No`), and every formation move is judged by the
 /// same call (`StartupShapeJudge`), so no transition writes a record the pin forbids.
-/// @param cfg The configuration to shape.
-/// @param record The formation record, as loaded or minted.
-/// @param remembered The fleet endpoints this node last knew; empty when there is no file.
-/// @return Nothing, or why the record cannot shape a configuration.
-[[nodiscard]] std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
-                                                              Cluster::FormationRecord const& record,
-                                                              Cluster::FleetEndpoints const& remembered);
-
-/// This node's own identity key as its state directory holds it, read and never minted: the key,
-/// nothing when the directory holds none, or why it could not be read -- with the key fault's own
-/// stage, so a pinned founder whose key file is damaged ends a start as that file does (`Refused`),
-/// never as a transient formation reading the supervisor retries.
-using HeldNodeKey = std::expected<std::optional<Ed25519PublicKey>, FormationUnread>;
-
-/// `ApplyFormation`, with this node's own key STATED rather than read from @p cfg (#1663).
 ///
-/// A record this node FOUNDED commits it to its own cluster under its own key
-/// (`CommittedUnderOwnKey`), so that key is what a pin is judged against. A configuration judged
-/// before its start has resolved the key -- the shaping `main` runs before any verb, which a
+/// **A record this node FOUNDED is judged by the key it is HANDED (@p ownKey), and nothing else** --
+/// it commits this node to its own cluster under its own key (`CommittedUnderOwnKey`), so that key is
+/// what a pin is judged against. There is deliberately no overload that reads the key out of @p cfg:
+/// one turned "not resolved yet" into "no key" silently, and the reload met #1663 through it. A
+/// configuration shaped before its start has resolved the key -- `main`'s shaping, which a
 /// `--print-surfaces` and an install answer from, and the install's reading after its handover --
-/// holds none, and answered every pin naming this very node "under key none". The key is READ for
-/// them (`ReadHeldNodeKey`), never minted: only a start mints one, after its table.
+/// goes through `ApplyKeptFormation`, which hands over the key the reading found (`ReadHeldNodeKey`,
+/// never minted); one shaped after it hands over `ResolvedNodeKey`.
 /// @param cfg The configuration to shape.
 /// @param record The formation record, as loaded or minted.
 /// @param remembered The fleet endpoints this node last knew; empty when there is no file.
@@ -117,6 +110,14 @@ using HeldNodeKey = std::expected<std::optional<Ed25519PublicKey>, FormationUnre
                                                                   Cluster::FormationRecord const& record,
                                                                   Cluster::FleetEndpoints const& remembered,
                                                                   HeldNodeKey const& ownKey);
+
+/// The key @p cfg holds BECAUSE ITS START RESOLVED IT (`ApplyNodeIdentity`), as `ApplyFormation`
+/// takes it: for a configuration shaped after the identity was applied -- the start's adoption, every
+/// reform, a reload candidate. Before that @p cfg holds none, and judging a founded record by it
+/// would answer "none" for a key that is on disk (#1663); use `ApplyKeptFormation` there.
+/// @param cfg A configuration whose identity has been applied.
+/// @return Its key; nothing when the node holds none.
+[[nodiscard]] HeldNodeKey ResolvedNodeKey(NodeConfig const& cfg);
 
 /// Whether @p record commits this node to a cluster under this node's OWN key: one it founded and
 /// runs fleet consensus in. A pin judges such a record by that key, so only such a record needs it.

@@ -329,7 +329,7 @@ TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mo
         cfg.raftListen.clear();
         cfg.nodeListen = "0.0.0.0:6674";
         cfg.clusterDir = scratch.Path();
-        REQUIRE(ApplyFormation(cfg, record, {}).has_value());
+        REQUIRE(ApplyFormation(cfg, record, {}, ResolvedNodeKey(cfg)).has_value());
 
         auto const joined = expected->joined;
         CHECK((row.members == Cluster::FleetReach::Beyond) == joined);

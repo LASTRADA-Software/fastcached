@@ -5,12 +5,14 @@
 #include "WorkerLease.hpp"
 
 #include <FastCache/Cluster/FleetPin.hpp>
+#include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -220,6 +222,47 @@ TEST_CASE("A reload of a founder pinned to its own cluster and key is judged by 
     REQUIRE(candidate.has_value());
     CHECK(Testing::Unwrap(candidate->formation).mode == Cluster::NodeMode::Voter);
     CHECK(candidate->identityPublicKey == std::optional { ownKey });
+
+    // And a JOINED node's candidate does not list itself among its fleet's members, as its start does
+    // not: `FleetMembersOf` reads the id the identity applies, which now comes first.
+    auto const roster =
+        Cluster::Roster { .members = { Cluster::RosterMember { .id = "office",
+                                                               .raftEndpoint = "office:6680",
+                                                               .seat = Cluster::MemberSeat::Voter,
+                                                               .publicKey = Testing::TestKeyPair("office").PublicKey(),
+                                                               .schedulerEndpoint = {} },
+                                       Cluster::RosterMember { .id = "n1",
+                                                               .raftEndpoint = {},
+                                                               .seat = Cluster::MemberSeat::Learner,
+                                                               .publicKey = ownKey,
+                                                               .schedulerEndpoint = {} } },
+                          .revoked = {} };
+    auto joined = record;
+    joined.mode = Cluster::NodeMode::Learner;
+    joined.fleet = Cluster::FleetMembership { .clusterId = "fedcba9876543210fedcba9876543210",
+                                              .roster = Cluster::EncodeRoster(roster),
+                                              .createdAtUnixSeconds = 0,
+                                              .admittedBy = Testing::TestKeyPair("office").PublicKey() };
+    auto const unpinned =
+        WriteFile(scratch.Path() / "joined", std::format("cluster_dir: {}\n", (scratch / "state").generic_string()));
+    auto const readJoined = ReloadCandidateReader(
+        {},
+        ReloadBasis {
+            .stateDirectory = NodeStateDirectoryChoice { .path = scratch / "state", .origin = StateDirectoryOrigin::Named },
+            .hostNames = NodeHostNames { .fqdn = "box.corp.example", .dnsSuffix = "corp.example", .withheld = {} },
+            .formation =
+                [&joined] {
+                    return std::expected<KeptFormation, std::string> { KeptFormation { .record = joined,
+                                                                                       .remembered = {} } };
+                },
+            .identity = NodeIdentity { .id = "n1", .origin = NodeIdentityOrigin::Recorded, .publicKey = ownKey },
+        });
+    auto const joinedCandidate = readJoined(unpinned);
+    INFO((joinedCandidate.has_value() ? std::string {} : joinedCandidate.error().context));
+    REQUIRE(joinedCandidate.has_value());
+    auto const& members = Testing::Unwrap(joinedCandidate->formation).fleetMembers;
+    CHECK(std::ranges::none_of(members, [](Cluster::ClusterMember const& member) { return member.id == "n1"; }));
+    CHECK(std::ranges::any_of(members, [](Cluster::ClusterMember const& member) { return member.id == "office"; }));
 }
 
 TEST_CASE("A reload candidate carries the route host the running node derives its endpoints from",
