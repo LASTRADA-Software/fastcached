@@ -9,6 +9,7 @@
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
+#include "SharedCacheResponder.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Duration.hpp>
@@ -1284,8 +1285,9 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "the client. Above 256m it also sizes this port's\n"
                            "one pool of bytes being read, which cache and\n"
                            "shared-cache reads share, so a large value loosens\n"
-                           "that bound too. A value below --compile-request-max\n"
-                           "is refused at startup.",
+                           "that bound too. A value below the larger of\n"
+                           "--compile-request-max and 256m (the listener's\n"
+                           "frame cap) is refused at startup.",
             .yamlKey = "compile_inflight_max",
             .same = FieldEq<&NodeConfig::compileInflightMaxBytes>(),
             .component = &WorkerComponent,
@@ -2918,20 +2920,40 @@ std::size_t CompileByteBudgetOf(NodeConfig const& cfg, std::uint32_t slots) noex
                                                    : DefaultCompileByteBudget(slots, CompileRequestMaxOf(cfg));
 }
 
-bool CompileBudgetBelowRequestMax(NodeConfig const& cfg) noexcept
+namespace
 {
-    return cfg.compileInflightMaxBytes.has_value() && *cfg.compileInflightMaxBytes < CompileRequestMaxOf(cfg);
+    /// The listener's COMPILE frame cap can never be below this: every node carries the shared-cache
+    /// owner, and the cap is the fold of its components' (`CompileBudgetFloorOf`).
+    constexpr std::size_t ListenerFrameCapFloor = SharedCacheResponder::SharedCacheMaxRequestBytes;
+
+    static_assert(WorkerMinInFlightBytes >= ListenerFrameCapFloor,
+                  "the derived compile budget's floor must clear the listener's frame cap, or a derived budget "
+                  "answers an admissible frame endpoint-busy on an idle worker");
+} // namespace
+
+std::size_t CompileBudgetFloorOf(NodeConfig const& cfg) noexcept
+{
+    return std::max(CompileRequestMaxOf(cfg), ListenerFrameCapFloor);
 }
 
-std::string CompileBudgetBelowRequestMaxRefusal(NodeConfig const& cfg)
+bool CompileBudgetBelowFloor(NodeConfig const& cfg) noexcept
 {
-    return std::format("--compile-inflight-max={} is smaller than the largest compile request this worker accepts "
-                       "(--compile-request-max, {}): one request of that size could never be admitted, and would be "
-                       "told endpoint-busy -- come back shortly -- on an idle worker forever. Raise "
-                       "--compile-inflight-max to at least --compile-request-max, or drop it to derive one from the "
-                       "slot count.",
+    return cfg.compileInflightMaxBytes.has_value() && *cfg.compileInflightMaxBytes < CompileBudgetFloorOf(cfg);
+}
+
+std::string CompileBudgetBelowFloorRefusal(NodeConfig const& cfg)
+{
+    return std::format("--compile-inflight-max={} is below {}, the least this worker's budget can be: the larger of "
+                       "the largest compile request it accepts (--compile-request-max, {}) and the frame size its "
+                       "listener admits whatever that says ({}, the shared cache's frame cap, present on every node). "
+                       "A request that size would be told endpoint-busy -- come back shortly -- on an idle worker "
+                       "forever. Raise --compile-inflight-max to at least {}, or drop it to derive one from the slot "
+                       "count.",
                        FormatByteSize(static_cast<std::size_t>(cfg.compileInflightMaxBytes.value_or(0))),
-                       FormatByteSize(CompileRequestMaxOf(cfg)));
+                       FormatByteSize(CompileBudgetFloorOf(cfg)),
+                       FormatByteSize(CompileRequestMaxOf(cfg)),
+                       FormatByteSize(ListenerFrameCapFloor),
+                       FormatByteSize(CompileBudgetFloorOf(cfg)));
 }
 
 bool RunsConsensus(NodeConfig const& cfg) noexcept
@@ -4115,9 +4137,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .refuses = [](NodeConfig const& c) { return c.toolchains.empty() && !c.toolchainDiscovery; },
           .message = "--no-toolchain-discovery was given and no --toolchain: a worker with none would register "
                      "and then refuse every job the scheduler sent it." },
-        { .scope = &WorkerComponent,
-          .refuses = CompileBudgetBelowRequestMax,
-          .explain = CompileBudgetBelowRequestMaxRefusal },
+        { .scope = &WorkerComponent, .refuses = CompileBudgetBelowFloor, .explain = CompileBudgetBelowFloorRefusal },
         // A cache the operator NAMED, on a node that serves no surface to reach it
         // through. The tier already says so at Info and names the flags, which is
         // better than the silence #229 was filed about -- but an operator who

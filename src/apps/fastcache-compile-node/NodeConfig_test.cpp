@@ -8,6 +8,7 @@
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
+#include "SharedCacheResponder.hpp"
 
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -7136,7 +7137,7 @@ TEST_CASE("NodeConfig: a typed compile budget below the request ceiling is refus
     auto const refusal = StartupPolicyRejection(*below);
     REQUIRE(refusal.has_value());
     // WHICH refusal: this rule's, naming both figures.
-    CHECK(Unwrap(refusal) == CompileBudgetBelowRequestMaxRefusal(*below));
+    CHECK(Unwrap(refusal) == CompileBudgetBelowFloorRefusal(*below));
     CHECK(Unwrap(refusal).contains("128M"));
     CHECK(Unwrap(refusal).contains("256M"));
     CHECK(NodeInstallRejection(*below) == refusal);
@@ -7145,7 +7146,7 @@ TEST_CASE("NodeConfig: a typed compile budget below the request ceiling is refus
     auto const raised = ParseNodeArgv(
         { "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", "--compile-request-max=1g", "--compile-inflight-max=512m" });
     REQUIRE(raised.has_value());
-    CHECK(StartupPolicyRejection(*raised) == std::optional { CompileBudgetBelowRequestMaxRefusal(*raised) });
+    CHECK(StartupPolicyRejection(*raised) == std::optional { CompileBudgetBelowFloorRefusal(*raised) });
 
     // The controls: equal is admissible, and a raised ceiling with the budget left to derive is
     // never refused -- the derivation follows it.
@@ -7158,6 +7159,29 @@ TEST_CASE("NodeConfig: a typed compile budget below the request ceiling is refus
         REQUIRE(cfg.has_value());
         CHECK_FALSE(StartupPolicyRejection(*cfg).has_value());
     }
+}
+
+TEST_CASE("NodeConfig: a typed compile budget below the listener's frame cap is refused under a lowered ceiling",
+          "[node][config][policy][capacity]")
+{
+    // #1667's final review. A lowered `--compile-request-max` bounds the declared expansion, but
+    // the listener admits a COMPILE frame up to the merged fold, never below the shared cache's
+    // 256 MiB -- and `ChargeFor` charges that frame's length. So 64m/128m would answer a 200 MiB
+    // identity-codec frame `endpoint-busy` on an idle worker, every time.
+    auto const below = ParseNodeArgv(
+        { "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", "--compile-request-max=64m", "--compile-inflight-max=128m" });
+    REQUIRE(below.has_value());
+    REQUIRE(StartupPolicyRejection(*below) == std::optional { CompileBudgetBelowFloorRefusal(*below) });
+    CHECK(CompileBudgetFloorOf(*below) == SharedCacheResponder::SharedCacheMaxRequestBytes);
+    // The remedy names the frame cap, so following it cannot land in the same hole.
+    CHECK(CompileBudgetBelowFloorRefusal(*below).contains("frame cap"));
+    CHECK(CompileBudgetBelowFloorRefusal(*below).contains("at least 256M"));
+
+    // The control: the same lowered ceiling with a budget at the frame cap is admitted.
+    auto const atCap = ParseNodeArgv(
+        { "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", "--compile-request-max=64m", "--compile-inflight-max=256m" });
+    REQUIRE(atCap.has_value());
+    CHECK_FALSE(StartupPolicyRejection(*atCap).has_value());
 }
 
 TEST_CASE("NodeConfig: the compile ceilings are registered when typed and left to derive when not", "[node][service]")

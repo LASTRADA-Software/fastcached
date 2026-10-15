@@ -177,8 +177,9 @@
 # below 256m nor below compile_request_max. Full, a compile is refused
 # endpoint-busy and runs on the client. Above 256m it also sizes this port's
 # one pool of bytes being read, which cache and shared-cache reads share, so a
-# large value loosens that bound too. A value below compile_request_max is refused at
-# startup. Read at startup only.
+# large value loosens that bound too. A value below the larger of
+# compile_request_max and 256m (the listener's frame cap) is refused at startup.
+# Read at startup only.
 #compile_inflight_max:
 
 # cores never offered to the fleet, overriding what the node class reserves.

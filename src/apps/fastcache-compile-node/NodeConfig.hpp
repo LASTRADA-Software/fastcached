@@ -283,8 +283,8 @@ struct NodeConfig
     /// request for the whole compile. Absent DERIVES it from the resolved slot count
     /// (`CompileByteBudgetOf`, `DefaultCompileByteBudget`): slots times 64 MiB, never below
     /// 256 MiB nor below the per-request ceiling -- a flat 256 MiB refused half the leases a
-    /// 30-slot worker was granted on a codebase whose translation units preprocess to 12-22
-    /// MiB (#1667). An `optional` for the reason the field above is one.
+    /// 30-slot worker was granted on a codebase whose translation units preprocess to a median
+    /// of 12.5 MiB, max 21.6 MiB (#1667). An `optional` for the reason the field above is one.
     std::optional<std::uint64_t> compileInflightMaxBytes;
 
     /// Where the admin endpoint listens, or empty to leave it off.
@@ -993,24 +993,41 @@ struct NodeConfig
 /// @return The budget, in bytes.
 [[nodiscard]] std::size_t CompileByteBudgetOf(NodeConfig const& cfg, std::uint32_t slots) noexcept;
 
-/// Whether a typed in-flight compile budget is smaller than the per-request ceiling.
+/// The least in-flight compile budget a worker may run with: the larger of the per-request
+/// ceiling (`CompileRequestMaxOf`) and the listener's COMPILE frame cap floor.
 ///
-/// Such a worker could never admit one request of the size it promises to accept: the budget
-/// would answer `endpoint-busy` ("come back shortly") on an idle worker, and the client would
-/// retry a frame that can never fit (`CompileCapacity::IsChargeable`). Only a TYPED budget can
-/// be: a derived one is never below the ceiling (`DefaultCompileByteBudget`).
+/// **Two floors, because two numbers decide what a COMPILE may cost.** The decoder admits a
+/// declared expansion up to the request ceiling. But the FRAME is admitted by the listener's
+/// cap, which is the merged fold of its components' caps (`MergedResponder::MaxRequestBytes`),
+/// and every node carries the shared-cache owner at
+/// `SharedCacheResponder::SharedCacheMaxRequestBytes` (256 MiB) -- so a frame up to that size
+/// passes the listener whatever `--compile-request-max` says, and `ChargeFor` charges its length.
+/// A budget below it answers such a frame `endpoint-busy` on an IDLE worker, every time.
+/// `SharedCacheMaxRequestBytes` is the floor; `WorkerMinInFlightBytes`, the derivation's own
+/// floor, is held at or above it by a `static_assert`, so a DERIVED budget always clears it.
+/// @param cfg The parsed configuration.
+/// @return The floor, in bytes.
+[[nodiscard]] std::size_t CompileBudgetFloorOf(NodeConfig const& cfg) noexcept;
+
+/// Whether a typed in-flight compile budget is below its floor (`CompileBudgetFloorOf`).
+///
+/// Such a worker could never admit one request it would otherwise take: the budget would
+/// answer `endpoint-busy` ("come back shortly") on an idle worker, and the client would retry
+/// a frame that can never fit (`CompileCapacity::IsChargeable`). Only a TYPED budget can be:
+/// a derived one is never below either floor (`DefaultCompileByteBudget`).
 ///
 /// A worker-scoped row of `StartupPolicyRejection` rather than a check where `CompileCapacity` is
 /// built, for that table's standing reason: an install returns long before any tier exists, and a
 /// registration replaying the mistake would refuse every compile of that size at every boot.
 /// @param cfg The parsed configuration.
 /// @return True when `StartupPolicyRejection` must refuse it.
-[[nodiscard]] bool CompileBudgetBelowRequestMax(NodeConfig const& cfg) noexcept;
+[[nodiscard]] bool CompileBudgetBelowFloor(NodeConfig const& cfg) noexcept;
 
-/// What a start refused by `CompileBudgetBelowRequestMax` is told, naming both figures.
+/// What a start refused by `CompileBudgetBelowFloor` is told, naming the budget, the request
+/// ceiling and the listener's frame cap floor.
 /// @param cfg The parsed configuration.
 /// @return The refusal, with its remedy.
-[[nodiscard]] std::string CompileBudgetBelowRequestMaxRefusal(NodeConfig const& cfg);
+[[nodiscard]] std::string CompileBudgetBelowFloorRefusal(NodeConfig const& cfg);
 
 /// Build a configuration from a file and a command line, in that order.
 ///

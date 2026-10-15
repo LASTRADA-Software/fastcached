@@ -3260,9 +3260,12 @@ that compiles run side by side. Two ceilings bound memory, and both are options:
 The budget is derived from the slot count the worker actually runs — the one
 `--slots` names, or the one it derives when `--slots` is omitted — so a 1-slot
 worker keeps `256m`, an 8-slot one gets `512m` and a 30-slot one `1920m`. The
-figure is sized from a measurement: preprocessed, the translation units of a large
-MFC-heavy Windows codebase run 12.5 MiB at the median and 21.6 MiB at the largest,
-so a 30-slot worker needs roughly 375–555 MiB in flight just to keep its slots busy.
+figure is sized from a measurement: preprocessed with `cl /EP`, the translation units
+of a large MFC-heavy Windows codebase run 12.5 MiB at the median, 18.5 MiB at p90 and
+21.6 MiB at the largest, so a 30-slot worker needs roughly 375 MiB (median) to 555 MiB
+(p90), and 648 MiB at the largest, in flight just to keep its slots busy. What a worker
+is actually sent is preprocessed again with `/E`, line markers kept, which is larger by
+an amount that was not measured; the headroom of `64m` per slot is what absorbs it.
 At the flat 256 MiB this budget used to be, one such worker refused 2,246 of the
 4,274 compiles it was granted in a single build
 ([#1667](https://github.com/LASTRADA-Software/fastcached/issues/1667)). `64m` per slot
@@ -3280,9 +3283,12 @@ fastcache-compile-node --compile-inflight-max=4g ...
 
 Both take `k`/`m`/`g`; zero is refused, since a zero ceiling would admit no compile
 at all, and so is a `--compile-request-max` of `4g` or more, which no frame's 32-bit
-length could ever reach. A `--compile-inflight-max` below `--compile-request-max` is refused at
-startup — and at `--install-service` — because one request of the size the worker
-promises to accept could then never be admitted. Both are **restart-only**: the
+length could ever reach. A `--compile-inflight-max` below the larger of
+`--compile-request-max` and `256m` is refused at startup — and at `--install-service` —
+because one request the worker would otherwise take could then never be admitted. The
+`256m` is the listener's frame cap: every node carries the shared cache, whose `256m` cap
+the listener takes whatever `--compile-request-max` says, so a compile frame that large
+is read and charged even under a lowered ceiling. Both are **restart-only**: the
 request ceiling and the budget are fixed when the worker tier starts, and compiles
 already running hold reservations against them. The worker states both at startup:
 
@@ -3758,8 +3764,10 @@ The **scheduler** surface is the one where they move nothing, and on purpose: it
 frame ceiling says the peer is confused about the framing rather than about the
 fleet, and its byte budget says the surface is momentarily full, which the peer sees
 and retries — summed into the scheduler's security series, either would make that
-series unreadable. Each uncounted row states that reason in the code, and a
-`static_assert` refuses a row that states neither a counter nor a reason. So a flat
+series unreadable. Both state that reason in the code: the byte-budget row is held
+to it by a `static_assert`, and the frame ceiling is answered through
+`RefuseWithoutCounter`, which the worker-refusals scan holds to stating its reason.
+So a flat
 scheduler graph is not a claim that the surface is quiet. The cache surface was
 uncounted until
 [#491](https://github.com/LASTRADA-Software/fastcached/issues/491), and it was the
