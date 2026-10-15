@@ -6,9 +6,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -57,6 +61,7 @@ class RecordingExchange final: public IEndpointExchange
         std::string endpoint;
         std::uint8_t op;
         Credential credential;
+        ExchangeBudget budget;
     };
 
     /// How a MINT-TICKET is answered.
@@ -71,12 +76,12 @@ class RecordingExchange final: public IEndpointExchange
     [[nodiscard]] CacheOutcome Exchange(std::string_view hostPort,
                                         std::vector<std::byte> frame,
                                         Credential const& credential,
-                                        ExchangeBudget /*budget*/) override
+                                        ExchangeBudget budget) override
     {
         auto const header = Wire::DecodeRequestHeader(frame);
         REQUIRE(header.has_value());
         auto const op = Unwrap(header).opRaw;
-        seen.push_back(Seen { .endpoint = std::string { hostPort }, .op = op, .credential = credential });
+        seen.push_back(Seen { .endpoint = std::string { hostPort }, .op = op, .credential = credential, .budget = budget });
         if (op != static_cast<std::uint8_t>(Wire::Op::MintTicket))
             return refuseCommands ? RefusalOf(Wire::ErrorCode::NotAMember) : OutcomeOf(CacheOutcomeKind::Hit);
         switch (mint)
@@ -107,12 +112,13 @@ struct Minting
 {
     explicit Minting(std::optional<std::string> mintFrom = std::string { "127.0.0.1:6674" },
                      Credential password = {},
-                     std::string passwordFor = {}):
+                     std::string passwordFor = {},
+                     ExchangeBudget budget = {}):
         tickets { raw,
                   std::move(mintFrom),
                   std::move(password),
                   std::move(passwordFor),
-                  ExchangeBudget {},
+                  budget,
                   [this](std::string_view line) { said.emplace_back(line); } }
     {
     }
@@ -120,6 +126,13 @@ struct Minting
     RecordingExchange raw;
     std::vector<std::string> said;
     TicketCredentials tickets;
+
+    /// @return How many times this machine's node was asked to mint.
+    [[nodiscard]] std::size_t Mints() const
+    {
+        return static_cast<std::size_t>(
+            std::ranges::count(raw.seen, static_cast<std::uint8_t>(Wire::Op::MintTicket), &RecordingExchange::Seen::op));
+    }
 };
 
 } // namespace
@@ -266,9 +279,11 @@ TEST_CASE("A failed mint explains only its own exchange, and a later successful 
 {
     // A failure remembered for the process blamed every later refusal on it: the FETCH's mint fails,
     // the LEASE's succeeds and is refused for its own reason, and the record said "no machine ticket".
+    // A REFUSED mint, because it is one the process asks again (`MintRetry::PerExchange`); a node
+    // that did not answer is not asked again, and its case is below.
     Minting fix;
-    fix.raw.mint = RecordingExchange::Mint::Unreachable;
-    CHECK(fix.tickets.Present("office.corp:6674").missing == std::optional { MintFailure::Unreachable });
+    fix.raw.mint = RecordingExchange::Mint::Refused;
+    REQUIRE(fix.tickets.Present("office.corp:6674").missing == std::optional { MintFailure::Refused });
     fix.raw.mint = RecordingExchange::Mint::Ticket;
     auto const later = fix.tickets.Present("office.corp:6674");
     CHECK(later.credential.Configured());
@@ -277,8 +292,129 @@ TEST_CASE("A failed mint explains only its own exchange, and a later successful 
     // And what the record says about each: the refusal the missing ticket caused names it, the
     // refusal answered to the valid ticket keeps its own words.
     auto const refused = RefusalOf(Wire::ErrorCode::NotAMember);
-    CHECK(RecordedReason(refused, MintFailure::Unreachable) == ReasonFor(MintFailure::Unreachable));
+    CHECK(RecordedReason(refused, MintFailure::Refused) == ReasonFor(MintFailure::Refused));
     CHECK(RecordedReason(refused, later.missing) == DescribeOutcome(refused));
+}
+
+TEST_CASE("Without a node to answer, a process asks for a ticket once however many exchanges it makes", "[cc][ticket]")
+{
+    // #1664: a mint that could not connect was asked again by every exchange, and on Windows each
+    // waited out a whole connect budget -- three of them on a miss, before anything was cached.
+    Minting fix;
+    fix.raw.mint = RecordingExchange::Mint::Unreachable;
+    auto const audiences = std::to_array<std::string_view>(
+        { "office.corp:6674", "10.0.0.7:6676", "office.corp:6674", "cache.corp:11211", "10.0.0.8:6676" });
+    for (auto const audience: audiences)
+    {
+        INFO(audience);
+        auto const presented = fix.tickets.Present(audience);
+        // Every exchange still carries WHY it has no ticket, so a refusal it causes is explained.
+        CHECK_FALSE(presented.credential.Configured());
+        CHECK(presented.missing == std::optional { MintFailure::Unreachable });
+    }
+    REQUIRE(fix.Mints() == 1);
+    CHECK(fix.said.size() == 1);
+}
+
+TEST_CASE("A node that answers is asked once per exchange, a refusal included", "[cc][ticket]")
+{
+    // The control for the case above: only a node that did not answer is remembered. One that minted
+    // keeps minting, each ticket naming its own audience; one that refused or answered with nothing
+    // is asked again, since its answer can differ per audience and asking cost a loopback round trip.
+    struct Row
+    {
+        char const* what;
+        RecordingExchange::Mint mint;
+        std::size_t expectedMints;
+    };
+    auto const audiences = std::to_array<std::string_view>({ "office.corp:6674", "10.0.0.7:6676", "10.0.0.8:6676" });
+    auto const rows = std::to_array<Row>({
+        { .what = "minting", .mint = RecordingExchange::Mint::Ticket, .expectedMints = 3 },
+        { .what = "refusing", .mint = RecordingExchange::Mint::Refused, .expectedMints = 3 },
+        { .what = "answering with no ticket", .mint = RecordingExchange::Mint::Empty, .expectedMints = 3 },
+        { .what = "not answering", .mint = RecordingExchange::Mint::Unreachable, .expectedMints = 1 },
+    });
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        Minting fix;
+        fix.raw.mint = row.mint;
+        auto presented = std::vector<PresentedCredential> {};
+        for (auto const audience: audiences)
+            presented.push_back(fix.tickets.Present(audience));
+        REQUIRE(fix.Mints() == row.expectedMints);
+        if (row.mint != RecordingExchange::Mint::Ticket)
+            continue;
+        for (auto const& [audience, each]: std::views::zip(audiences, presented))
+            CHECK(each.credential.secret.View() == "ticket-for:" + std::string { audience });
+    }
+}
+
+TEST_CASE("A node that answered once is asked again when it stops answering, and then not again", "[cc][ticket]")
+{
+    // Remembering is a property of the FAILURE, never of the source: a node that minted for the
+    // first exchange is asked by the second, and only the attempt that could not connect ends it.
+    Minting fix;
+    REQUIRE(fix.tickets.Present("office.corp:6674").credential.Configured());
+    fix.raw.mint = RecordingExchange::Mint::Unreachable;
+    CHECK(fix.tickets.Present("10.0.0.7:6676").missing == std::optional { MintFailure::Unreachable });
+    CHECK(fix.tickets.Present("10.0.0.8:6676").missing == std::optional { MintFailure::Unreachable });
+    CHECK(fix.Mints() == 2);
+}
+
+TEST_CASE("A mint connects under the loopback bound and keeps the exchange's total", "[cc][ticket]")
+{
+    // The source is a loopback literal by construction, so its connect is bounded by what loopback
+    // costs and not by a LAN exchange's second -- which, on Windows, a closed loopback port takes in
+    // full. The round trip keeps the exchange's total: a busy node may answer slowly.
+    using std::chrono::milliseconds;
+    struct Row
+    {
+        char const* what;
+        milliseconds configuredConnect;
+        milliseconds expectedConnect;
+    };
+    auto const rows = std::to_array<Row>({
+        { .what = "the launcher's default",
+          .configuredConnect = milliseconds { 1'000 },
+          .expectedConnect = LoopbackConnectBound },
+        { .what = "a tighter one configured",
+          .configuredConnect = milliseconds { 10 },
+          .expectedConnect = milliseconds { 10 } },
+        { .what = "the platform default", .configuredConnect = milliseconds { 0 }, .expectedConnect = LoopbackConnectBound },
+    });
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        auto const configured = ExchangeBudget { .connect = row.configuredConnect, .total = milliseconds { 7'000 } };
+        Minting fix { std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, configured };
+        std::ignore = fix.tickets.Present("office.corp:6674");
+        REQUIRE(fix.raw.seen.size() == 1);
+        auto const& received = fix.raw.seen.front().budget;
+        REQUIRE(received.connect == row.expectedConnect);
+        CHECK(received.total == configured.total);
+        CHECK(received.idle == configured.idle);
+        CHECK(received.keepAlive == configured.keepAlive);
+    }
+    // The figure is a loopback one, far below the launcher's default connect budget.
+    STATIC_REQUIRE(LoopbackConnectBound == milliseconds { 50 });
+    STATIC_REQUIRE(LoopbackConnectBound < ExchangeBudget {}.connect);
+}
+
+TEST_CASE("A failed mint says no ticket was minted, never that the exchanges are refused", "[cc][ticket]")
+{
+    // #1664: against a cache with authentication off, the exchanges were served while the line said
+    // they "go unauthenticated and are refused". Only the audience knows whether it refuses.
+    Minting fix;
+    fix.raw.mint = RecordingExchange::Mint::Unreachable;
+    std::ignore = fix.tickets.Present("office.corp:6674");
+    REQUIRE(fix.said.size() == 1);
+    auto const& line = fix.said.front();
+    CHECK(line.starts_with(ReasonFor(MintFailure::Unreachable)));
+    REQUIRE(line.contains("carry no ticket"));
+    CHECK(line.contains("one whose cache or scheduler requires a ticket will be refused"));
+    CHECK_FALSE(line.contains("are refused"));
+    CHECK_FALSE(line.contains("go unauthenticated"));
 }
 
 TEST_CASE("The recorded reason names a missing ticket only for a refusal a ticket would have answered",
@@ -379,23 +515,25 @@ TEST_CASE("The decorator files, per refused exchange site, whether that exchange
     };
     fix.raw.refuseCommands = true;
 
-    // Refused with no ticket: filed under that exchange's failed mint.
-    fix.raw.mint = RecordingExchange::Mint::Unreachable;
+    // Refused with no ticket: filed under that exchange's failed mint. A mint answered with NO
+    // ticket, which the process asks again: an unreachable node is remembered, and the valid
+    // tickets this case needs later would never be minted.
+    fix.raw.mint = RecordingExchange::Mint::Empty;
     std::ignore = credentialed.Exchange("office.corp:6674", Wire::EncodeFetch("k"), Credential {}, ExchangeBudget {});
-    CHECK(credentialed.Refusals().MissingAt(fetchAt("office.corp:6674")) == std::optional { MintFailure::Unreachable });
+    CHECK(credentialed.Refusals().MissingAt(fetchAt("office.corp:6674")) == std::optional { MintFailure::NoTicket });
 
     // A later exchange at the same site that is SERVED leaves the filed refusal as it was.
     fix.raw.refuseCommands = false;
     fix.raw.mint = RecordingExchange::Mint::Ticket;
     std::ignore = credentialed.Exchange("office.corp:6674", Wire::EncodeFetch("k"), Credential {}, ExchangeBudget {});
-    CHECK(credentialed.Refusals().MissingAt(fetchAt("office.corp:6674")) == std::optional { MintFailure::Unreachable });
+    CHECK(credentialed.Refusals().MissingAt(fetchAt("office.corp:6674")) == std::optional { MintFailure::NoTicket });
 
     // A refusal answered to a VALID ticket at ANOTHER endpoint is filed there, and touches nothing
     // filed elsewhere.
     fix.raw.refuseCommands = true;
     std::ignore = credentialed.Exchange("10.0.0.7:6676", Wire::EncodeFetch("k"), Credential {}, ExchangeBudget {});
     CHECK_FALSE(credentialed.Refusals().MissingAt(fetchAt("10.0.0.7:6676")).has_value());
-    CHECK(credentialed.Refusals().MissingAt(fetchAt("office.corp:6674")) == std::optional { MintFailure::Unreachable });
+    CHECK(credentialed.Refusals().MissingAt(fetchAt("office.corp:6674")) == std::optional { MintFailure::NoTicket });
 
     // Nor does another VERB at the same endpoint: one address answers several exchanges.
     fix.raw.mint = RecordingExchange::Mint::Refused;

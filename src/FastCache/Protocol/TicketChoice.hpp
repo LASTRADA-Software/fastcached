@@ -93,21 +93,43 @@ enum class MintFailure : std::uint8_t
     Last,        ///< Enumerator count.
 };
 
+/// Whether a failed mint is asked again by the next exchange of the same process (#1664).
+///
+/// **PRIVATE: persisted and transmitted nowhere.**
+enum class MintRetry : std::uint8_t
+{
+    /// Asked again: the node ANSWERED, so asking cost a loopback round trip, and its answer can
+    /// differ per audience or per draw -- a malformed audience, a nonce it could not draw.
+    PerExchange,
+    /// Remembered for the process: asking again costs the same bound and cannot learn anything the
+    /// first attempt did not. Stale for at most one compile, and it fails CLOSED -- no ticket, which
+    /// a node-backed cache refuses and the launcher answers by compiling locally.
+    NotAgain,
+};
+
 /// One row of `MintFailureTable`.
 struct MintFailureRow
 {
     MintFailure failure;     ///< Which failure.
     std::string_view reason; ///< What the invocation records: FIXED, so `--show-stats` tallies a cause, not a compile.
+    MintRetry retry;         ///< Whether a later exchange of the same process asks again.
 };
 
-/// Every way a mint fails, and the reason each is recorded under.
+/// Every way a mint fails, the reason each is recorded under, and whether it is asked again.
 inline constexpr EnumTable<MintFailure, MintFailureRow> MintFailureTable { {
     { .failure = MintFailure::NoSource,
       .reason = "no machine ticket: nothing configured names the port this machine's node answers on, so it could "
-                "not be asked" },
-    { .failure = MintFailure::Unreachable, .reason = "no machine ticket: this machine's node did not answer MINT-TICKET" },
-    { .failure = MintFailure::Refused, .reason = "no machine ticket: this machine's node refused MINT-TICKET" },
-    { .failure = MintFailure::NoTicket, .reason = "no machine ticket: this machine's node answered MINT-TICKET with none" },
+                "not be asked",
+      .retry = MintRetry::NotAgain },
+    { .failure = MintFailure::Unreachable,
+      .reason = "no machine ticket: this machine's node did not answer MINT-TICKET",
+      .retry = MintRetry::NotAgain },
+    { .failure = MintFailure::Refused,
+      .reason = "no machine ticket: this machine's node refused MINT-TICKET",
+      .retry = MintRetry::PerExchange },
+    { .failure = MintFailure::NoTicket,
+      .reason = "no machine ticket: this machine's node answered MINT-TICKET with none",
+      .retry = MintRetry::PerExchange },
 } };
 
 static_assert(RowsInEnumeratorOrder(MintFailureTable, &MintFailureRow::failure),
@@ -118,6 +140,13 @@ static_assert(RowsInEnumeratorOrder(MintFailureTable, &MintFailureRow::failure),
 [[nodiscard]] constexpr std::string_view ReasonFor(MintFailure failure) noexcept
 {
     return MintFailureTable[static_cast<std::size_t>(failure)].reason;
+}
+
+/// @param failure Why no ticket was presented.
+/// @return Whether a later exchange of the same process asks this machine's node again.
+[[nodiscard]] constexpr MintRetry RetryFor(MintFailure failure) noexcept
+{
+    return MintFailureTable[static_cast<std::size_t>(failure)].retry;
 }
 
 } // namespace FastCache::Cc

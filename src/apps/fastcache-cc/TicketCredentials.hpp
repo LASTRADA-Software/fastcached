@@ -9,6 +9,8 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/TicketChoice.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -61,6 +63,46 @@ class ICredentialFor
     }
 };
 
+/// Ceiling on CONNECTING to this machine's node for a mint (#1664).
+///
+/// A mint source is a loopback literal by construction (`TicketSourceFor`), so it is bounded by
+/// what loopback costs and not by a LAN exchange's connect budget. That matters on Windows, where a
+/// connect to a CLOSED loopback port is not refused at once: the stack retries the SYN and answers
+/// `WSAECONNREFUSED` after ~2 s, so a machine with no node used to wait out the whole exchange
+/// budget (a second) on every mint.
+///
+/// **The figures it was chosen from, and their conditions** -- 32-thread hosts, each sampled idle and
+/// under 64 CPU-bound processes, 3,000 connects per row, timed in Python (`asyncio`):
+///
+/// | host | path | live listener, max (p99.9) | closed port |
+/// |---|---|---|---|
+/// | Windows 11 26200 | Proactor (IOCP `ConnectEx`) | 0.76 ms (0.60 ms) | 2,016--2,042 ms, refused |
+/// | WSL2 Ubuntu 24.04, kernel 6.6 | selector (`epoll`) | 13.5 ms (7.2 ms) | 0.15--0.47 ms, refused |
+///
+/// The Linux tail is the interpreter's as much as the kernel's -- a measurement of the instrument,
+/// which inflates it -- and Linux refuses a closed port at once, so there the bound is never paid.
+/// Fifty milliseconds is over 60 times the Windows maximum and over three times the inflated Linux
+/// one, and it is what a machine with no node pays, ONCE per invocation (`MintRetry::NotAgain`).
+/// A live node slower than this to ACCEPT costs no build: the exchange goes without a ticket, which
+/// a node-backed cache refuses and the launcher answers by compiling locally.
+inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };
+
+/// The budget a mint runs under, from the exchange budget the launcher was configured with.
+///
+/// Only the CONNECT is tightened, to `LoopbackConnectBound` or the configured one if that is
+/// tighter: a node that accepted but is busy may answer slowly, so the round trip keeps the
+/// exchange's own total -- and a node that does not answer in time only means no ticket.
+/// @param exchange The launcher's exchange budget.
+/// @return @p exchange with its connect bounded by loopback.
+[[nodiscard]] constexpr ExchangeBudget MintBudget(ExchangeBudget exchange) noexcept
+{
+    // Non-positive is `DialOptions`' spelling of *the platform default*, which is no bound at all.
+    exchange.connect = exchange.connect > std::chrono::milliseconds::zero()
+                           ? std::min(exchange.connect, LoopbackConnectBound)
+                           : LoopbackConnectBound;
+    return exchange;
+}
+
 /// Mints one ticket per call from this machine's node, over `exchange`, which must be the RAW
 /// exchange -- never a `CredentialedExchange`, which would ask this object for the mint's own
 /// credential.
@@ -72,9 +114,15 @@ class ICredentialFor
 ///
 /// **A mint that fails leaves that exchange unauthenticated, and says why twice**: once per process
 /// through `sink` (one process serves one compile), and as the `missing` half of that exchange's
-/// `PresentedCredential`, which `RecordedReason` records in place of the refusal it causes. The
-/// exchange is then refused `NotAMember` remotely, and every refusal ends in a local compile, so a
+/// `PresentedCredential`, which `RecordedReason` records in place of a refusal it causes. Whether
+/// the exchange IS refused is its audience's decision: a cache with authentication off serves it,
+/// one backed by a node refuses it `NotAMember`, and every refusal ends in a local compile, so a
 /// missing node costs speed, never a build.
+///
+/// **And a failure whose row says `MintRetry::NotAgain` is not asked again by this process**
+/// (#1664): without a node, every exchange used to wait out a connect of its own before it went
+/// anywhere. Each later exchange still carries the failure as its `missing`, so a refusal it causes
+/// is explained exactly as the first one's is.
 class TicketCredentials final: public ICredentialFor
 {
   public:
@@ -84,7 +132,7 @@ class TicketCredentials final: public ICredentialFor
     /// @param password The one password configured; presented to @p passwordFor alone.
     /// @param passwordFor The endpoint @p password belongs to (`FASTCACHE_ADDR`); ignored when
     ///        @p password is not configured.
-    /// @param budget The budget one mint runs under: a loopback round trip.
+    /// @param budget The launcher's exchange budget; a mint runs under `MintBudget` of it.
     /// @param sink Where a failed mint is said, once; may be empty.
     TicketCredentials(IEndpointExchange& exchange,
                       std::optional<std::string> mintFrom,
@@ -128,6 +176,8 @@ class TicketCredentials final: public ICredentialFor
     ExchangeBudget _budget;
     std::function<void(std::string_view)> _sink;
     bool _said { false };
+    /// A failure this process does not ask the node about again (`MintRetry::NotAgain`).
+    std::optional<MintFailure> _remembered;
 };
 
 /// What each exchange that was REFUSED presented, filed under where it went and what it asked.

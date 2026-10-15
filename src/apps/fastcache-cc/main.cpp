@@ -1329,7 +1329,8 @@ void ReportVerification(InvocationRecord const& record, Cc::HitComparison const&
 /// first call's configuration is the only one there is. A failed mint is said once through
 /// `Note`, and travels with the exchange it failed for (`PresentedCredential::missing`) into
 /// `RecordedReason`, so the record names it only against a refusal it caused. The mint runs
-/// over its own RAW exchange, at the cache's budget: a loopback round trip.
+/// over its own RAW exchange, under `Cc::MintBudget` of the cache's budget: the round trip keeps
+/// the cache's total, the connect is bounded by loopback (#1664).
 /// @param cfg The launcher configuration.
 /// @param verbose Whether FASTCACHE_VERBOSE was set; `InvocationRecord::verbose`.
 /// @return The credentials.

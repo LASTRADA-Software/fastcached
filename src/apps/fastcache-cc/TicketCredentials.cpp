@@ -40,7 +40,7 @@ TicketCredentials::TicketCredentials(IEndpointExchange& exchange,
     _mintFrom { std::move(mintFrom) },
     _password { std::move(password) },
     _passwordFor { std::move(passwordFor) },
-    _budget { budget },
+    _budget { MintBudget(budget) },
     _sink { std::move(sink) }
 {
 }
@@ -67,6 +67,8 @@ PresentedCredential TicketCredentials::PasswordCredential(std::string_view /*aud
 
 PresentedCredential TicketCredentials::MintedCredential(std::string_view audience)
 {
+    if (_remembered.has_value())
+        return PresentedCredential { .credential = {}, .missing = _remembered };
     if (!_mintFrom.has_value())
         return Failed(MintFailure::NoSource, "FASTCACHE_ADDR for the launcher, --listen-node for a node");
 
@@ -105,12 +107,16 @@ PresentedCredential TicketCredentials::MintedCredential(std::string_view audienc
 
 PresentedCredential TicketCredentials::Failed(MintFailure failure, std::string_view detail)
 {
+    // Says only what is KNOWN: no ticket. Whether an exchange without one is refused is its
+    // audience's decision -- a cache with authentication off serves it (#1664).
     if (!_said && _sink)
-        _sink(std::format("{} ({}); exchanges with other machines go unauthenticated and are refused, so they "
-                          "compile locally",
+        _sink(std::format("{} ({}); exchanges with other machines carry no ticket, and one whose cache or "
+                          "scheduler requires a ticket will be refused and its compile run locally",
                           ReasonFor(failure),
                           detail));
     _said = true;
+    if (RetryFor(failure) == MintRetry::NotAgain)
+        _remembered = failure;
     return PresentedCredential { .credential = {}, .missing = failure };
 }
 
