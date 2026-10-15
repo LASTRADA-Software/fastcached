@@ -8,6 +8,7 @@
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
+#include "Responders.hpp"
 #include "SharedCacheResponder.hpp"
 
 #include <FastCache/Cache/CowTreeStorage.hpp>
@@ -7172,7 +7173,8 @@ TEST_CASE("NodeConfig: a typed compile budget below the listener's frame cap is 
         { "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", "--compile-request-max=64m", "--compile-inflight-max=128m" });
     REQUIRE(below.has_value());
     REQUIRE(StartupPolicyRejection(*below) == std::optional { CompileBudgetBelowFloorRefusal(*below) });
-    CHECK(CompileBudgetFloorOf(*below) == SharedCacheResponder::SharedCacheMaxRequestBytes);
+    CHECK(CompileBudgetFloorOf(*below)
+          == std::max(SharedCacheResponder::SharedCacheMaxRequestBytes, CacheResponder::CacheMaxRequestBytes));
     // The remedy names the frame cap, so following it cannot land in the same hole.
     CHECK(CompileBudgetBelowFloorRefusal(*below).contains("frame cap"));
     CHECK(CompileBudgetBelowFloorRefusal(*below).contains("at least 256M"));

@@ -300,7 +300,8 @@ Every rule below has already been a bug.
       below 256 MiB nor below the per-request ceiling -- inside the 1 GiB per slot the
       slot clamp already assumes a compile may cost. `slots` times the CEILING is what
       #241 closed and stays closed. An operator names another budget with
-      `--compile-inflight-max`, refused at startup below `--compile-request-max`.
+      `--compile-inflight-max`, refused at startup below the larger of
+      `--compile-request-max` and the listener's 256 MiB frame cap.
     - **A price nothing could ever pay is not charged at all.** A footprint above the
       *whole* budget is the per-request ceiling, which `Unenvelope` answers by name
       with `payload-too-large` and without allocating. Reserved for, it comes back

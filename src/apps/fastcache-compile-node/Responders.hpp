@@ -675,8 +675,16 @@ class CacheResponder final: public IFrameResponder
     /// translation units, which are exactly the ones worth caching.
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
     {
-        return 256ULL * 1024ULL * 1024ULL;
+        return CacheMaxRequestBytes;
     }
+
+    /// The cache surface's frame cap, named because a second party reads it.
+    ///
+    /// The listener's frame cap is the fold of its components' (`MergedResponder::MaxRequestBytes`),
+    /// so on a node holding a tier a COMPILE frame up to this size is admitted whatever
+    /// `--compile-request-max` says -- and a worker's in-flight budget must hold one
+    /// (`CompileBudgetFloorOf` takes it into its floor, #1667). Raised here alone, that floor follows.
+    static constexpr std::size_t CacheMaxRequestBytes = 256ULL * 1024ULL * 1024ULL;
 
     /// Hundreds, and NOT eight, which is what it was while a connection was a request.
     ///

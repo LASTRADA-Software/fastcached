@@ -1000,11 +1000,13 @@ struct NodeConfig
 /// declared expansion up to the request ceiling. But the FRAME is admitted by the listener's
 /// cap, which is the merged fold of its components' caps (`MergedResponder::MaxRequestBytes`),
 /// and every node carries the shared-cache owner at
-/// `SharedCacheResponder::SharedCacheMaxRequestBytes` (256 MiB) -- so a frame up to that size
-/// passes the listener whatever `--compile-request-max` says, and `ChargeFor` charges its length.
-/// A budget below it answers such a frame `endpoint-busy` on an IDLE worker, every time.
-/// `SharedCacheMaxRequestBytes` is the floor; `WorkerMinInFlightBytes`, the derivation's own
-/// floor, is held at or above it by a `static_assert`, so a DERIVED budget always clears it.
+/// `SharedCacheResponder::SharedCacheMaxRequestBytes`, a node holding a tier the cache owner at
+/// `CacheResponder::CacheMaxRequestBytes` (both 256 MiB) -- so a frame up to that size passes the
+/// listener whatever `--compile-request-max` says, and `ChargeFor` charges its length. A budget
+/// below it answers such a frame `endpoint-busy` on an IDLE worker, every time. The larger of
+/// those two constants is the floor, so raising either alone moves it; `WorkerMinInFlightBytes`,
+/// the derivation's own floor, is held at or above it by a `static_assert`, so a DERIVED budget
+/// always clears it.
 /// @param cfg The parsed configuration.
 /// @return The floor, in bytes.
 [[nodiscard]] std::size_t CompileBudgetFloorOf(NodeConfig const& cfg) noexcept;

@@ -9,6 +9,7 @@
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
+#include "Responders.hpp"
 #include "SharedCacheResponder.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
@@ -2922,9 +2923,14 @@ std::size_t CompileByteBudgetOf(NodeConfig const& cfg, std::uint32_t slots) noex
 
 namespace
 {
-    /// The listener's COMPILE frame cap can never be below this: every node carries the shared-cache
-    /// owner, and the cap is the fold of its components' (`CompileBudgetFloorOf`).
-    constexpr std::size_t ListenerFrameCapFloor = SharedCacheResponder::SharedCacheMaxRequestBytes;
+    /// What the listener's COMPILE frame cap may reach whatever `--compile-request-max` says.
+    ///
+    /// The cap is the fold of its components' (`MergedResponder::MaxRequestBytes`, the largest):
+    /// every node carries the shared-cache owner, and a node holding a tier the cache owner too.
+    /// The larger of the two is taken, so raising either cap alone moves this floor with it rather
+    /// than reopening a frame the listener admits and the budget can never charge.
+    constexpr std::size_t ListenerFrameCapFloor =
+        std::max(SharedCacheResponder::SharedCacheMaxRequestBytes, CacheResponder::CacheMaxRequestBytes);
 
     static_assert(WorkerMinInFlightBytes >= ListenerFrameCapFloor,
                   "the derived compile budget's floor must clear the listener's frame cap, or a derived budget "
@@ -2945,10 +2951,10 @@ std::string CompileBudgetBelowFloorRefusal(NodeConfig const& cfg)
 {
     return std::format("--compile-inflight-max={} is below {}, the least this worker's budget can be: the larger of "
                        "the largest compile request it accepts (--compile-request-max, {}) and the frame size its "
-                       "listener admits whatever that says ({}, the shared cache's frame cap, present on every node). "
-                       "A request that size would be told endpoint-busy -- come back shortly -- on an idle worker "
-                       "forever. Raise --compile-inflight-max to at least {}, or drop it to derive one from the slot "
-                       "count.",
+                       "listener admits whatever that says ({}, the cache surfaces' frame cap; the shared cache "
+                       "is on every node). A request that size would be told endpoint-busy -- come back shortly "
+                       "-- on an idle worker forever. Raise --compile-inflight-max to at least {}, or drop it to "
+                       "derive one from the slot count.",
                        FormatByteSize(static_cast<std::size_t>(cfg.compileInflightMaxBytes.value_or(0))),
                        FormatByteSize(CompileBudgetFloorOf(cfg)),
                        FormatByteSize(CompileRequestMaxOf(cfg)),
