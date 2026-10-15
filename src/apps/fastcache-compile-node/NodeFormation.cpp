@@ -127,7 +127,9 @@ std::expected<void, FormationUnread> ApplyFormation(NodeConfig& cfg,
         // Then the refusal is the reading's, at the key fault's own stage, never the remedy below:
         // resetting the state directory would discard the very key the pin may name.
         auto const pin = FleetPinOf(cfg);
-        if (!held.has_value() && pin.fleet.has_value() && pin.fleet->clusterId == *committed)
+        // Whether the pin names THIS cluster is `AdmitsFleet`'s own question, asked under every key the
+        // pin names -- the one predicate, never an id compared here.
+        if (!held.has_value() && pin.fleet.has_value() && Cluster::AdmitsFleet(pin, *committed, pin.fleet->voterKeys))
             return std::unexpected { FormationUnread {
                 .reason = std::format("the formation record commits this node to cluster {1} (it is {0}) under its own "
                                       "key, and --fleet-id pins it to {2}, but that key cannot be read to compare: {3}",
@@ -139,15 +141,23 @@ std::expected<void, FormationUnread> ApplyFormation(NodeConfig& cfg,
         auto const signer = held.value_or(std::nullopt);
         auto const signers =
             signer.has_value() ? std::span<Ed25519PublicKey const> { &*signer, 1 } : std::span<Ed25519PublicKey const> {};
+        // What is known of the signer, and no more: a key that could not be read is not an absent one.
+        auto const signerText = [&held, &signer] {
+            if (!held.has_value())
+                return std::string { "its own key, which could not be read" };
+            if (!signer.has_value())
+                return std::string { "key none" };
+            return std::format("key {}", FormatEd25519PublicKey(*signer));
+        }();
         if (!Cluster::AdmitsFleet(pin, *committed, signers))
             return refused(std::format(
-                "the formation record commits this node to cluster {1} (it is {0}) under key {3}, which --fleet-id "
+                "the formation record commits this node to cluster {1} (it is {0}) under {3}, which --fleet-id "
                 "does not name, and --fleet-id pins it to {2}: if that is the fleet this node belongs to, reset its "
                 "state directory so it starts alone and joins it; if {1} is, change --fleet-id",
                 Cluster::NodeModeRowFor(record.mode).name,
                 *committed,
-                Cluster::PinText(FleetPinOf(cfg)),
-                signer.has_value() ? FormatEd25519PublicKey(*signer) : std::string { "none" }));
+                Cluster::PinText(pin),
+                signerText));
     }
 
     auto view = NodeFormationView { .mode = record.mode,
@@ -385,7 +395,8 @@ std::expected<void, FormationUnread> ApplyKeptFormation(NodeConfig& cfg, KeptFor
 std::expected<void, FormationUnread> ShapeByKeptFormation(NodeConfig& cfg,
                                                           std::expected<KeptFormation, FormationUnread> const& kept)
 {
-    // A record that was read and that `ApplyFormation` refuses is the formation's own step.
+    // A record that was read and that `ApplyFormation` refuses ends at the step it names: the formation's
+    // own, or the key fault's when a pin needed this node's key and it could not be read.
     auto shaped = kept.and_then([&cfg](KeptFormation const& held) { return ApplyKeptFormation(cfg, held); });
     if (!shaped.has_value())
         cfg.formationUnread = shaped.error();

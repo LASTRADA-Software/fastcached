@@ -1346,6 +1346,9 @@ TEST_CASE("A pinned founder's key file that cannot be used is refused by name an
     REQUIRE_FALSE(elsewhere.kept.error().reason.contains("cannot be read to compare"));
     CHECK(elsewhere.kept.error().reason.contains(PinRefusal));
     CHECK(elsewhere.kept.error().stage == StartStage::Formation);
+    // And it says what is known of the key: unreadable, never "none", the wording #1663 removes.
+    CHECK_FALSE(elsewhere.kept.error().reason.contains("under key none"));
+    CHECK(elsewhere.kept.error().reason.contains("under its own key, which could not be read"));
 
     // The same file decides nothing for a founder no pin asks about: no refusal where there was none.
     auto const unpinned = JudgeFounderLine(scratch.Path(), {});
