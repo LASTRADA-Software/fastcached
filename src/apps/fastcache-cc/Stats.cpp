@@ -385,11 +385,11 @@ namespace
         DeclineReasonRow { .reason = "matching workers had withdrawn their slots",
                            .cause = DeclineCause::Withdrawn,
                            .specifics = Specifics::None },
-        // Not the row above: the worker had slots, and the budget that ran out is one an
-        // operator raises (`--compile-inflight-max`). Peer text names an endpoint and figures
-        // that change per refusal, so it stays on the verbose line (#1667).
-        DeclineReasonRow { .reason = "a node's in-flight byte budget was full",
-                           .cause = DeclineCause::ByteBudgetFull,
+        // Not the row above: the node's front door was full -- its in-flight byte budget or its
+        // connection cap, one wire code for both. Peer text names an endpoint and figures that
+        // change per refusal, so it stays on the verbose line (#1667).
+        DeclineReasonRow { .reason = "a node had no room for another request (endpoint-busy)",
+                           .cause = DeclineCause::NodeBusy,
                            .specifics = Specifics::None },
         DeclineReasonRow { .reason = "another client was already building this key",
                            .cause = DeclineCause::AlreadyBuilding,
