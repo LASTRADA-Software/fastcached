@@ -265,6 +265,28 @@ struct NodeConfig
     /// turn off.
     std::chrono::seconds drainTimeout { 30 };
 
+    /// The largest compile request this worker accepts, when the operator named one.
+    ///
+    /// Bounds the size a compile's codec envelope declares it expands to, ONE value handed to
+    /// `Cc::WorkerProtocol` and read back by the compile surface (`CompileRequestMaxOf`).
+    /// It reaches the listener's FRAME cap only when RAISED: that cap is the largest of the
+    /// components', and every node carries the shared cache's 256 MiB, so a lower value
+    /// bounds the envelope alone. Absent is `WorkerMaxRequestBytes`, 256 MiB.
+    ///
+    /// An `optional` for `slots`' reason: it is this row's provenance, so a registration
+    /// replays a value the operator typed and never bakes in today's default (#1667).
+    std::optional<std::uint64_t> compileRequestMaxBytes;
+
+    /// The in-flight compile budget, when the operator named one.
+    ///
+    /// What every compile running on this worker may hold at once, each charged its whole
+    /// request for the whole compile. Absent DERIVES it from the resolved slot count
+    /// (`CompileByteBudgetOf`, `DefaultCompileByteBudget`): slots times 64 MiB, never below
+    /// 256 MiB nor below the per-request ceiling -- a flat 256 MiB refused half the leases a
+    /// 30-slot worker was granted on a codebase whose translation units preprocess to a median
+    /// of 12.5 MiB, max 21.6 MiB (#1667). An `optional` for the reason the field above is one.
+    std::optional<std::uint64_t> compileInflightMaxBytes;
+
     /// Where the admin endpoint listens, or empty to leave it off.
     ///
     /// One string rather than the daemon's address/port/enabled triple, because a
@@ -953,6 +975,61 @@ struct NodeConfig
 /// @return The count to advertise and enforce, or absent when `RunsWorker` is false.
 [[nodiscard]] std::optional<std::uint32_t> WorkerSlotsOf(NodeConfig const& cfg,
                                                          Distributed::NodeCapacity const& capacity) noexcept;
+
+/// The largest compile request this worker accepts: `--compile-request-max`, or
+/// `WorkerMaxRequestBytes` when it names none.
+///
+/// The one door from the option to the value, asked by the worker tier when it builds its
+/// protocol and by the startup rule comparing it with the budget, so the two cannot read
+/// the default differently.
+/// @param cfg The parsed configuration.
+/// @return The ceiling, in bytes.
+[[nodiscard]] std::size_t CompileRequestMaxOf(NodeConfig const& cfg) noexcept;
+
+/// The in-flight compile budget this worker runs with: `--compile-inflight-max`, or
+/// `DefaultCompileByteBudget` over the RESOLVED slot count when it names none (#1667).
+/// @param cfg The parsed configuration.
+/// @param slots What `WorkerSlotsOf` answered -- the count the worker runs, never the flag.
+/// @return The budget, in bytes.
+[[nodiscard]] std::size_t CompileByteBudgetOf(NodeConfig const& cfg, std::uint32_t slots) noexcept;
+
+/// The least in-flight compile budget a worker may run with: the larger of the per-request
+/// ceiling (`CompileRequestMaxOf`) and the listener's COMPILE frame cap floor.
+///
+/// **Two floors, because two numbers decide what a COMPILE may cost.** The decoder admits a
+/// declared expansion up to the request ceiling. But the FRAME is admitted by the listener's
+/// cap, which is the merged fold of its components' caps (`MergedResponder::MaxRequestBytes`),
+/// and every node carries the shared-cache owner at
+/// `SharedCacheResponder::SharedCacheMaxRequestBytes`, a node holding a tier the cache owner at
+/// `CacheResponder::CacheMaxRequestBytes` (both 256 MiB) -- so a frame up to that size passes the
+/// listener whatever `--compile-request-max` says, and `ChargeFor` charges its length. A budget
+/// below it answers such a frame `endpoint-busy` on an IDLE worker, every time. The larger of
+/// those two constants is the floor, so raising either alone moves it; `WorkerMinInFlightBytes`,
+/// the derivation's own floor, is held at or above it by a `static_assert`, so a DERIVED budget
+/// always clears it.
+/// @param cfg The parsed configuration.
+/// @return The floor, in bytes.
+[[nodiscard]] std::size_t CompileBudgetFloorOf(NodeConfig const& cfg) noexcept;
+
+/// Whether a typed in-flight compile budget is below its floor (`CompileBudgetFloorOf`).
+///
+/// Such a worker could never admit one request it would otherwise take: the budget would
+/// answer `endpoint-busy` ("come back shortly") on an idle worker, and the client would retry
+/// a frame that can never fit (`CompileCapacity::IsChargeable`). Only a TYPED budget can be:
+/// a derived one is never below either floor (`DefaultCompileByteBudget`).
+///
+/// A worker-scoped row of `StartupPolicyRejection` rather than a check where `CompileCapacity` is
+/// built, for that table's standing reason: an install returns long before any tier exists, and a
+/// registration replaying the mistake would refuse every compile of that size at every boot.
+/// @param cfg The parsed configuration.
+/// @return True when `StartupPolicyRejection` must refuse it.
+[[nodiscard]] bool CompileBudgetBelowFloor(NodeConfig const& cfg) noexcept;
+
+/// What a start refused by `CompileBudgetBelowFloor` is told, naming the budget, the request
+/// ceiling and the listener's frame cap floor.
+/// @param cfg The parsed configuration.
+/// @return The refusal, with its remedy.
+[[nodiscard]] std::string CompileBudgetBelowFloorRefusal(NodeConfig const& cfg);
 
 /// Build a configuration from a file and a command line, in that order.
 ///

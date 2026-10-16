@@ -455,6 +455,21 @@ enum class DeclineCause : std::uint8_t
     /// somebody is using them, or a scratch disk is full. The fleet is big enough
     /// and unavailable, which is a different purchase from being too small.
     Withdrawn,
+    /// A node had no room for another request at its front door (`EndpointBusy`).
+    ///
+    /// **Two causes share that wire code, and this launcher cannot tell them apart**: the
+    /// node's in-flight byte budget was full (on a worker, the compiles running there each
+    /// hold their whole request -- raise `--compile-inflight-max`), or its listener was at its
+    /// connection cap (counted on the node as
+    /// `fastcache_node_frame_connections_refused_at_capacity_total` rather than
+    /// `fastcache_worker_jobs_refused_endpoint_busy_total`, and the likelier of the two for a
+    /// LEASE, whose payload is kilobytes). The remedy is on that node either way, so the row
+    /// names both rather than the one a compile usually meets.
+    ///
+    /// **Its own row, never `Withdrawn`'s**: nobody else is using the machines, and folded
+    /// into "withdrawn their slots" one worker refusing half the leases it was granted in a
+    /// single build read as exactly that (#1667).
+    NodeBusy,
     /// Another client already holds the lease for this key.
     ///
     /// **Not a fault, and its own row for exactly that reason.** This is duplicate
@@ -485,11 +500,13 @@ enum class DeclineCause : std::uint8_t
     ArgumentRefused,
     /// The job was larger than a worker's surface takes.
     ///
-    /// A FLEET fact for the same reason `ArgumentRefused` is one: the ceiling is a constant of the
-    /// worker's build (`WorkerMaxRequestBytes`), so every worker of that build refuses the same
-    /// translation unit alike, and "one machine to go and look at" would send an operator to a
-    /// machine for a property of the unit. Nothing to fix on either end; the compile runs here,
-    /// correctly, and the peer's message naming the ceiling rides `DispatchResult::refusal`.
+    /// Usually a FLEET fact, for the reason `ArgumentRefused` is one: the ceiling is the worker's
+    /// `--compile-request-max` (`WorkerMaxRequestBytes` unless raised), and a fleet left at the
+    /// default refuses the same translation unit alike, so "one machine to go and look at" would
+    /// send an operator to a machine for a property of the unit. **That is an assumption since
+    /// #1667 made the ceiling per node**: in a fleet whose workers set it differently, this is one
+    /// machine's setting, and the peer's message naming the ceiling -- which rides
+    /// `DispatchResult::refusal` -- says which. Either way the compile runs here, correctly.
     TooLarge,
     /// The fleet could not name a leader to ask.
     ///
@@ -579,10 +596,11 @@ inline constexpr std::array DeclineCauseTable {
     // build has never heard of.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ClusterChangeInFlight, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ClusterChangeNotNeeded, .cause = DeclineCause::NotPermitted },
-    // Slots were free and MEMORY was not, which the worker's own rule calls a
-    // momentary fullness the peer retries past -- the same answer as a withdrawn
-    // slot, and not a machine to go and inspect.
-    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EndpointBusy, .cause = DeclineCause::Withdrawn },
+    // A node's front door was full: its in-flight byte budget or its connection cap, which
+    // this code does not distinguish. The launcher still compiles locally, as it does for a
+    // withdrawn slot -- but the remedy is on that node, so it is tallied apart rather than read
+    // as a fleet somebody else is using (#1667).
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EndpointBusy, .cause = DeclineCause::NodeBusy },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::MalformedRegistration, .cause = DeclineCause::ProtocolMismatch },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::LeaseUnauthorized, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::LeaseEndpointMismatch, .cause = DeclineCause::NotPermitted },

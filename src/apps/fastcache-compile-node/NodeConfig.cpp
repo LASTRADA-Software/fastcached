@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheTier.hpp"
+#include "CompileCapacity.hpp"
 #include "EnrollAutoApprove.hpp"
 #include "NodeConfig.hpp"
 #include "NodeFormation.hpp"
@@ -8,6 +9,8 @@
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
+#include "Responders.hpp"
+#include "SharedCacheResponder.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Duration.hpp>
@@ -642,6 +645,52 @@ namespace
         return static_cast<std::uint64_t>(*parsed);
     }
 
+    /// A worker's compile ceiling: `--compile-request-max` or `--compile-inflight-max`.
+    ///
+    /// `--cache-disk`'s grammar, `k`/`m`/`g` and no `N%` -- these bound what one process
+    /// buffers, so a share of host RAM would be a different number on every machine one
+    /// registration is replayed on. **Zero is refused here, in the row's grammar**, rather
+    /// than meaning "unbounded" as it does for a cache: a zero ceiling admits no request at
+    /// all, and a zero budget would turn every compile away `endpoint-busy` on an idle worker
+    /// -- a worker that registers, is leased out and never compiles anything (#1667). Whether
+    /// the two agree with EACH OTHER is a cross-flag rule, `StartupPolicyRejection`'s.
+    /// @param sv Text to parse.
+    /// @return The size in bytes, or why it is not one.
+    [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCompileBytes(std::string_view sv)
+    {
+        auto const parsed = ParseByteSize(sv);
+        if (!parsed.has_value())
+            return std::unexpected(parsed.error());
+        if (*parsed == 0)
+            return std::unexpected(ArgvError(
+                ConfigErrorCode::OutOfRange,
+                "must be more than zero: a zero ceiling admits no compile at all, so the worker would register, be "
+                "leased out and refuse every job"));
+        return static_cast<std::uint64_t>(*parsed);
+    }
+
+    /// `--compile-request-max`: `ParseCompileBytes`, and no larger than a frame can say.
+    ///
+    /// A frame declares its payload in a u32 (`CompileCacheWire::MaxFramePayload`), so a
+    /// ceiling past it is one no request could ever reach -- and the derived budget, which
+    /// follows the ceiling, would reserve gigabytes for nothing. Refused by name rather than
+    /// clamped, so the operator sees the figure they typed was not the one in force. The BUDGET
+    /// takes no such bound: it is many requests' worth, and past 4 GiB is a real answer.
+    /// @param sv Text to parse.
+    /// @return The size in bytes, or why it is not one.
+    [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCompileRequestBytes(std::string_view sv)
+    {
+        return ParseCompileBytes(sv).and_then([](std::uint64_t bytes) -> std::expected<std::uint64_t, ConfigError> {
+            if (bytes > CompileCacheWire::MaxFramePayload)
+                return std::unexpected(
+                    ArgvError(ConfigErrorCode::OutOfRange,
+                              std::format("must be at most {} bytes: a frame declares its length in 32 bits, so no request "
+                                          "could ever be larger",
+                                          CompileCacheWire::MaxFramePayload)));
+            return bytes;
+        });
+    }
+
     /// The fleet `--fleet-id` pins this node to: text, then `Cluster::ParsePinnedFleet`'s grammar.
     ///
     /// Refused by name here rather than accepted and matched by nothing: a truncated copy of what
@@ -1194,6 +1243,56 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .yamlKey = "drain_timeout",
             .same = FieldEq<&NodeConfig::drainTimeout>(),
             .component = &WorkerComponent,
+        },
+        // The worker's two memory ceilings (#1667), named for what they bound rather than
+        // after the cache flags: `--cache-memory` is a tier's SIZE, these are a compile
+        // surface's MAXIMA, so `compile-` groups them with the surface they cap and `-max`
+        // says each is a ceiling a request is refused at, never an allocation.
+        //
+        // Restart-only (`Reloadable::No`, the default), deliberately: the request ceiling is
+        // handed to `Cc::WorkerProtocol` and the budget to `CompileCapacity` once, at
+        // construction, and both are read by compiles already in flight. Moving either live
+        // needs a budget that can shrink under reservations it already granted, which is a
+        // larger change than a reload row -- the reason `--slots` is a restart as well.
+        {
+            .primary = "--compile-request-max",
+            .arity = Arity::Value,
+            .operand = "=<size>",
+            .apply = AssignFrom<&NodeConfig::compileRequestMaxBytes, ParseCompileRequestBytes>(),
+            .description = "the largest compile request this worker accepts:\n"
+                           "the size its compressed source declares it expands\n"
+                           "to (default 256m, below 4g; k/m/g = KiB/MiB/GiB).\n"
+                           "Raising it also raises this port's frame cap for\n"
+                           "the verbs the session cap governs -- compile, store,\n"
+                           "fetch, shared-store, shared-fetch -- and no other;\n"
+                           "lowering it leaves that cap at the cache's 256m. A\n"
+                           "larger translation unit is refused\n"
+                           "payload-too-large and compiled locally.",
+            .yamlKey = "compile_request_max",
+            .same = FieldEq<&NodeConfig::compileRequestMaxBytes>(),
+            .component = &WorkerComponent,
+            .present = PresentIn<&NodeConfig::compileRequestMaxBytes>(),
+        },
+        {
+            .primary = "--compile-inflight-max",
+            .arity = Arity::Value,
+            .operand = "=<size>",
+            .apply = AssignFrom<&NodeConfig::compileInflightMaxBytes, ParseCompileBytes>(),
+            .description = "the bytes every compile running here may hold at\n"
+                           "once, each charged its whole request until it\n"
+                           "answers; k/m/g = KiB/MiB/GiB. Default: 64m per slot,\n"
+                           "never below 256m nor below --compile-request-max.\n"
+                           "Full, a compile is refused endpoint-busy and runs on\n"
+                           "the client. Above 256m it also sizes this port's\n"
+                           "one pool of bytes being read, which cache and\n"
+                           "shared-cache reads share, so a large value loosens\n"
+                           "that bound too. A value below the larger of\n"
+                           "--compile-request-max and 256m (the listener's\n"
+                           "frame cap) is refused at startup.",
+            .yamlKey = "compile_inflight_max",
+            .same = FieldEq<&NodeConfig::compileInflightMaxBytes>(),
+            .component = &WorkerComponent,
+            .present = PresentIn<&NodeConfig::compileInflightMaxBytes>(),
         },
         {
             .primary = "--reserve-cores",
@@ -2491,6 +2590,10 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // different instructions. The `optional` is this row's provenance bit, and it
     // predates the ones the other rows now carry.
     emitIfPresent("reserve-cores", cfg.reservedCores);
+    // On presence, for `--slots`' reason: absent DERIVES the budget from the slot count at
+    // every start, and a registration that baked today's figure in would stop following it.
+    emitIfPresent("compile-request-max", cfg.compileRequestMaxBytes);
+    emitIfPresent("compile-inflight-max", cfg.compileInflightMaxBytes);
     emitIfExplicit("admin-listen", cfg.adminListen, cfg.adminListenExplicit);
     if (cfg.dashboard)
         argv.emplace_back("--dashboard");
@@ -2804,6 +2907,59 @@ std::optional<std::uint32_t> WorkerSlotsOf(NodeConfig const& cfg, Distributed::N
     if (!RunsWorker(cfg))
         return std::nullopt;
     return Distributed::OfferableSlots(capacity, cfg.slots);
+}
+
+std::size_t CompileRequestMaxOf(NodeConfig const& cfg) noexcept
+{
+    return cfg.compileRequestMaxBytes.has_value() ? static_cast<std::size_t>(*cfg.compileRequestMaxBytes)
+                                                  : WorkerMaxRequestBytes;
+}
+
+std::size_t CompileByteBudgetOf(NodeConfig const& cfg, std::uint32_t slots) noexcept
+{
+    return cfg.compileInflightMaxBytes.has_value() ? static_cast<std::size_t>(*cfg.compileInflightMaxBytes)
+                                                   : DefaultCompileByteBudget(slots, CompileRequestMaxOf(cfg));
+}
+
+namespace
+{
+    /// What the listener's COMPILE frame cap may reach whatever `--compile-request-max` says.
+    ///
+    /// The cap is the fold of its components' (`MergedResponder::MaxRequestBytes`, the largest):
+    /// every node carries the shared-cache owner, and a node holding a tier the cache owner too.
+    /// The larger of the two is taken, so raising either cap alone moves this floor with it rather
+    /// than reopening a frame the listener admits and the budget can never charge.
+    constexpr std::size_t ListenerFrameCapFloor =
+        std::max(SharedCacheResponder::SharedCacheMaxRequestBytes, CacheResponder::CacheMaxRequestBytes);
+
+    static_assert(WorkerMinInFlightBytes >= ListenerFrameCapFloor,
+                  "the derived compile budget's floor must clear the listener's frame cap, or a derived budget "
+                  "answers an admissible frame endpoint-busy on an idle worker");
+} // namespace
+
+std::size_t CompileBudgetFloorOf(NodeConfig const& cfg) noexcept
+{
+    return std::max(CompileRequestMaxOf(cfg), ListenerFrameCapFloor);
+}
+
+bool CompileBudgetBelowFloor(NodeConfig const& cfg) noexcept
+{
+    return cfg.compileInflightMaxBytes.has_value() && *cfg.compileInflightMaxBytes < CompileBudgetFloorOf(cfg);
+}
+
+std::string CompileBudgetBelowFloorRefusal(NodeConfig const& cfg)
+{
+    return std::format("--compile-inflight-max={} is below {}, the least this worker's budget can be: the larger of "
+                       "the largest compile request it accepts (--compile-request-max, {}) and the frame size its "
+                       "listener admits whatever that says ({}, the cache surfaces' frame cap; the shared cache "
+                       "is on every node). A request that size would be told endpoint-busy -- come back shortly "
+                       "-- on an idle worker forever. Raise --compile-inflight-max to at least {}, or drop it to "
+                       "derive one from the slot count.",
+                       FormatByteSize(static_cast<std::size_t>(cfg.compileInflightMaxBytes.value_or(0))),
+                       FormatByteSize(CompileBudgetFloorOf(cfg)),
+                       FormatByteSize(CompileRequestMaxOf(cfg)),
+                       FormatByteSize(ListenerFrameCapFloor),
+                       FormatByteSize(CompileBudgetFloorOf(cfg)));
 }
 
 bool RunsConsensus(NodeConfig const& cfg) noexcept
@@ -3987,6 +4143,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .refuses = [](NodeConfig const& c) { return c.toolchains.empty() && !c.toolchainDiscovery; },
           .message = "--no-toolchain-discovery was given and no --toolchain: a worker with none would register "
                      "and then refuse every job the scheduler sent it." },
+        { .scope = &WorkerComponent, .refuses = CompileBudgetBelowFloor, .explain = CompileBudgetBelowFloorRefusal },
         // A cache the operator NAMED, on a node that serves no surface to reach it
         // through. The tier already says so at Info and names the flags, which is
         // better than the silence #229 was filed about -- but an operator who

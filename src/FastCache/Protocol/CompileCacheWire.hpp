@@ -1481,8 +1481,8 @@ class PayloadCap
 
 /// This verb carries whatever the operator's session cap allows.
 ///
-/// Legitimate for the three payload-bearing verbs -- STORE and a COMPILE reply carry
-/// an object file, COMPILE carries a preprocessed translation unit -- and never for a
+/// Legitimate for the five payload-bearing verbs -- STORE, FETCH and their shared-cache
+/// twins carry an object file, COMPILE carries a preprocessed translation unit -- and never for a
 /// verb reachable before authentication, which `PreAuthVerbsAreBounded` refuses.
 inline constexpr PayloadCap SessionCapGoverns { 0 };
 

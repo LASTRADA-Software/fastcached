@@ -697,8 +697,10 @@ class IMetricsSink
         /// The diagnostic verbs are the ones an operator reaches for when a node is in
         /// trouble, and this is the node answering *I am too busy to tell you what I
         /// am*. It names the REQUEST that was refused rather than the load that
-        /// exhausted the budget -- which on any node holding a tier is the cache's
-        /// traffic, since the listener's ceiling folds to the largest owner's.
+        /// exhausted the budget -- usually the cache's traffic on a node holding a tier,
+        /// or compile uploads still being read on a worker (a running compile has handed its
+        /// reservation to the compile budget by then), since the listener's ceiling folds to the
+        /// largest owner's (the compile budget wherever it exceeds the cache's 256 MiB, #1667).
         ///
         /// A rise here is therefore read together with
         /// `NodeCacheRequestsRefusedEndpointBusy` rather than summed with it: this one
@@ -741,9 +743,11 @@ class IMetricsSink
         /// flight.
         ///
         /// **The byte-budget refusal a node with a tier actually reaches.**
-        /// `MergedResponder::MaxInFlightBytes()` folds to the largest owner's budget,
-        /// which in practice is this cache's, so the endpoint's in-flight ceiling is
-        /// the cache's ceiling and a `STORE` is what runs into it.
+        /// `MergedResponder::MaxInFlightBytes()` folds to the largest owner's budget:
+        /// the cache's 256 MiB, or a worker's compile budget wherever that exceeds it --
+        /// five or more slots, a raised `--compile-request-max`, or a typed
+        /// `--compile-inflight-max` (#1667) -- where cache reads may hold up to that.
+        /// Either way a `STORE` is what runs into it.
         ///
         /// **Never summed with `WorkerJobsRefusedEndpointBusy` or
         /// `NodeFrameConnectionsRefusedAtCapacity`.** Three refusals answer

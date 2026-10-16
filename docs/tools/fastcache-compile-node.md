@@ -3141,7 +3141,9 @@ endpoint-mismatch refusals in the minutes after it.
 ### Why the capacity flags still need a restart
 
 `slots`, `node_class` and `reserve_cores` are resolved against what the cache tier
-actually holds, which is decided when that tier starts. Re-deriving them safely means
+actually holds, which is decided when that tier starts. `compile_request_max` and
+`compile_inflight_max` are fixed when the worker starts, because the compiles already
+running hold reservations against them. Re-deriving them safely means
 re-establishing that ordering on a running node, which is a larger change than it
 looks.
 
@@ -3245,21 +3247,80 @@ the fleet's own busy/free arithmetic. Its `fastcache_node_slots_configured` gaug
 does read 0, which is a different question with a different right answer -- that one
 is this node's configured capacity, and zero is what it is.
 
+### Memory: what a compile may hold
+
 Slots bound CPU; they do not bound memory, and the two are separate questions now
-that compiles run side by side. A worker also caps the payload bytes all its jobs
-are reading at once at 256 MiB — one request's worth, so ordinary translation units
-run together and a single enormous one cannot be joined by a second. A job refused
-by that budget is told `endpoint-busy` rather than `no-capacity`, and counted as
+that compiles run side by side. Two ceilings bound memory, and both are options:
+
+| Option | Default | What it bounds |
+| --- | --- | --- |
+| `--compile-request-max` (`compile_request_max`) | `256m`, below `4g` | One compile request: the size its compressed source declares it expands to. **Raising** it also raises the frame-length cap the session cap governs on this node's `0xFC` port — the listener takes the largest of its components' caps — which moves exactly `COMPILE`, `STORE`, `FETCH`, `SHARED-STORE` and `SHARED-FETCH`; every other verb keeps its own fixed bound. **Lowering** it leaves that cap at the shared cache's `256m`, present on every node, and bounds only the declared expansion |
+| `--compile-inflight-max` (`compile_inflight_max`) | slots × `64m`, never below `256m` nor below `--compile-request-max` | Every compile running on this worker at once, each charged its whole request **for the whole compile** — from the moment the compile is admitted until it answers, not only while it is being read. (The read itself is charged to the listener's pool below; only the slot, not the bytes, is held until the answer is written.) |
+
+The budget is derived from the slot count the worker actually runs — the one
+`--slots` names, or the one it derives when `--slots` is omitted — so a 1-slot
+worker keeps `256m`, an 8-slot one gets `512m` and a 30-slot one `1920m`. The
+figure is sized from a measurement: preprocessed with `cl /EP`, the translation units
+of a large MFC-heavy Windows codebase run 12.5 MiB at the median, 18.5 MiB at p90 and
+21.6 MiB at the largest, so a 30-slot worker needs roughly 375 MiB (median) to 555 MiB
+(p90), and 648 MiB at the largest, in flight just to keep its slots busy. What a worker
+is actually sent is preprocessed again with `/E`, line markers kept, which is larger by
+an amount that was not measured; the headroom of `64m` per slot is what absorbs it.
+At the flat 256 MiB this budget used to be, one such worker refused 2,246 of the
+4,274 compiles it was granted in a single build
+([#1667](https://github.com/LASTRADA-Software/fastcached/issues/1667)). `64m` per slot
+is about three times the largest of those units, and a sixteenth of the gigabyte per
+slot the memory clamp above already assumes a compile may cost.
+
+```sh
+# Translation units larger than 256 MiB once preprocessed: raise the request
+# ceiling. The derived budget follows it, so one such unit is always admissible.
+fastcache-compile-node --compile-request-max=512m ...
+
+# A worker that should hold more than 64 MiB per slot in flight.
+fastcache-compile-node --compile-inflight-max=4g ...
+```
+
+Both take `k`/`m`/`g`; zero is refused, since a zero ceiling would admit no compile
+at all, and so is a `--compile-request-max` of `4g` or more, which no frame's 32-bit
+length could ever reach. A `--compile-inflight-max` below the larger of
+`--compile-request-max` and `256m` is refused at startup — and at `--install-service` —
+because one request the worker would otherwise take could then never be admitted. The
+`256m` is the listener's frame cap: every node carries the shared cache, whose `256m` cap
+the listener takes whatever `--compile-request-max` says, so a compile frame that large
+is read and charged even under a lowered ceiling. Both are **restart-only**: the
+request ceiling and the budget are fixed when the worker tier starts, and compiles
+already running hold reservations against them. The worker states both at startup:
+
+```
+[INFO] worker: 30 slot(s), in-flight compile budget 1920M (derived from the slots), largest request 256M
+```
+
+A request over `--compile-request-max` is refused `payload-too-large` and compiled
+on the client. A compile refused by the budget is told `endpoint-busy` rather than
+`no-capacity`, and counted as
 `fastcache_worker_jobs_refused_endpoint_busy_total`: slots were free and memory was
-not, so more machines would not have helped.
+not, so more machines would not have helped. `fastcache-cc --show-stats` tallies it
+as `a node had no room for another request (endpoint-busy)`, apart from withdrawn slots — a
+tally that also covers a full connection cap, so read the node's own counter: a rising
+`fastcache_worker_jobs_refused_endpoint_busy_total` is the signal to raise
+`--compile-inflight-max`.
+
+The node's one `0xFC` listener holds its own pool of bytes for frames still being
+read, sized to the largest budget any of its components declares — so it follows the
+compile budget and never undercuts it. It is ONE pool: the cache and shared-cache
+surfaces share it too, so wherever the compile budget exceeds `256m` — five or more
+slots, a raised `--compile-request-max`, or a typed `--compile-inflight-max` — a
+`STORE` or `FETCH` being read may hold up to that budget rather than the cache's own
+`256m`, and a large typed budget loosens that bound with it.
 
 Because the compiles now outlive the accept loop, stopping the node waits for
-them. A stop closes the listener first, so nothing new is admitted, and then
-blocks until every compile still running has finished and answered its client.
-There is no deadline on that wait: a compile is a client's answer, and abandoning
-one would hand that client a broken connection to save a few seconds of shutdown.
+them. A stop closes the listener first, so nothing new is admitted, and then waits
+for every compile still running to finish and answer its client — for at most
+`--drain-timeout`, `30s` by default, after which it names what it abandons and ends
+itself ([Stopping one, and what a stop waits for](#stopping-one-and-what-a-stop-waits-for)).
 A node stopping while it is full therefore takes as long as its longest running
-translation unit.
+translation unit, up to that bound.
 
 ### Withdrawing while the machine is busy
 
@@ -3699,14 +3760,21 @@ rather than one row each, because a cache `STORE` that overran its ceiling count
 against the compile surface names the wrong subsystem, and naming the subsystem is
 what these series are read for.
 
-The **scheduler** surface is the one where they still move nothing
-([#494](https://github.com/LASTRADA-Software/fastcached/issues/494)). That is a
-known gap rather than a claim about that surface being quiet. The cache surface was
-the same until
+The **scheduler** surface is the one where they move nothing, and on purpose: its
+frame ceiling says the peer is confused about the framing rather than about the
+fleet, and its byte budget says the surface is momentarily full, which the peer sees
+and retries — summed into the scheduler's security series, either would make that
+series unreadable. Both state that reason in the code: the byte-budget row is held
+to it by a `static_assert`, and the frame ceiling is answered through
+`RefuseWithoutCounter`, which the worker-refusals scan holds to stating its reason.
+So a flat
+scheduler graph is not a claim that the surface is quiet. The cache surface was
+uncounted until
 [#491](https://github.com/LASTRADA-Software/fastcached/issues/491), and it was the
 gap that mattered most: the listener's in-flight ceiling is the largest of the
-components present, which on any node holding a tier is the cache's, so the
-byte-budget refusal that fires in practice is a cache `STORE`.
+components present — the cache's 256 MiB, or a worker's compile budget wherever that
+is larger — and on a node holding a tier the byte-budget refusal that fires in
+practice is a cache `STORE`.
 
 | Series | Says | Counted for |
 |---|---|---|
@@ -3714,7 +3782,7 @@ byte-budget refusal that fires in practice is a cache `STORE`.
 | `fastcache_worker_jobs_refused_endpoint_busy_total` | A request would not fit in the bytes already in flight. A slot was free and the memory was not, so more machines would not have helped. | compile verbs |
 | `fastcache_node_frame_connections_refused_at_capacity_total` | The listener already holds every *connection* it will, so a new one was turned away before it sent anything. | every verb — it is decided before one is named |
 | `fastcache_node_cache_requests_refused_payload_too_large_total` | The cache surface's half of the frame ceiling. On a node holding a tier this is the one that actually fires, and it needs 24 bytes and no body to move. | cache verbs |
-| `fastcache_node_cache_requests_refused_endpoint_busy_total` | The cache surface's half of the byte budget: a `STORE` that would not fit in the bytes already in flight. The listener's ceiling folds to the largest component's, so on a node with a tier this is that ceiling. | cache verbs |
+| `fastcache_node_cache_requests_refused_endpoint_busy_total` | The cache surface's half of the byte budget: a `STORE` that would not fit in the bytes already in flight. The listener's ceiling folds to the largest component's — the cache's 256 MiB, or a worker's compile budget wherever that is larger — and a `STORE` is what runs into it. | cache verbs |
 | `fastcache_node_cache_requests_refused_unsupported_version_total` | A cache request at a wire version this build cannot decode — a client from another release. Worth alerting on because the launcher steps over it and compiles locally, so the only other symptom is a cache that looks permanently cold. | cache verbs |
 | `fastcache_node_cache_requests_refused_malformed_payload_total` | A `FETCH` or `STORE` body that would not decode, in a frame whose declared length arrived in full. Two ends that agree on the framing and disagree about what goes inside it. | cache verbs |
 | `fastcache_node_cache_requests_refused_foreign_generation_total` | A `STORE` whose value names a canonicalization generation this build does not implement — the value-format twin of the unsupported-version row above, and the same operator action: find the machine that is out of step. Answered `foreign-value-generation`, never `malformed-value`: the value is well formed and the fleet is mid-upgrade, so reading it as a damaged cache is the one wrong move. Flat at zero unless the fleet spans a `CompileValueVersion` bump, so any rise is a real event. It is also the only view of what refusing costs, since the launcher reports a miss and compiles locally. | cache verbs |

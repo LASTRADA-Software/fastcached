@@ -272,9 +272,13 @@ core::async::Task<FrameReply> CompileResponder::Answer(std::span<std::byte const
     // the per-request ceiling, which the decoder answers by name and without allocating
     // a byte, and charged here it would come back `EndpointBusy` on a completely idle
     // worker and send the client off to retry a frame that can never fit. That hand-off
-    // is sound only while the decoder's ceiling is no larger than this budget, which is
-    // why `WorkerMaxRequestBytes` is one exported constant rather than a literal per
-    // side.
+    // is sound only while the decoder's ceiling is no larger than this budget. Since both
+    // became options (#1667) that rests on three things rather than on one shared constant:
+    // the derived budget is never below the request ceiling (`DefaultCompileByteBudget`'s
+    // request term); it is never below the listener's frame cap either, which is the merged
+    // fold and never below the shared cache's 256 MiB, so a frame the listener admits is one
+    // `ChargeFor` can charge (`WorkerMinInFlightBytes`, held there by a `static_assert`); and a
+    // typed budget below either is refused at startup (`CompileBudgetBelowFloor`).
     //
     // It is not charged NOTHING either, which is the distinction `ChargeFor` carries:
     // the frame has arrived and is held, so it costs its own length whatever the
