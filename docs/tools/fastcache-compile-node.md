@@ -2610,10 +2610,28 @@ that leases this worker never races its startup, and an idle worker costs
 nothing — which suits a compile fleet, where misses on a warm shared cache are
 bursty and rare.
 
+The port is **6674**, the node's own default and where every local client looks —
+`fastcache-cc`, `CompileCache.cmake` and `fastcache-cli` all default to
+`127.0.0.1:6674` — so this machine's builds use the node's cache tier with no
+`FASTCACHE_ADDR` at all. The plain `fastcached` the package also installs listens on
+6674 too, and a fresh install enables and starts it, so the node **supersedes** it:
+the socket declares `Conflicts=fastcached.service`, and enabling the socket stops the
+daemon and takes the port; with both enabled, a boot starts the node. Disable the
+daemon as well so `systemctl status` does not show an enabled unit that never runs:
+
+```sh
+sudo systemctl disable --now fastcached
+```
+
+Starting `fastcached` by hand does the reverse and stops the node's socket. Up to
+0.5.0 the socket listened on 6676, which no local client dials
+([#1676](https://github.com/LASTRADA-Software/fastcached/issues/1676)); a drop-in
+that moved it by hand can go.
+
 The worker needs no `advertise:` for it. It asks the socket it is handed where it is
-bound: the shipped `ListenStream=6676` binds every interface, so it advertises the
-address this machine routes from on port 6676 and follows the network when that
-changes; a `ListenStream=10.0.0.5:6676` is advertised as exactly that. An `advertise:`
+bound: the shipped `ListenStream=6674` binds every interface, so it advertises the
+address this machine routes from on port 6674 and follows the network when that
+changes; a `ListenStream=10.0.0.5:6674` is advertised as exactly that. An `advertise:`
 in the configuration file still wins. **Coming from 0.4.0**, which refused to start
 under activation without one: if you added a literal address only to get past that
 refusal, remove it, or the node stays pinned to it and does not follow the network.

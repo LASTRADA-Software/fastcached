@@ -2752,14 +2752,23 @@ jobs:
           # give, which only the unit's CacheDirectory= makes writable: without it
           # the worker refuses to start on a read-only path, and no step here set a
           # cache_dir, which is how that shipped (#1674).
-          printf 'advertise: 127.0.0.1:6676\ncluster_dir: /var/lib/fastcache-node\ntoolchain:\n  - /usr/bin/g++\ncache_memory: 64m\ncache_disk: 256m\ncache_dir: /var/cache/fastcache-node\n' \
+          printf 'advertise: 127.0.0.1:6674\ncluster_dir: /var/lib/fastcache-node\ntoolchain:\n  - /usr/bin/g++\ncache_memory: 64m\ncache_disk: 256m\ncache_dir: /var/cache/fastcache-node\n' \
             | sudo tee /etc/fastcached/fastcache-compile-node.yaml >/dev/null
 
           # Enabling the SOCKET is what enables the worker; the service carries
-          # no [Install] on purpose.
+          # no [Install] on purpose. And it supersedes fastcached: both serve
+          # 6674, the socket declares Conflicts= with Before= on the daemon, and
+          # this is the takeover on a systemd older than the 259 the .rpm step
+          # measured it on (#1676). fastcached is started first because the step
+          # above stopped it, and a fresh install leaves it running.
+          sudo systemctl start fastcached
+          systemctl is-active --quiet fastcached \
+            || { echo "::error::fastcached did not start again before the takeover"; exit 1; }
           sudo systemctl enable --now fastcache-compile-node.socket
           systemctl is-active --quiet fastcache-compile-node.socket \
-            || { echo "::error::the socket unit did not start"; exit 1; }
+            || { echo "::error::the socket unit did not start beside a running fastcached"; sudo ss -ltnp || true; exit 1; }
+          systemctl is-active --quiet fastcached \
+            && { echo "::error::enabling the node's socket left fastcached running on the same port"; exit 1; }
 
           # Nothing should be running yet -- that is the whole point of
           # activation. An already-active service here means the socket was
@@ -2768,7 +2777,7 @@ jobs:
             && { echo "::error::the service started without a connection"; exit 1; }
 
           # One connection activates it.
-          timeout 10 bash -c 'exec 3<>/dev/tcp/127.0.0.1/6676' || true
+          timeout 10 bash -c 'exec 3<>/dev/tcp/127.0.0.1/6674' || true
 
           # Waited for by its OUTPUT, not by is-active. Type=simple is reported
           # active the moment systemd forks, while this worker still has to walk
@@ -2795,42 +2804,33 @@ jobs:
           # It must have ADOPTED the socket rather than bound its own, and that is
           # asserted on the STATE as well as on a log line.
           #
-          # The paragraph here used to argue the grep was belt-and-braces, because a
-          # worker that failed to adopt would collide with the socket unit already
-          # holding the port and never come up. That was true while the activated
-          # surface was the dedicated compile port -- `--bind`/`--port`, the same port
-          # the unit holds. #290 stage 3 activates the NODE surface instead, whose
-          # default is 6674 while this unit holds 6676, and `fastcached` is stopped a
-          # step earlier so 6674 is free. A non-adopting worker therefore binds its
-          # own default, logs readiness, and passes every other assertion in this
-          # step. The reasoning survived the change that invalidated it, so the grep
-          # had quietly become the only check standing here.
-          #
-          # `ss` rather than a connect probe: a connect to 6676 succeeds either way,
-          # since the socket unit answers it whether or not the service adopted. What
-          # separates the two outcomes is whether anything is listening on the port
-          # the FALLBACK would take.
+          # Until #1676 the socket held 6676 while the worker's own default was 6674,
+          # so a worker that did not adopt bound 6674 beside it, logged readiness and
+          # passed everything else here -- which is why this read "nothing listens on
+          # 6674". The socket now holds 6674 itself, the worker's default, so that
+          # worker cannot bind at all and the readiness wait above already fails.
+          # What remains to show is POSITIVE: 6674 has exactly ONE listener, the
+          # socket systemd bound, and the worker shares it -- `ss -p` names both pid 1
+          # and the worker on that line. A connect probe could not say so: the socket
+          # answers it whether or not the service adopted.
           command -v ss >/dev/null \
             || { echo "::error::ss is unavailable, so this step cannot tell an adopted socket from a bound one"; exit 1; }
-          # Captured and matched, never `ss ... | grep -q`. That pipeline is a false
-          # NEGATIVE under `pipefail`, and it fails on the success path: `grep -q`
-          # exits at the first match, `ss` dies of SIGPIPE, and `pipefail` reports
-          # the producer's status -- so the pipeline says "nothing listening"
-          # precisely when something IS. Same trap as `nm | grep -q __tsan_init` in
-          # build-and-toolchain.md, which is where this shape is written down.
+          # Captured and matched through a herestring, never `ss ... | grep -q`: under
+          # `pipefail` that pipeline is a false NEGATIVE on the success path, since
+          # `grep -q` leaves at the first match and `ss` dies of SIGPIPE. Same trap as
+          # `nm | grep -q __tsan_init` in build-and-toolchain.md.
           #
-          # `if` rather than an `&&` chain for the second reason: under `set -e` the
-          # good case would make a chained form return non-zero and abort the step.
-          listening_6674="$(ss -lnt 'sport = :6674' 2>/dev/null || true)"
-          if [[ "$listening_6674" == *LISTEN* ]]; then
-            echo "::error::the worker bound its own --listen-node default instead of adopting the activated socket"
-            ss -lnt || true; exit 1
+          # `if` rather than an `&&` chain: under `set -e` the good case would make a
+          # chained form return non-zero and abort the step.
+          held_6674="$(sudo ss -ltnpH 'sport = :6674' 2>/dev/null || true)"
+          if [[ "$(grep -c LISTEN <<<"$held_6674")" != 1 || "$held_6674" != *'"systemd",pid=1,'* || "$held_6674" != *fastcache-compi* ]]; then
+            echo "::error::6674 is not the activated socket shared by the worker alone: ${held_6674}"
+            sudo ss -ltnp || true; exit 1
           fi
 
-          # And the sentence, which is what says WHY it is not on 6674 -- the state
-          # check alone cannot separate "adopted" from "started no listener at all".
-          # Its wording changed with the flags: it named `--bind` and `--port` until
-          # stage 3 deleted them.
+          # And the sentence, which says the worker took the descriptor it was handed
+          # rather than one it opened. Its wording changed with the flags: it named
+          # `--bind` and `--port` until stage 3 deleted them.
           grep -q 'serving a socket-activated listener' /tmp/node-log.txt \
             || { echo "::error::the worker did not adopt the activated socket"; exit 1; }
 

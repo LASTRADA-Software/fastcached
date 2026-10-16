@@ -20,23 +20,48 @@
 Description=fastcache compile worker socket
 Documentation=https://github.com/LASTRADA-Software/fastcached
 
+# The node SUPERSEDES the plain daemon on this machine, as it does under the Windows
+# MSI, where fastcached is registered DISABLED beside a node. Both serve the cache on
+# 6674 -- the daemon on loopback, this socket on every interface -- and the package
+# enables and starts fastcached on a fresh install, so enabling this socket must take
+# the port from it rather than fail to bind it.
+#
+# Conflicts= stops fastcached when this socket starts (and stops this socket when an
+# operator starts fastcached by hand, which is that operator's choice). Before= is
+# what makes it WORK: Conflicts= implies no ordering, and without one systemd ran the
+# daemon's stop and this socket's start in parallel, so the bind raced the daemon's
+# exit and failed "Address already in use". Ordered either way, a stop runs before a
+# conflicting start -- and it must be Before=, because After= would close a cycle:
+# fastcached is ordered after sockets.target, which is ordered after this socket.
+# Measured on systemd 259 (Fedora 44): `enable --now` with fastcached running stops
+# it and binds *:6674; with BOTH enabled, three boots of three came up with this
+# socket holding the port and fastcached inactive. The packaging e2e asserts both.
+Conflicts=fastcached.service
+Before=fastcached.service
+
 [Socket]
 # The worker's single 0xFC port: the cache verbs, the compile verbs a scheduler
 # dispatches here, and the scheduler verbs themselves while the node's mode serves a scheduler.
-# It is deliberately NOT an IANA-registered assignment, and deliberately not
-# 6674 either -- 6674 is where fastcache-cc looks by default and where a
-# fastcached listens, so activating there would collide on a machine running
-# both. The scheduler hands a client this worker's endpoint explicitly, so this
-# is never a client-side default; it is only ever what an operator configured,
-# and this file is where they change it.
+# It is deliberately NOT an IANA-registered assignment.
+#
+# 6674, the node's own default (DefaultNodePort) and where every LOCAL client looks:
+# fastcache-cc, CompileCache.cmake and fastcache-cli all default to 127.0.0.1:6674,
+# and the node's cache tier serves this machine's builds on this port. This was 6676
+# until #1676, on the reasoning that "the scheduler hands a client this worker's
+# endpoint explicitly, so this is never a client-side default". That held while the
+# activated surface was the compile port alone; since #290 it is the node port, and
+# on 6676 no local build ever reached the node's cache -- it fell back to ccache at
+# configure and reported `cache unavailable` on every compile, while the docs said a
+# developer running a node needs nothing but the scheduler line. The clash with
+# fastcached on the same port is what Conflicts= above settles.
 #
 # The service needs no --advertise for this: it asks the socket it is handed
 # where it is bound and advertises that. A wildcard ListenStream, as here, is
 # advertised as the address this machine routes from, on this port, and follows
 # the network when that changes; one bound to an address
-# (ListenStream=10.0.0.5:6676) is advertised as that address. An `advertise:`
+# (ListenStream=10.0.0.5:6674) is advertised as that address. An `advertise:`
 # in the node's configuration still overrides both.
-ListenStream=6676
+ListenStream=6674
 
 # One connection carries one compile, and a compile occupies a slot for
 # seconds. Accept=no means ONE service instance handles every connection,

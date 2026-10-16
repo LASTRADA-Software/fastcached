@@ -28,6 +28,10 @@
 #             (so it is not daemonizing), round-trips a set/get, keeps its config
 #             at 0640 root:fastcached and readable by that account, applies a
 #             SIGHUP reload, and stops with Result=success.
+#   takeover  enabling the node's socket while fastcached runs stops fastcached
+#             and binds 6674 -- the node supersedes the plain daemon (#1676);
+#   boot      with BOTH enabled, a boot comes up with the node's socket holding
+#             6674 and fastcached inactive;
 #   worker    the socket activates fastcache-compile-node with a memory AND a disk
 #             tier at /var/cache/fastcache-node, the service adopts the socket,
 #             runs as fastcache-node, opens its store there, and stops cleanly.
@@ -60,8 +64,10 @@ command -v docker >/dev/null || { echo "rpm-package-e2e: docker is required and 
 
 readonly NODE_ACCOUNT="fastcache-node"
 readonly NODE_CACHE_DIR="/var/cache/fastcache-node"
-readonly NODE_PORT=6676
+# ONE port, on purpose: both serve this machine's builds where every local client
+# looks, and the node's socket takes it from the daemon (#1676).
 readonly DAEMON_PORT=6674
+readonly NODE_PORT=6674
 
 rpm_name="$(basename "$rpm_path")"
 workdir="$(mktemp -d)"
@@ -188,8 +194,38 @@ echo "== fastcache-compile-node with cache_dir ${NODE_CACHE_DIR}"
 in_container bash -c "printf 'toolchain:\n  - /usr/bin/g++\ncache_memory: 64m\ncache_disk: 256m\ncache_dir: ${NODE_CACHE_DIR}\n' \
     > /etc/fastcached/fastcache-compile-node.yaml"
 
+# Who holds a port, as one line per listener: the process names ss reports for it.
+# @param 1 port
+listeners_of() { in_container ss -ltnpH "( sport = :$1 )" 2>&1 || true; }
+
+# The takeover: fastcached running, as a fresh install leaves it, and the node's
+# socket enabled beside it. The socket must stop it and bind the port, not fail to.
+in_container systemctl start fastcached
+in_container systemctl is-active --quiet fastcached || fail "fastcached did not start again before the takeover"
 in_container systemctl enable --now fastcache-compile-node.socket
-in_container systemctl is-active --quiet fastcache-compile-node.socket || fail "the worker's socket unit did not start"
+in_container systemctl is-active --quiet fastcache-compile-node.socket \
+    || fail "the worker's socket unit did not start beside a running fastcached: $(listeners_of "$NODE_PORT")"
+if in_container systemctl is-active --quiet fastcached; then
+    fail "enabling the node's socket left fastcached running, so the two contend for ${NODE_PORT}"
+fi
+held="$(listeners_of "$NODE_PORT")"
+[[ "$held" == *'"systemd",pid=1,'* && "$held" != *fastcached* ]] \
+    || fail "after the takeover ${NODE_PORT} is not held by the socket unit alone: ${held}"
+
+# The boot: both units enabled, as they are now -- %post enabled fastcached, the step
+# above the socket. Which one a boot starts is systemd's answer to the Conflicts= the
+# socket declares, and it is asserted rather than assumed.
+echo "== reboot with fastcached and the node's socket both enabled"
+[[ "$(in_container systemctl is-enabled fastcached 2>&1 || true)" == enabled ]] \
+    || fail "fastcached is no longer enabled, so the boot below would test nothing"
+docker restart "$container" >/dev/null
+wait_until system_booted "systemd in the container to boot again" - - 60
+in_container systemctl is-active --quiet fastcache-compile-node.socket \
+    || fail "after a boot with both enabled the node's socket is not active: $(listeners_of "$NODE_PORT")"
+if in_container systemctl is-active --quiet fastcached; then
+    fail "after a boot with both enabled fastcached is running beside the node's socket"
+fi
+
 if in_container systemctl is-active --quiet fastcache-compile-node; then
     fail "the worker started without a connection, so the socket was bypassed"
 fi
@@ -217,6 +253,11 @@ store_owner="$(in_container stat -c '%U %a' "${NODE_CACHE_DIR}/objects.cow" 2>&1
 
 grep -q 'serving a socket-activated listener' "${workdir}/node.log" \
     || fail "the worker did not adopt the activated socket"
+# And the state: the port's only listener is the socket systemd bound, which the
+# worker shares -- one it bound for itself would be a second line, or none at all.
+held="$(listeners_of "$NODE_PORT")"
+[[ "$(grep -c LISTEN <<<"$held")" == 1 && "$held" == *'"systemd",pid=1,'* && "$held" == *fastcache-compi* ]] \
+    || fail "${NODE_PORT} is not the adopted socket alone: ${held}"
 [[ "$(in_container systemctl show -p User --value fastcache-compile-node)" == "$NODE_ACCOUNT" ]] \
     || fail "the worker does not run as ${NODE_ACCOUNT}"
 
