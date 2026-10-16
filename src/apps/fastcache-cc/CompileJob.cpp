@@ -667,6 +667,140 @@ namespace
         return !body.contains('/') && !body.contains('\\');
     }
 
+    /// An option whose fused remainder is ONE argument for a different driver grammar.
+    ///
+    /// clang-cl's `/clang:<arg>` (and `-clang:<arg>`) hands `<arg>` to the clang driver
+    /// underneath it, which parses it with clang's OWN option table rather than clang-cl's.
+    /// CMake writes the C++ standard that way for clang-cl, which has no `/std:c++23`
+    /// (`-clang:-std=c++23`, on every unit of a C++23 build), so refusing the prefix by
+    /// absence made every such build distribute nothing (#1672).
+    ///
+    /// **The inner argument is judged as if it stood alone, under the grammar it is parsed
+    /// by** -- the side-artefact table, every `DeniedArguments` row and the allowlist, in
+    /// that order -- so the prefix admits nothing that argument standing alone would not:
+    /// `-clang:-fplugin=x` is refused by the `fplugin` row exactly as `-fplugin=x` is.
+    /// The grammar is the GNU clang driver's (`Flavor::Clang`) because that is the table
+    /// clang parses `<arg>` with: GNU spellings only, `-` the only introducer, so
+    /// `-clang:/O2` names a FILE to that driver and is refused, and an MSVC-only row never
+    /// reaches an inner argument. Every GNU-spelled row is `Any` already (see `AllowedArg`),
+    /// so `-clang:-std=c++23` is admitted exactly when `-std=c++23` is.
+    ///
+    /// The row is scoped to the family that spells the prefix, as the `-clang:-MF` rows of
+    /// `PathValueFlags()` are. `DriverFamily` cannot tell `cl` from clang-cl; `cl` does not
+    /// implement the prefix, and a line it ignores is one the client's own `cl` ignored, by
+    /// the fingerprint argument the `Any` rows rest on.
+    struct PassThroughPrefix
+    {
+        std::string_view spelling;                    ///< The prefix, without its leading `-` or `/`.
+        DriverFamily families { DriverFamily::None }; ///< Which driver families spell it.
+        Flavor innerGrammar { Flavor::Unknown };      ///< The driver whose rules judge the inner argument.
+    };
+
+    /// Every pass-through prefix a worker unwraps before judging an argument.
+    constexpr std::array PassThroughPrefixes {
+        PassThroughPrefix { .spelling = "clang:", .families = DriverFamily::Msvc, .innerGrammar = Flavor::Clang },
+    };
+
+    /// What the built-in rules say about one argument, before an operator's list is asked.
+    ///
+    /// Private to this file: never transmitted and never persisted. THREE answers rather
+    /// than a `bool`, because a pass-through has to keep the one distinction a `bool`
+    /// loses: an inner argument a row REFUSES must stay refused whatever an operator lists,
+    /// while one no rule recognises is exactly what `--allow-compile-arg` may extend.
+    enum class BuiltInVerdict : std::uint8_t
+    {
+        Accepted,     ///< A built-in rule admits the argument.
+        Refused,      ///< A built-in rule refuses it; no operator entry can re-admit it.
+        Unrecognised, ///< No built-in rule speaks for it; only an operator entry can admit it.
+    };
+
+    /// The pass-through row @p body begins with for a driver of @p family, if any.
+    /// @param body The argument with one introducer stripped.
+    /// @param family The worker's driver family.
+    /// @return The row, or null.
+    [[nodiscard]] PassThroughPrefix const* MatchPassThrough(std::string_view body, DriverFamily family)
+    {
+        // A loop rather than a named `find_if` iterator, for the reason `FindDeniedArgument`
+        // gives: no single spelling of the iterator's type satisfies clang-tidy everywhere.
+        for (PassThroughPrefix const& row: PassThroughPrefixes)
+            if (Overlaps(row.families, family) && body.starts_with(row.spelling))
+                return &row;
+        return nullptr;
+    }
+
+    /// The built-in rules' answer for one argument, in the order that makes them safe.
+    /// @param arg One argument, as the driver would receive it.
+    /// @param driver The driver whose grammar judges it.
+    /// @return Whether the table admits, refuses, or does not recognise it.
+    [[nodiscard]] BuiltInVerdict JudgeBuiltIn(std::string_view arg, DriverSpec const& driver)
+    {
+        if (arg.empty())
+            return BuiltInVerdict::Accepted; // an empty argument names nothing and reaches no file
+        if (arg.starts_with('@'))
+            return BuiltInVerdict::Refused; // a response file names a path with no separator in it
+
+        // Asked of the MAINTAINED table rather than restated as rows here: a flag that
+        // makes the compile write a second artefact is refused, because only the object
+        // comes back. `-fmodule-mapper=|program args` is on it and makes GCC spawn a
+        // subprocess, so this check is load-bearing rather than tidy.
+        if (ProducesSideArtefact(arg, driver))
+            return BuiltInVerdict::Refused;
+
+        // The language the client states for a preprocessed input, read out of the
+        // driver's OWN table rather than copied. A language added to `preprocessedInput`
+        // upstream would otherwise make every such job a silent `RejectedArgument`. These
+        // spellings include bare value tokens (`c++-cpp-output`) that carry no introducer,
+        // so they are matched before the introducer rule below.
+        for (auto const& spelling: driver.preprocessedInput)
+            if (std::ranges::contains(spelling.flags, arg))
+                return BuiltInVerdict::Accepted;
+
+        // The target pin, from the one seam that spells it. Restating `--target=` here
+        // would drift from `TargetPinPrefixFor` and refuse every dispatched clang job.
+        if (auto const prefix = TargetPinPrefixFor(driver.targetDiscovery); !prefix.empty() && arg.size() > prefix.size()
+                                                                            && arg.starts_with(prefix) && !arg.contains('/')
+                                                                            && !arg.contains('\\'))
+            return BuiltInVerdict::Accepted;
+
+        // One introducer is stripped before the table is consulted, so a row covers `/O2`
+        // and `-O2` alike. An argument that introduces no option at all matches nothing:
+        // it is a bare word, which on a compiler's command line is an input file.
+        auto const introducers = IntroducersOf(driver.family);
+        if (introducers.empty() || !introducers.contains(arg.front()))
+            return BuiltInVerdict::Refused;
+        auto const body = arg.substr(1);
+
+        // The refusals FIRST, so a carve-out cannot be out-voted by an allowlist prefix it
+        // also matches: `-Wl,` is a `-W`, and `/analyze:plugin` would be an `/analyze`. The
+        // table is the launcher's too, which is how a client learns before it asks for a
+        // lease that no worker will run this argument.
+        if (FindDeniedArgument(arg, driver.family) != nullptr)
+            return BuiltInVerdict::Refused;
+
+        // A pass-through is judged by what it passes, under the grammar that will parse
+        // it -- and by the WHOLE of this function, refusals included, so an inner argument
+        // a row refuses comes back `Refused` and no operator entry can buy it back. The
+        // inner argument must introduce an option of its own: a bare word is an input file
+        // to that driver too, and an empty one passes nothing worth having.
+        //
+        // BEFORE the allowlist, and that order is the structure rather than a convention: an
+        // `AllowedArgs` row that happened to prefix the pass-through's spelling would
+        // otherwise admit `-clang:<anything>` without the inner argument ever being judged.
+        if (auto const* passThrough = MatchPassThrough(body, driver.family))
+        {
+            auto const inner = body.substr(passThrough->spelling.size());
+            auto const& innerDriver = DriverOf(passThrough->innerGrammar);
+            if (inner.empty() || !IntroducersOf(innerDriver.family).contains(inner.front()))
+                return BuiltInVerdict::Refused;
+            return JudgeBuiltIn(inner, innerDriver);
+        }
+
+        if (std::ranges::any_of(AllowedArgs, [&](AllowedArg const& row) { return ArgRowMatches(row, body, driver.family); }))
+            return BuiltInVerdict::Accepted;
+
+        return BuiltInVerdict::Unrecognised;
+    }
+
 } // namespace
 
 JobError JobError::RejectedArgumentNaming(std::string_view argument, std::optional<Flavor> judgedFor)
@@ -710,57 +844,23 @@ JobError JobError::RejectedArgumentsNaming(std::span<std::string const> argument
 
 bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver, std::span<std::string const> operatorAllowed)
 {
-    if (arg.empty())
-        return true; // an empty argument names nothing and reaches no file
-    if (arg.starts_with('@'))
-        return false; // a response file names a path with no separator in it
-
-    // Asked of the MAINTAINED table rather than restated as rows here: a flag that
-    // makes the compile write a second artefact is refused, because only the object
-    // comes back. `-fmodule-mapper=|program args` is on it and makes GCC spawn a
-    // subprocess, so this check is load-bearing rather than tidy.
-    if (ProducesSideArtefact(arg, driver))
-        return false;
-
-    // The language the client states for a preprocessed input, read out of the
-    // driver's OWN table rather than copied. A language added to `preprocessedInput`
-    // upstream would otherwise make every such job a silent `RejectedArgument`. These
-    // spellings include bare value tokens (`c++-cpp-output`) that carry no introducer,
-    // so they are matched before the introducer rule below.
-    for (auto const& spelling: driver.preprocessedInput)
-        if (std::ranges::contains(spelling.flags, arg))
+    switch (JudgeBuiltIn(arg, driver))
+    {
+        case BuiltInVerdict::Accepted:
             return true;
-
-    // The target pin, from the one seam that spells it. Restating `--target=` here
-    // would drift from `TargetPinPrefixFor` and refuse every dispatched clang job.
-    if (auto const prefix = TargetPinPrefixFor(driver.targetDiscovery); !prefix.empty() && arg.size() > prefix.size()
-                                                                        && arg.starts_with(prefix) && !arg.contains('/')
-                                                                        && !arg.contains('\\'))
-        return true;
-
-    // One introducer is stripped before the table is consulted, so a row covers `/O2`
-    // and `-O2` alike. An argument that introduces no option at all matches nothing:
-    // it is a bare word, which on a compiler's command line is an input file.
-    auto const introducers = IntroducersOf(driver.family);
-    if (introducers.empty() || !introducers.contains(arg.front()))
-        return false;
-    auto const body = arg.substr(1);
-
-    // The refusals FIRST, so a carve-out cannot be out-voted by an allowlist prefix it
-    // also matches: `-Wl,` is a `-W`, and `/analyze:plugin` would be an `/analyze`. The
-    // table is the launcher's too, which is how a client learns before it asks for a
-    // lease that no worker will run this argument.
-    if (FindDeniedArgument(arg, driver.family) != nullptr)
-        return false;
-    if (std::ranges::any_of(AllowedArgs, [&](AllowedArg const& row) { return ArgRowMatches(row, body, driver.family); }))
-        return true;
+        case BuiltInVerdict::Refused:
+            return false;
+        case BuiltInVerdict::Unrecognised:
+            break;
+    }
 
     // Operator extensions, and the ORDER is the security property rather than a
-    // preference. A `DeniedArguments` row returned above, a side-artefact flag returned above
-    // that, and an argument that introduces no option returned before the loop -- so
-    // by here the table has refused nothing and merely failed to RECOGNISE this
-    // spelling. That is the only thing a site may extend, which is what "operator
-    // entries extend, never replace" means written as code instead of as a comment.
+    // preference. A `DeniedArguments` row, a side-artefact flag and an argument that
+    // introduces no option all answered `Refused` above -- for a pass-through's INNER
+    // argument as much as for the argument itself -- so by here the table has refused
+    // nothing and merely failed to RECOGNISE this spelling. That is the only thing a
+    // site may extend, which is what "operator entries extend, never replace" means
+    // written as code instead of as a comment.
     //
     // **The `DeniedArguments` rows for the program-invoking class exist because of this line.**
     // Until #293 those options were refused by ABSENCE, which is the same answer as
@@ -778,7 +878,9 @@ bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver, std
     // an `Allow` prefix. Defence in depth for the one class a configuration file can
     // reach: `--allow-compile-arg` refuses a separator when it is PARSED, so this is
     // the second of two doors, and a value-bearing spelling only ever reaches this
-    // function through the wire.
+    // function through the wire. `Unrecognised` is only ever said of an argument that
+    // opened with one of the family's introducers, which is the one stripped here.
+    auto const body = arg.substr(1);
     return !body.contains('/') && !body.contains('\\');
 }
 

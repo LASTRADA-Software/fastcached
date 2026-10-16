@@ -303,9 +303,10 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .scope = ConditionScope::Worker,
       .remedy = "Builds stay correct: each refused compile ran on its own client, losing only distribution. Admit a "
                 "named argument that runs no program and names no path with --allow-compile-arg=<argument> on every "
-                "worker, then reload. The reload re-judges the row: each argument the list now admits leaves, and the "
-                "row clears once none is named. One still named was not admitted: check its spelling; the list never "
-                "overrides the built-in rules. Report a flag every build carries: it belongs in the built-in table." },
+                "worker, then reload. The reload re-judges the row: each argument now admitted leaves, and the row "
+                "clears once none is named. One still named was not admitted: check its spelling; built-in rules "
+                "outrank the list and judge -clang:<arg> as <arg>. Report a flag every build carries: it belongs in "
+                "the built-in table." },
     { .condition = NodeCondition::SurfaceNotAccepting,
       .id = "surface-not-accepting",
       .persistence = CompileCacheWire::ConditionPersistence::Latched,

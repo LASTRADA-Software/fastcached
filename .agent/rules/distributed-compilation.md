@@ -197,6 +197,10 @@ is the reproducible lesson, since no unit test can reach either:
     which is this rulebook's most-repeated shape and was true here for months before it
     could bite. They are `Deny` rows now, plus the side-artefact set (`/Zi`, `/ZI`,
     `-gsplit-dwarf`, `-fprofile-*`) that three test comments also called deliberate.
+  - **A pass-through (clang-cl's `-clang:<arg>`) is judged by its INNER argument, under the
+    grammar that parses it, by the WHOLE built-in set** — side artefacts, `Deny` rows and the
+    allowlist alike — and a refused inner argument STAYS refused above `--allow-compile-arg`,
+    which is why the verdict is three-valued (`BuiltInVerdict`) rather than a `bool` (#1672).
   - **A flag that decides what a compile of PREPROCESSED text reports is forwarded, never
     dropped — under `/WX` a dropped warning switch is a failed compile the client passed.**
     MSVC's `/external:` family is the case that forced it: CMake writes `-external:I<dir>
