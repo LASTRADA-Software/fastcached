@@ -339,6 +339,12 @@
 # disk tier is a resource an operator should have to name. ONE node per
 # path, enforced: the store is claimed exclusively, so a second node sharing
 # it refuses to start.
+#
+# Under the packaged Linux service, cache_dir: /var/cache/fastcache-node. The
+# unit creates it for the service account (CacheDirectory=); ProtectSystem=strict
+# leaves nothing else persistent writable but the state directory, and that is
+# not a place for it -- the node refuses to start beside an entry there it did
+# not write.
 #cache_dir:
 
 # on-disk value codec for cache_dir: none, lz4 or zstd (default zstd). Reads

@@ -2583,6 +2583,13 @@ identity key it proves to its scheduler, and a worker naming a scheduler without
 refuses to start. Its first start mints the key; admit it as
 [the node proof section says](#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 
+A disk tier goes in `cache_dir: /var/cache/fastcache-node`, which the unit creates
+for the worker too (`CacheDirectory=`). It cannot go under the state directory: the
+unit runs with `ProtectSystem=strict`, so those two are the only persistent
+directories it can write, and the node refuses to start beside an entry in its state
+directory that it did not write — `/var/lib/fastcache-node/cache` is refused with
+*this build keeps no entry by that name*.
+
 The unit's `ExecStart` names that file, and the shipped copy is every setting
 commented out — so an untouched install behaves exactly like running the worker
 with no flags, and anything it does that you did not want is something written

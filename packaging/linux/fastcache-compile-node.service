@@ -151,6 +151,24 @@ WorkingDirectory=/run/fastcache-node
 StateDirectory=fastcache-node
 StateDirectoryMode=0700
 
+# The node's DISK CACHE directory, /var/cache/fastcache-node, for `cache_dir:`.
+#
+# `cache_dir` has no default -- a disk tier is a resource an operator names -- so
+# this line turns nothing on. What it gives the setting is somewhere to point.
+# Under ProtectSystem=strict the only persistent directories this unit can write
+# are the ones it declares, and the state directory above is not a candidate: the
+# node keeps its identity there and refuses to start beside an entry it has no row
+# for, so `cache_dir: /var/lib/fastcache-node/cache` ends the start with "this
+# build keeps no entry by that name". Without this line the path the reference
+# configuration and the docs name, /var/cache/fastcache-node, is read-only to the
+# service, and a disk tier was reachable only through a drop-in.
+#
+# CacheDirectory= because a compile cache is regenerable by definition, which is
+# what /var/cache is for -- and so a backup of /var/lib does not carry 20 GiB of
+# objects the fleet can rebuild. 0700 for the reason UMask=0077 is set below.
+CacheDirectory=fastcache-node
+CacheDirectoryMode=0700
+
 # --- Hardening -------------------------------------------------------------
 # This block is deliberately NOT a copy of fastcached's, and the difference is
 # the whole point of the service: fastcached executes nothing, while this
