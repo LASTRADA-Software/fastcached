@@ -1467,6 +1467,135 @@ TEST_CASE("What a clang object records about where it was built travels through 
     }
 }
 
+TEST_CASE("A real CMake clang-cl C++23 unit dispatches with every argument accepted", "[compile-job][clang-cl]")
+{
+    // One entry of a real tree, verbatim: the `compile_commands.json` of
+    // `D:\Lastrada\out\build\win64-clangcl-ninja-debug` (CMake + Ninja, clang-cl from Visual Studio 18, 2026-10-16),
+    // the unit `src/Toolbox/Diagram.cpp`. 5103 of that tree's 5138 units carry
+    // `-clang:-std=c++23`, and every one of them carries the `/clang:` warnings below.
+    // Quoting is resolved the way the process receives it (`-imsvc"C:\Program Files..."`
+    // arrives unquoted). The paths travel nowhere: the launcher drops each one, which is
+    // part of what this case proves.
+    std::vector<std::string> const argv {
+        R"(C:\PROGRA~1\MICROS~1\18\PROFES~1\VC\Tools\Llvm\x64\bin\clang-cl.exe)",
+        "/nologo",
+        "-TP",
+        "-DLASTRADA_ENABLE_DABASE=1",
+        "-DLIGHTWEIGHT_POOL_GROWTH_STRATEGY=BoundedOverflow",
+        "-DLIGHTWEIGHT_POOL_INITIAL_SIZE=4",
+        "-DLIGHTWEIGHT_POOL_MAX_IDLE_TIME_MS=0",
+        "-DLIGHTWEIGHT_POOL_MAX_LIFETIME_MS=0",
+        "-DLIGHTWEIGHT_POOL_MAX_SIZE=16",
+        "-DLIGHTWEIGHT_POOL_PREPARED_STATEMENT_CACHE_CAPACITY=0",
+        "-DLIGHTWEIGHT_POOL_VALIDATE_ON_BORROW=Yes",
+        "-DLIGHTWEIGHT_SHARED=1",
+        "-DNOMINMAX",
+        "-DWIN32_LEAN_AND_MEAN",
+        "-DWINVER=0x0A00",
+        "-D_ITERATOR_DEBUG_LEVEL=2",
+        "-D_LIB",
+        "-D_VC80_UPGRADE=0x0600",
+        "-D_WIN32_WINDOWS=0x0A00",
+        "-D_WIN32_WINNT=0x0A00",
+        R"(-ID:\Lastrada\src)",
+        R"(-imsvcC:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\ucrt)",
+        R"(-imsvcC:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um)",
+        R"(-imsvcC:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared)",
+        R"(-imsvcD:\Lastrada\out\build\win64-clangcl-ninja-debug\vcpkg_installed\x64-windows\include)",
+        "/DWIN32",
+        "/D_WINDOWS",
+        "/EHsc",
+        "/Ob0",
+        "/Od",
+        "/RTC1",
+        "-D_DEBUG",
+        "-clang:-std=c++23",
+        "-MDd",
+        "-Z7",
+        "/clang:-Wno-non-pod-varargs",
+        "/clang:-Wno-unused-function",
+        "/clang:-Wno-unused-variable",
+        "/clang:-Wno-unused-value",
+        "/clang:-Wno-unused-local-typedef",
+        "/clang:-Wno-backslash-newline-escape",
+        "/clang:-Wno-reorder-ctor",
+        "/clang:-Wno-array-parameter",
+        "/clang:-Wno-parentheses",
+        "/clang:-Wno-switch",
+        "/clang:-Wno-varargs",
+        "/clang:-Wno-unused-but-set-variable",
+        "/clang:-Wno-misleading-indentation",
+        "/clang:-Wno-overloaded-virtual",
+        "/clang:-Wno-microsoft-template",
+        "/clang:-Wno-comment",
+        "/clang:-Wno-return-type-c-linkage",
+        "/clang:-Wno-delete-non-abstract-non-virtual-dtor",
+        "/clang:-Wno-sometimes-uninitialized",
+        "/clang:-Wno-missing-braces",
+        "/clang:-Wno-unused-command-line-argument",
+        "/clang:-Wno-trigraphs",
+        "/clang:-fno-delayed-template-parsing",
+        "/EHsc",
+        "/Oy-",
+        "/bigobj",
+        "/FC",
+        "/diagnostics:classic",
+        "/nologo",
+        "/GS",
+        "/Zc:wchar_t",
+        "/external:W0",
+        "/wd4251",
+        "/wd4275",
+        "/wd4464",
+        "/wd4714",
+        "/wd4820",
+        "/wd4828",
+        "/wd4996",
+        "/wd5045",
+        "/Zc:forScope",
+        "/Zc:inline",
+        "/W3",
+        "/WX",
+        "/source-charset:utf-8",
+        "/clang:-fdebug-compilation-dir=.",
+        "/clang:-fcoverage-compilation-dir=.",
+        "-gno-codeview-command-line",
+        R"(/Fosrc\Toolbox\CMakeFiles\Toolbox.dir\Diagram.cpp.obj)",
+        R"(/Fdsrc\Toolbox\CMakeFiles\Toolbox.dir\Toolbox.pdb)",
+        "-c",
+        "--",
+        R"(D:\Lastrada\src\Toolbox\Diagram.cpp)",
+    };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    // The client's own construction of the remote line, target pin included.
+    auto const remote = RemoteCompileArgs(cmd, argv, "x86_64-pc-windows-msvc19.51.36252");
+    INFO("the launcher refused: " << remote.error_or(""));
+    REQUIRE(remote.has_value());
+    REQUIRE(std::ranges::contains(*remote, "-clang:-std=c++23"));
+
+    // Every argument, asked one at a time, so a failure names the one refused rather
+    // than only the first.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    for (auto const& argument: *remote)
+    {
+        INFO("argument " << argument);
+        CHECK(IsAcceptableJobArgument(argument, clangCl));
+    }
+
+    // And through the worker's own runner, which is what a lease actually reaches.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "clang-cl", argv.front() } }, ToolchainSurvey::Completed() };
+    auto job = Job(*remote);
+    job.fingerprint = "clang-cl";
+    auto const outcome = jobs.Run(job);
+    INFO("the worker refused: " << (outcome.has_value() ? std::string {} : outcome.error().detail));
+    REQUIRE(outcome.has_value());
+    CHECK(std::ranges::contains(runner.Argv(), "-clang:-std=c++23"));
+}
+
 TEST_CASE("A refused pass-through is named whole, as the client sent it", "[compile-job][clang-cl]")
 {
     // The node condition `refused-compile-arguments` names what was refused, and an
