@@ -1441,6 +1441,32 @@ TEST_CASE("An operator entry naming a whole pass-through admits it as before", "
     CHECK_FALSE(IsAcceptableJobArgument("/clang:-fsomething", clangCl, allowed));
 }
 
+TEST_CASE("What a clang object records about where it was built travels through the pass-through too",
+          "[compile-job][clang-cl]")
+{
+    // #1681's rows, reached the way Lastrada's clang-cl line spells two of them:
+    // `/clang:-fdebug-compilation-dir=.`, because the clang-cl driver does not take it bare. The
+    // inner argument meets the same rows under the inner grammar, so the pass-through admits the
+    // `.`-shaped value and nothing a row refuses.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    REQUIRE(IsAcceptableJobArgument("/clang:-fdebug-compilation-dir=.", clangCl));
+    CHECK(IsAcceptableJobArgument("/clang:-fcoverage-compilation-dir=.", clangCl));
+
+    // A directory that names a path is refused through the prefix exactly as standing alone.
+    CHECK_FALSE(IsAcceptableJobArgument("/clang:-fdebug-compilation-dir=/home/build", clangCl));
+    CHECK_FALSE(IsAcceptableJobArgument(R"(/clang:-fcoverage-compilation-dir=C:\build)", clangCl));
+
+    // The coverage family's other members stay refused by ROW through the pass-through, with an
+    // operator naming each one whole.
+    for (auto const* hostile: { "-fcoverage-mapping", "-fcoverage-mcdc", "-fcoverage-prefix-map=a=b" })
+    {
+        INFO("argument " << hostile);
+        auto const passed = std::format("/clang:{}", hostile);
+        std::vector<std::string> const namingPassed { passed };
+        CHECK_FALSE(IsAcceptableJobArgument(passed, clangCl, namingPassed));
+    }
+}
+
 TEST_CASE("A refused pass-through is named whole, as the client sent it", "[compile-job][clang-cl]")
 {
     // The node condition `refused-compile-arguments` names what was refused, and an
