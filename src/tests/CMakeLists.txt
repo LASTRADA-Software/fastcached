@@ -4287,10 +4287,23 @@ set_tests_properties("service-accounts" PROPERTIES
 # node from the fixture's own working directory, which is exactly how #674 reached
 # master with a dispatch e2e already green.
 #
+# It also reads where the node's DISK TIER can live: the unit's `CacheDirectory=`,
+# judged against every `cache_dir` the docs and the shipped reference configuration
+# cite. The unit shipped without one while the docs named /var/cache/fastcache-node,
+# a path ProtectSystem=strict left read-only, and the state directory -- the one
+# persistent directory the service could write -- is refused by the node as a
+# cache_dir, so following the docs gave no disk tier and the obvious workaround gave
+# no node.
+#
+# `docs-subject` as well as `hygiene`, because half of what it judges is prose: a
+# page that starts citing a path the unit does not create is a docs-only change,
+# which the code-gated jobs skip -- so `doc-subject-checks.sh` runs it from the
+# style job (#687).
+#
 # Not labelled "smoke", for the reason node-config-reference is not: it reads
-# three shipped files and compares strings, so it belongs in the default `ctest`
-# set and must survive `ctest -LE smoke`. Every file it reads ships in an exported
-# tarball, so it has no skip path.
+# shipped files and compares strings, so it belongs in the default `ctest` set and
+# must survive `ctest -LE smoke`. Every file it reads ships in an exported tarball,
+# so it has no skip path.
 add_test(
     NAME "node-working-directory"
     COMMAND ${CMAKE_COMMAND}
@@ -4299,7 +4312,7 @@ add_test(
 )
 set_tests_properties("node-working-directory" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
+    LABELS "hygiene;docs-subject"
     TIMEOUT 60
 )
 

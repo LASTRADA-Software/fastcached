@@ -2525,11 +2525,24 @@ jobs:
           # non-fatal findings, so grep for the ones that matter. The
           # ExecStart-not-executable note is expected: fastcached is not
           # installed at /usr/bin in this step.
-          for unit in packaging/linux/fastcached.service packaging/linux/fastcached-user.service; do
+          #
+          # The compile worker's two units are here too: they carry the most
+          # hardening of any unit this project ships, and they were the ones left
+          # out. A misspelled directive is "Unknown lvalue" up to systemd 255 and
+          # "Unknown key" from 259 on -- both are matched, or the newer wording
+          # passes a typo through as a clean verify.
+          #
+          # Herestrings rather than `echo | grep -Ev | grep -q`: under pipefail a
+          # `grep -q` that exits at its first match can SIGPIPE the stage feeding
+          # it, and the pipeline then reports "no finding" exactly when there was
+          # one (build-and-toolchain.md).
+          for unit in packaging/linux/fastcached.service packaging/linux/fastcached-user.service \
+                      packaging/linux/fastcache-compile-node.service packaging/linux/fastcache-compile-node.socket; do
             echo "== $unit"
             out=$(systemd-analyze verify "$unit" 2>&1 || true)
             echo "$out"
-            if echo "$out" | grep -Ev 'is not executable|Unit .* not found' | grep -qiE 'error|invalid|bad|unknown (lvalue|section)'; then
+            findings=$(grep -Ev 'is not executable|Unit .* not found' <<<"$out" || true)
+            if grep -qiE 'error|invalid|bad|unknown (key|lvalue|section)' <<<"$findings"; then
               echo "::error::$unit failed verification"
               exit 1
             fi
@@ -2639,6 +2652,17 @@ jobs:
           bash "$check" --deb "$(ls fastcached_*.deb)"  "$GITHUB_WORKSPACE"
           bash "$check" --rpm "$(ls fastcached-*.rpm)" "$GITHUB_WORKSPACE"
 
+      # The .rpm, installed where rpm is the package manager. The steps above only
+      # INSPECT it; this one has dnf resolve its dependencies and run its
+      # scriptlets on Fedora, under a real systemd in a container, then drives the
+      # daemon and a socket-activated compile worker with a disk tier, a reinstall
+      # and a removal. The worker leg is what #1674 needed: the 0.5.0 .rpm passes
+      # every inspection above and fails it, refusing to start on a read-only
+      # cache_dir. What each leg asserts is in the script's header.
+      - name: "Install the .rpm on Fedora and exercise the services"
+        working-directory: out/build/gcc-release
+        run: bash "$GITHUB_WORKSPACE/scripts/rpm-package-e2e.sh" "$PWD/$(ls fastcached-*.rpm)"
+
       # Install for real and drive traffic through it. The GitHub runner has a
       # live systemd, so this exercises the actual unit — the service account,
       # the hardening, journald capture and the SIGHUP path all included.
@@ -2723,7 +2747,12 @@ jobs:
           # formation record there. /var/lib/fastcache-node is the StateDirectory= the unit
           # creates for it -- the one writable place under ProtectSystem=strict that
           # survives a restart, so this step also pins that the unit provides it.
-          printf 'advertise: 127.0.0.1:6676\ncluster_dir: /var/lib/fastcache-node\ntoolchain:\n  - /usr/bin/g++\n' \
+          #
+          # And a disk tier at /var/cache/fastcache-node, the cache_dir the docs
+          # give, which only the unit's CacheDirectory= makes writable: without it
+          # the worker refuses to start on a read-only path, and no step here set a
+          # cache_dir, which is how that shipped (#1674).
+          printf 'advertise: 127.0.0.1:6676\ncluster_dir: /var/lib/fastcache-node\ntoolchain:\n  - /usr/bin/g++\ncache_memory: 64m\ncache_disk: 256m\ncache_dir: /var/cache/fastcache-node\n' \
             | sudo tee /etc/fastcached/fastcache-compile-node.yaml >/dev/null
 
           # Enabling the SOCKET is what enables the worker; the service carries
@@ -2804,6 +2833,13 @@ jobs:
           # stage 3 deleted them.
           grep -q 'serving a socket-activated listener' /tmp/node-log.txt \
             || { echo "::error::the worker did not adopt the activated socket"; exit 1; }
+
+          # The disk tier is open where the unit made room for it, and the store
+          # belongs to the service account.
+          grep -q 'disk 256M [a-z0-9]* at /var/cache/fastcache-node' /tmp/node-log.txt \
+            || { echo "::error::the worker did not open a 256M disk tier at /var/cache/fastcache-node"; exit 1; }
+          test "$(sudo stat -c '%U' /var/cache/fastcache-node/objects.cow)" = fastcache-node \
+            || { echo "::error::the worker's store is not owned by fastcache-node"; exit 1; }
 
           test "$(systemctl show -p User --value fastcache-compile-node)" = fastcache-node
 
