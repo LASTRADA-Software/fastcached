@@ -148,13 +148,23 @@ struct NodeStateFileRow
 /// @return A clause to append, opening with its own separator, or empty.
 [[nodiscard]] std::string StateFileUnreadableHint(std::filesystem::path const& path);
 
+/// @p kept with this node's own key read beside it, when its record is committed under that key
+/// (`CommittedUnderOwnKey`, #1663): read from @p stateDirectory and never minted (`ReadHeldNodeKey`).
+/// Both readings a configuration is shaped from before its start resolves the key pass through here
+/// -- `main`'s and the install's -- so the two judge a founder's pin by the same key.
+/// @param kept What the state directory holds.
+/// @param stateDirectory The directory it was read from.
+/// @return @p kept, its `ownKey` read where its record needs it.
+[[nodiscard]] KeptFormation WithHeldNodeKey(KeptFormation kept, std::filesystem::path const& stateDirectory);
+
 /// What @p stateDirectory holds about this node's formation, read the way a start reads it.
 ///
 /// The directory's writers are judged first, then who owns each file (`JudgeStateDirectory`), and
 /// only then the record and the remembered endpoints (`ReadKeptFormation`), so a record another
-/// account could have written is never read. A refusal carries `StateFileUnreadableHint`'s remedy
-/// for the record. The one reading `main` makes for every invocation, judged from the account
-/// running it -- through @p guard, which carries the accounts that caller counts as the node's own
+/// account could have written is never read. Beside a record committed under this node's own key,
+/// the key that judges it is read too, never minted (`WithHeldNodeKey`, #1663). A refusal carries
+/// `StateFileUnreadableHint`'s remedy for the record. The one reading `main` makes for every invocation, judged from the
+/// account running it -- through @p guard, which carries the accounts that caller counts as the node's own
 /// (`OwnStateAccountsGuard`); `--install-service` reads the record again after its handover, without
 /// the owner judgement whose answer depends on that account (`StateDirectoryFormationReader`).
 /// @param stateDirectory The directory the node resolved (`ChosenStateDirectory`).

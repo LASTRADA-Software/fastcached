@@ -376,7 +376,7 @@ struct Machine
     cfg.nodeId = "n-laptop";
     cfg.identityPublicKey = Testing::TestKeyPair("n-laptop").PublicKey();
     cfg.hostNames = NodeHostNames { .fqdn = "laptop.corp.example", .dnsSuffix = {}, .withheld = {} };
-    REQUIRE(ApplyFormation(cfg, pending, {}).has_value());
+    REQUIRE(ApplyFormation(cfg, pending, {}, ResolvedNodeKey(cfg)).has_value());
     return cfg;
 }
 

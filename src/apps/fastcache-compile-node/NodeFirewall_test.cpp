@@ -4,6 +4,7 @@
 #include "NodeKey.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Platform/Firewall.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
@@ -20,8 +21,10 @@
 #include <vector>
 
 #include <tests/FirewallFakes.hpp>
+#include <tests/FoundedStateDirectory.hpp>
 #include <tests/HostNamingFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -668,4 +671,57 @@ TEST_CASE("An install reads the formation record in exactly the directory its re
         CHECK_FALSE(refused.message.contains(recordIn(merged.clusterDir)));
         CHECK(refusedFirewall.rules.empty());
     }
+}
+
+TEST_CASE("An install over a founder's state directory is judged by the key that directory holds, as its start is",
+          "[node][firewall][install][pin]")
+{
+    // #1663's MSI upgrade: the founder pinned to its own cluster and key failed its install with 1722
+    // and rolled back, because the record was judged with no key -- the install mints none and had
+    // resolved none. The record and the key are read through the production reader, after the
+    // registration, from the directory it secured.
+    Testing::ScratchDirectory const scratch { "install-founder-pin" };
+    auto const ownKey = Testing::WriteFoundedStateDirectory(scratch.Path());
+    StateDirectoryFormationReader const formation { scratch.Path() };
+
+    auto const install = [&](Ed25519PublicKey const& pinned, Testing::RecordingFirewall& firewall, int& removals) {
+        NodeConfig cfg;
+        cfg.clusterDir = scratch.Path();
+        cfg.fleetPin =
+            Cluster::PinnedFleet { .clusterId = std::string { Testing::FoundedClusterId }, .voterKeys = { pinned } };
+        REQUIRE_FALSE(cfg.identityPublicKey.has_value()); // what the install holds: it mints no key
+        return InstallWithServiceFirewall(
+            [] { return ServiceControlResult { .outcome = ServiceControlOutcome::Created, .message = "installed" }; },
+            [&removals] {
+                ++removals;
+                return ServiceControlResult { .outcome = ServiceControlOutcome::Removed, .message = "removed" };
+            },
+            cfg,
+            Program,
+            cfg.serviceName,
+            formation,
+            &firewall);
+    };
+
+    Testing::RecordingFirewall firewall;
+    auto removals = 0;
+    auto const result = install(ownKey, firewall, removals);
+    INFO(result.message);
+    REQUIRE(result.ExitCode() == 0);
+    CHECK(removals == 0);
+    auto const opened = firewall.NamesInGroup(FirewallGroupFor(NodeConfig {}.serviceName));
+    REQUIRE(opened.has_value());
+    CHECK(std::ranges::contains(Testing::Unwrap(opened), std::string { "FastCacheCompileNode raft tcp/6680" }));
+
+    // Pinned under another key, the install is refused as the start is, naming the key it holds,
+    // and the registration it created is removed again.
+    Testing::RecordingFirewall refusedFirewall;
+    auto refusedRemovals = 0;
+    auto const refused = install(Testing::TestKeyPair("n-rogue").PublicKey(), refusedFirewall, refusedRemovals);
+    INFO(refused.message);
+    REQUIRE(refused.ExitCode() != 0);
+    CHECK(refused.message.contains("refusing the install"));
+    CHECK(refused.message.contains(std::format("under key {}", FormatEd25519PublicKey(ownKey))));
+    CHECK(refusedRemovals == 1);
+    CHECK(refusedFirewall.rules.empty());
 }

@@ -33,7 +33,8 @@ namespace FastCache::Testing
 /// @return It, shaped.
 [[nodiscard]] inline Node::NodeConfig FirstStart(Node::NodeConfig cfg)
 {
-    auto const applied = Node::ApplyFormation(cfg, Cluster::FormationRecord {}, Cluster::FleetEndpoints {});
+    auto const applied =
+        Node::ApplyFormation(cfg, Cluster::FormationRecord {}, Cluster::FleetEndpoints {}, Node::ResolvedNodeKey(cfg));
     REQUIRE(applied.has_value());
     return cfg;
 }

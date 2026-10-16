@@ -507,6 +507,23 @@ enum class KeyMoment : std::uint8_t
                                                                     ISecureRandom& random,
                                                                     INodeKeyFileGuard& guard);
 
+/// Read the identity key @p stateDirectory already holds, minting NOTHING (#1663).
+///
+/// For a verdict that needs this node's PUBLIC key before its start has resolved it: the pin a
+/// record this node founded is judged by (`KeptFormation::ownKey`). **Only an absent file is
+/// "none"**, never minted over; a file that is there and cannot be used is refused in the words
+/// `ResolveNodeKey` uses, and left exactly as it is.
+///
+/// Neither the directory nor the key's exposure is judged here, deliberately: the start resolves
+/// the key through `ResolveNodeKey`, which judges both, before it acts on it; `main`'s reading has
+/// judged the directory already (`ReadStateDirectoryFormation`); and an install reads after its
+/// handover without the owner judgement, as it reads the record. Nothing proves anything with the
+/// key read here -- it is compared with a pin and dropped.
+/// @param stateDirectory Where this node keeps its state.
+/// @return The public key, nothing when the directory holds no key file, or why it cannot be read.
+[[nodiscard]] std::expected<std::optional<Ed25519PublicKey>, NodeKeyRefusal> ReadHeldNodeKey(
+    std::filesystem::path const& stateDirectory);
+
 /// Judge the state directory before anything in it is read: WHO may write in it (`OpenDirectory`,
 /// carrying the key's own exposure question when the key is readable by others, since the
 /// directory's remedy would erase that evidence), then WHO wrote each entry

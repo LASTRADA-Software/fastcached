@@ -68,8 +68,8 @@ namespace
         auto resumed = ResumeFormation(std::move(record), store, archiver);
         if (!resumed.has_value())
             return std::unexpected { std::move(resumed).error() };
-        if (auto applied = ApplyFormation(cfg, *resumed, remembered); !applied.has_value())
-            return std::unexpected { std::move(applied).error() };
+        if (auto applied = ApplyFormation(cfg, *resumed, remembered, ResolvedNodeKey(cfg)); !applied.has_value())
+            return std::unexpected { std::move(applied).error().reason };
         return AdoptedFormation { .record = *std::move(resumed), .remembered = std::move(remembered) };
     }
 } // namespace

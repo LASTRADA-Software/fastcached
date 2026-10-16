@@ -2528,7 +2528,9 @@ int main(int argc, char** argv)
 
     // Shaped by what was read; where nothing could shape it, told WHY (`ShapeByKeptFormation`), so the
     // mode line and the `--raft-self` row name the reading's refusal -- that row told an operator who
-    // had typed `--listen-raft` that its absence was the cause.
+    // had typed `--listen-raft` that its absence was the cause. A record this node FOUNDED is judged
+    // against `--fleet-id` by its own key, which no identity has resolved yet here: the reading
+    // read it beside the record, minting nothing (`WithHeldNodeKey`, #1663).
     auto shaped = Node::ShapeByKeptFormation(cfg, keptFormation).and_then([&] {
         return Node::ShapeByKeptFormation(cliOnly, keptFormation);
     });
@@ -2752,9 +2754,12 @@ int main(int argc, char** argv)
     if (!adopted.has_value())
         return RefuseStart(
             startHost, logger, std::format("{}; refusing to start", adopted.error()), ExitCodeFor(StartStage::Formation));
-    if (auto applied = Node::ApplyFormation(cliOnly, adopted->record, adopted->remembered); !applied.has_value())
-        return RefuseStart(
-            startHost, logger, std::format("{}; refusing to start", applied.error()), ExitCodeFor(StartStage::Formation));
+    if (auto applied = Node::ApplyFormation(cliOnly, adopted->record, adopted->remembered, Node::ResolvedNodeKey(cliOnly));
+        !applied.has_value())
+        return RefuseStart(startHost,
+                           logger,
+                           std::format("{}; refusing to start", applied.error().reason),
+                           ExitCodeFor(StartStage::Formation));
     logger.Logf(LogLevel::Info, "{}, cluster {}", Node::DescribeFormationMode(cfg), cfg.clusterId);
 
     // Built only when there IS a file, and holding the SAME argv the startup parse

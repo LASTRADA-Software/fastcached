@@ -9,6 +9,7 @@
 #include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/NodeMode.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Platform/ProcessExit.hpp>
 
@@ -66,6 +67,12 @@ struct NodeFormationView
     [[nodiscard]] friend bool operator==(NodeFormationView const&, NodeFormationView const&) = default;
 };
 
+/// This node's own identity key as its state directory holds it, read and never minted: the key,
+/// nothing when the directory holds none, or why it could not be read -- with the key fault's own
+/// stage, so a pinned founder whose key file is damaged ends a start as that file does (`Refused`),
+/// never as a transient formation reading the supervisor retries.
+using HeldNodeKey = std::expected<std::optional<Ed25519PublicKey>, FormationUnread>;
+
 /// Shape @p cfg from the formation record.
 ///
 /// Fills `cfg.formation` from @p record and writes `cfg.clusterId` from it as well -- the lease
@@ -84,13 +91,39 @@ struct NodeFormationView
 /// because every shape the node takes passes through: the start refuses it by name with the remedy,
 /// a reload cannot reach it (the pin is `Reloadable::No`), and every formation move is judged by the
 /// same call (`StartupShapeJudge`), so no transition writes a record the pin forbids.
+///
+/// **A record this node FOUNDED is judged by the key it is HANDED (@p ownKey), and nothing else** --
+/// it commits this node to its own cluster under its own key (`CommittedUnderOwnKey`), so that key is
+/// what a pin is judged against. There is deliberately no overload that reads the key out of @p cfg:
+/// one turned "not resolved yet" into "no key" silently, and the reload met #1663 through it. A
+/// configuration shaped before its start has resolved the key -- `main`'s shaping, which a
+/// `--print-surfaces` and an install answer from, and the install's reading after its handover --
+/// goes through `ApplyKeptFormation`, which hands over the key the reading found (`ReadHeldNodeKey`,
+/// never minted); one shaped after it hands over `ResolvedNodeKey`.
 /// @param cfg The configuration to shape.
 /// @param record The formation record, as loaded or minted.
 /// @param remembered The fleet endpoints this node last knew; empty when there is no file.
-/// @return Nothing, or why the record cannot shape a configuration.
-[[nodiscard]] std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
-                                                              Cluster::FormationRecord const& record,
-                                                              Cluster::FleetEndpoints const& remembered);
+/// @param ownKey This node's own key; its error is why it could not be read, which a refusal names.
+/// @return Nothing, or why the record cannot shape a configuration and the step a start gives up at:
+///         `Formation`, or the key fault's own stage when the key a pin needed could not be read.
+[[nodiscard]] std::expected<void, FormationUnread> ApplyFormation(NodeConfig& cfg,
+                                                                  Cluster::FormationRecord const& record,
+                                                                  Cluster::FleetEndpoints const& remembered,
+                                                                  HeldNodeKey const& ownKey);
+
+/// The key @p cfg holds BECAUSE ITS START RESOLVED IT (`ApplyNodeIdentity`), as `ApplyFormation`
+/// takes it: for a configuration shaped after the identity was applied -- the start's adoption, every
+/// reform, a reload candidate. Before that @p cfg holds none, and judging a founded record by it
+/// would answer "none" for a key that is on disk (#1663); use `ApplyKeptFormation` there.
+/// @param cfg A configuration whose identity has been applied.
+/// @return Its key; nothing when the node holds none.
+[[nodiscard]] HeldNodeKey ResolvedNodeKey(NodeConfig const& cfg);
+
+/// Whether @p record commits this node to a cluster under this node's OWN key: one it founded and
+/// runs fleet consensus in. A pin judges such a record by that key, so only such a record needs it.
+/// @param record The record.
+/// @return True when a pin judges @p record by this node's own key.
+[[nodiscard]] bool CommittedUnderOwnKey(Cluster::FormationRecord const& record) noexcept;
 
 /// The pin @p cfg carries: `--fleet-id`, or none.
 /// @param cfg The configuration.
@@ -279,6 +312,11 @@ struct KeptFormation
 {
     std::optional<Cluster::FormationRecord> record; ///< The record, DISENGAGED when none was ever written.
     Cluster::FleetEndpoints remembered;             ///< The fleet endpoints last known; empty when none are.
+
+    /// This node's own key, as the state directory holds it, for a record committed under it
+    /// (`CommittedUnderOwnKey`, #1663) -- read beside the record, never minted; nothing for any
+    /// other record. Its error is held, not refused: it decides only a pin, and only a pin says it.
+    HeldNodeKey ownKey {};
 };
 
 /// What a node that is already running says when the record it runs by is no longer in its state
@@ -306,6 +344,15 @@ inline constexpr std::string_view FormationRecordGone =
 /// @param kept What the state directory holds.
 /// @return The record to apply.
 [[nodiscard]] Cluster::FormationRecord ProspectiveRecord(KeptFormation const& kept);
+
+/// `ApplyFormation` of @p kept's `ProspectiveRecord`, as every configuration shaped from a READING
+/// is: a record committed under this node's own key is judged by @p cfg's key when the start has
+/// resolved one, and else by the key the reading found (`KeptFormation::ownKey`).
+/// @param cfg The configuration to shape.
+/// @param kept What the state directory holds.
+/// @return Nothing, or why the record cannot shape a configuration and the step a start gives up at:
+///         `Formation`, or the key fault's own stage when the key a pin needed could not be read.
+[[nodiscard]] std::expected<void, FormationUnread> ApplyKeptFormation(NodeConfig& cfg, KeptFormation const& kept);
 
 /// Shape @p cfg by what its state directory keeps, as `main` shapes every configuration before any
 /// verb or rule is asked: by the `ProspectiveRecord` of @p kept.

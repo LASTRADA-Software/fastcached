@@ -11,6 +11,7 @@
 #include "RaftStoreArchiver.hpp"
 
 #include <FastCache/Cluster/FleetEndpoints.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Consensus/DurableFile.hpp>
@@ -50,9 +51,11 @@
 #include <core/Ranges.hpp>
 #include <tests/AccessList.hpp>
 #include <tests/FleetHistoryFakes.hpp>
+#include <tests/FoundedStateDirectory.hpp>
 #include <tests/NodeConditionFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/NodeKeyFakes.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScopedUmask.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SecureRandomFakes.hpp>
@@ -1204,6 +1207,196 @@ TEST_CASE("A line whose state directory cannot be read is refused once naming th
     CHECK(refusal.contains(FormationAbsenceOf(judged.cfg)));
     CHECK(judged.report.text.contains("not served (no formation record could be read; see the mode line)"));
     CHECK_FALSE(judged.report.text.contains("no formation record yet"));
+}
+
+namespace
+{
+
+/// A line naming @p stateDirectory and, unless empty, pinned by @p pin, as `main` judges it before
+/// any verb: parsed, its state directory read (`ReadStateDirectoryFormation`), shaped by what was
+/// read (`ShapeByKeptFormation`) -- with the reading's refusal REPLACED by the shaping's, as `main`
+/// replaces it -- then rendered and judged (`ReportSurfaces`). The start, `--print-surfaces` and
+/// `--install-service` all take this verdict; no identity has been resolved yet, as in `main`.
+/// @param stateDirectory What `--cluster-dir` names.
+/// @param pin What `--fleet-id` names; empty for none.
+/// @return The configuration, what was read and the verdict.
+[[nodiscard]] JudgedLine JudgeFounderLine(std::filesystem::path const& stateDirectory, std::string const& pin)
+{
+    auto const clusterDir = std::format("--cluster-dir={}", stateDirectory.string());
+    auto const fleetId = std::format("--fleet-id={}", pin);
+    auto args = std::vector<char const*> { clusterDir.c_str(), "--print-surfaces" };
+    if (!pin.empty())
+        args.push_back(fleetId.c_str());
+    auto cfg = NodeConfig {};
+    REQUIRE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { args }, cfg).has_value());
+    REQUIRE_FALSE(cfg.identityPublicKey.has_value()); // as `main` holds it: no key resolved yet
+    FileTrustNodeKeyGuard guard;
+    auto kept = ReadStateDirectoryFormation(stateDirectory, guard);
+    if (auto shaped = ShapeByKeptFormation(cfg, kept); !shaped.has_value())
+        kept = std::unexpected { std::move(shaped).error() };
+    auto report = ReportSurfaces(cfg);
+    return JudgedLine { .cfg = std::move(cfg), .kept = std::move(kept), .report = std::move(report) };
+}
+
+/// `--fleet-id` naming @p clusterId under @p key alone.
+/// @param clusterId The cluster.
+/// @param key The voter key.
+/// @return The pin, spelled as `fastcache-cli node` prints it.
+[[nodiscard]] std::string PinText(std::string_view clusterId, Ed25519PublicKey const& key)
+{
+    return Cluster::FormatPinnedFleet(Cluster::PinnedFleet { .clusterId = std::string { clusterId }, .voterKeys = { key } });
+}
+
+/// The words a record the pin refuses is refused with.
+constexpr std::string_view PinRefusal = "which --fleet-id does not name";
+
+} // namespace
+
+TEST_CASE("A founder pinned to its own cluster and its own key is shaped before its start resolves the key",
+          "[node][state][formation][pin][security]")
+{
+    // #1663, the office leader: founded its cluster, then pinned to it by the MSI. `main` judges the
+    // record against the pin BEFORE the identity is resolved, and a founder's commitment is vouched
+    // for by its OWN key -- so every start, `--print-surfaces` and `--install-service` answered
+    // "under key none" and refused. The key is read beside the record, never minted.
+    Testing::ScratchDirectory const scratch { "founder-pin" };
+    auto const ownKey = Testing::WriteFoundedStateDirectory(scratch.Path());
+
+    auto const judged = JudgeFounderLine(scratch.Path(), PinText(Testing::FoundedClusterId, ownKey));
+    INFO((judged.kept.has_value() ? std::string {} : judged.kept.error().reason));
+    REQUIRE(judged.cfg.formation.has_value());
+    CHECK(judged.kept.has_value());
+    CHECK_FALSE(judged.cfg.formationUnread.has_value());
+    CHECK(Testing::Unwrap(judged.cfg.formation).mode == Cluster::NodeMode::Voter);
+    CHECK(judged.cfg.clusterId == Testing::FoundedClusterId);
+    CHECK(judged.report.text.contains("mode: voter"));
+    INFO(judged.report.refusal.value_or(std::string {}));
+    CHECK_FALSE(judged.report.refusal.has_value());
+    // `--install-service` judges this same shaped configuration before it registers anything.
+    CHECK_FALSE(NodeInstallRejection(judged.cfg).has_value());
+    // Read, never written: the key on disk is the one minted, and it is the only one.
+    auto const reread = ReadHeldNodeKey(scratch.Path());
+    REQUIRE(reread.has_value());
+    CHECK(*reread == std::optional { ownKey });
+}
+
+TEST_CASE("A founder pinned under another key or to another cluster is still refused, naming the key it holds",
+          "[node][state][formation][pin][security]")
+{
+    Testing::ScratchDirectory const scratch { "founder-pin-refused" };
+    auto const ownKey = Testing::WriteFoundedStateDirectory(scratch.Path());
+    auto const ownKeyText = FormatEd25519PublicKey(ownKey);
+
+    // Its own cluster under another key: the pin keeps its meaning.
+    auto const rogue =
+        JudgeFounderLine(scratch.Path(), PinText(Testing::FoundedClusterId, Testing::TestKeyPair("n-rogue").PublicKey()));
+    REQUIRE_FALSE(rogue.cfg.formation.has_value());
+    REQUIRE_FALSE(rogue.kept.has_value());
+    INFO(rogue.kept.error().reason);
+    CHECK(rogue.kept.error().reason.contains(PinRefusal));
+    CHECK(rogue.kept.error().stage == StartStage::Formation);
+    // The key the record IS committed under, where it said "none".
+    REQUIRE(rogue.kept.error().reason.contains(std::format("under key {}", ownKeyText)));
+    CHECK_FALSE(rogue.kept.error().reason.contains("under key none"));
+    CHECK(rogue.report.refusal.has_value());
+
+    // Another cluster under its own key.
+    constexpr std::string_view OtherCluster = "fedcba9876543210fedcba9876543210";
+    auto const elsewhere = JudgeFounderLine(scratch.Path(), PinText(OtherCluster, ownKey));
+    REQUIRE_FALSE(elsewhere.cfg.formation.has_value());
+    REQUIRE_FALSE(elsewhere.kept.has_value());
+    INFO(elsewhere.kept.error().reason);
+    CHECK(elsewhere.kept.error().reason.contains(PinRefusal));
+    CHECK(elsewhere.kept.error().reason.contains(std::format("commits this node to cluster {}", Testing::FoundedClusterId)));
+    CHECK(elsewhere.kept.error().reason.contains(std::format("pins it to {}@", OtherCluster)));
+}
+
+TEST_CASE("A pinned founder's key file that cannot be used is refused by name and left as it is, and none is minted",
+          "[node][state][formation][pin][security]")
+{
+    Testing::ScratchDirectory const scratch { "founder-pin-key" };
+    auto const ownKey = Testing::WriteFoundedStateDirectory(scratch.Path());
+    auto const keyFile = scratch.Path() / NodeKeyFileName;
+    auto const pin = PinText(Testing::FoundedClusterId, ownKey);
+
+    // A file that is there and is not a key: the reading's own refusal, never "reset its state
+    // directory" -- which would discard the very key the pin may name -- and never a re-mint.
+    WriteText(keyFile, "not a key file");
+    auto const damaged = JudgeFounderLine(scratch.Path(), pin);
+    REQUIRE_FALSE(damaged.kept.has_value());
+    INFO(damaged.kept.error().reason);
+    REQUIRE(damaged.kept.error().reason.contains("but that key cannot be read to compare"));
+    CHECK(damaged.kept.error().reason.contains(keyFile.string()));
+    CHECK_FALSE(damaged.kept.error().reason.contains("reset its state directory"));
+    CHECK(TextOf(keyFile) == "not a key file");
+
+    // And it ends a start as that key file ends one -- a verdict on the bytes, `Refused` and never
+    // retried -- not as a transient formation reading the supervisor would restart forever.
+    auto const keyFault = ReadHeldNodeKey(scratch.Path());
+    REQUIRE_FALSE(keyFault.has_value());
+    REQUIRE(damaged.kept.error().stage == StageOf(keyFault.error().fault));
+    CHECK(UnreadStateStage(damaged.cfg) == std::optional { StageOf(keyFault.error().fault) });
+    CHECK(ExitOf(StageOf(keyFault.error().fault)) == ProcessExit::Refused);
+    CHECK(damaged.report.ending == CommandEnding::Declined);
+
+    // A pin naming ANOTHER cluster is refused whatever the key holds, so the key file is not named.
+    auto const elsewhere = JudgeFounderLine(scratch.Path(), PinText("fedcba9876543210fedcba9876543210", ownKey));
+    REQUIRE_FALSE(elsewhere.kept.has_value());
+    INFO(elsewhere.kept.error().reason);
+    REQUIRE_FALSE(elsewhere.kept.error().reason.contains("cannot be read to compare"));
+    CHECK(elsewhere.kept.error().reason.contains(PinRefusal));
+    CHECK(elsewhere.kept.error().stage == StartStage::Formation);
+    // And it says what is known of the key: unreadable, never "none", the wording #1663 removes.
+    CHECK_FALSE(elsewhere.kept.error().reason.contains("under key none"));
+    CHECK(elsewhere.kept.error().reason.contains("under its own key, which could not be read"));
+
+    // The same file decides nothing for a founder no pin asks about: no refusal where there was none.
+    auto const unpinned = JudgeFounderLine(scratch.Path(), {});
+    INFO((unpinned.kept.has_value() ? std::string {} : unpinned.kept.error().reason));
+    CHECK(unpinned.cfg.formation.has_value());
+    CHECK(TextOf(keyFile) == "not a key file");
+
+    // An absent key is "none", as it was, and is not minted by being asked about.
+    std::filesystem::remove(keyFile);
+    auto const absent = JudgeFounderLine(scratch.Path(), pin);
+    REQUIRE_FALSE(absent.kept.has_value());
+    CHECK(absent.kept.error().reason.contains("under key none"));
+    CHECK_FALSE(std::filesystem::exists(keyFile));
+}
+
+TEST_CASE("A joined node's pin is still judged by the key that signed its admission, never by its own",
+          "[node][state][formation][pin][security]")
+{
+    // The control: a learner's commitment is vouched for by the record, so the key file beside it
+    // is not read at all, and a pin naming this node's OWN key does not admit a fleet it joined.
+    constexpr std::string_view FleetCluster = "fedcba9876543210fedcba9876543210";
+    auto const office = Testing::TestKeyPair("office").PublicKey();
+    auto const roster = Cluster::Roster { .members = { Cluster::RosterMember { .id = "office",
+                                                                               .raftEndpoint = "office:6680",
+                                                                               .seat = Cluster::MemberSeat::Voter,
+                                                                               .publicKey = office,
+                                                                               .schedulerEndpoint = {} } },
+                                          .revoked = {} };
+    auto record = Testing::FoundedVoterRecord();
+    record.mode = Cluster::NodeMode::Learner;
+    record.fleet = Cluster::FleetMembership { .clusterId = std::string { FleetCluster },
+                                              .roster = Cluster::EncodeRoster(roster),
+                                              .createdAtUnixSeconds = 0,
+                                              .admittedBy = office };
+    Testing::ScratchDirectory const scratch { "joined-pin" };
+    auto const ownKey = Testing::WriteFoundedStateDirectory(scratch.Path(), record);
+
+    auto const admitted = JudgeFounderLine(scratch.Path(), PinText(FleetCluster, office));
+    INFO((admitted.kept.has_value() ? std::string {} : admitted.kept.error().reason));
+    REQUIRE(admitted.cfg.formation.has_value());
+    CHECK(Testing::Unwrap(admitted.cfg.formation).mode == Cluster::NodeMode::Learner);
+    REQUIRE(admitted.kept.has_value());
+    CHECK(admitted.kept->ownKey == HeldNodeKey {}); // not read: the record vouches for itself
+
+    auto const ownPinned = JudgeFounderLine(scratch.Path(), PinText(FleetCluster, ownKey));
+    REQUIRE_FALSE(ownPinned.kept.has_value());
+    INFO(ownPinned.kept.error().reason);
+    CHECK(ownPinned.kept.error().reason.contains(std::format("under key {}", FormatEd25519PublicKey(office))));
 }
 
 namespace

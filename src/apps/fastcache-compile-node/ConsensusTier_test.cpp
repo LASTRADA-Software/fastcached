@@ -3017,8 +3017,8 @@ TEST_CASE("A learner enrolled through its leader's own route is recorded under t
         .rejectedBy = std::nullopt,
         .askedJoins = {},
     };
-    auto const applied = ApplyFormation(fleet.joiner, record, Cluster::FleetEndpoints {});
-    INFO("the formation was refused: " << (applied.has_value() ? std::string {} : applied.error()));
+    auto const applied = ApplyFormation(fleet.joiner, record, Cluster::FleetEndpoints {}, ResolvedNodeKey(fleet.joiner));
+    INFO("the formation was refused: " << (applied.has_value() ? std::string {} : applied.error().reason));
     REQUIRE(applied.has_value());
     auto joined = StartTier(fleet.joiner, fleet.joinerMetrics, fleet.joinerLogger);
     INFO("the joiner's start refused: " << RefusalOf(joined));

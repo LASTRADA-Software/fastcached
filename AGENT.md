@@ -440,7 +440,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   unless `--fleet-id` PINS it — a KEY pin** (an id alone is REFUSED): ONE predicate, `AdmitsFleet`, INSIDE
   `ClassifyEncounter`, of every `Enroll` answer and redirect, the dissolve and the record. **It anchors the
   JOIN**, then the applied state rules. A `--fleet-seed` outranks any beacon, and a joined machine never
-  YIELDS to another fleet (`foreign-fleet-visible`).
+  YIELDS to another fleet (`foreign-fleet-visible`). A FOUNDER is judged by its OWN key, READ, never minted.
 - **A split heals BY ITSELF only on a VOTER's key** (their speaker recorded here as a voter under it), through
   ONE replicated `DissolveInto` its losing LEADER proposes; a memo's or a learner's key is an OPERATOR's call.
 - **Every Raft peer connection proves each end's OWN identity key before a message is read**

@@ -78,8 +78,9 @@ class IKeptFormationReader
 /// installer's seat every upgrade over a directory the service had used would read as planted.
 /// The install asks only after its handover made the directory the service's -- on Windows
 /// `SecureDirectoryForService` refuses any entry owned by anybody but SYSTEM, Administrators or
-/// the service -- and the record decides nothing here but which rules to open; the start judges
-/// the directory again, as the service, before it acts on anything in it.
+/// the service -- and the record decides which rules to open and, for a founder pinned by
+/// `--fleet-id`, together with the key read beside it (`WithHeldNodeKey`, #1663), the install's
+/// verdict; the start judges the directory again, as the service, before it acts on anything in it.
 class StateDirectoryFormationReader final: public IKeptFormationReader
 {
   public:

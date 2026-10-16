@@ -2373,7 +2373,9 @@ refused where it is typed** rather than taken as a pin by name. Pinned, a node:
   admit** -- a pending ask, a fleet it joined, a cluster it founded, each judged by a key this
   node PROVED: the one that proved the fleet it asked, the one that SIGNED the admission it acted
   on (never the voters a roster lists), or its own -- naming both and the remedy: reset the state
-  directory to join the pinned fleet, or change the pin.
+  directory to join the pinned fleet, or change the pin. A founder whose own key file cannot be
+  read is refused in that key file's own words and ends as that file would, never with the
+  "reset the state directory" remedy, which would discard the key the pin names.
 
 Pin the machine that founds the fleet too, to its own `fleet-id`: it then yields to nobody, so
 a stranger proving an older fleet cannot take the founder -- and the fleet with it -- either.

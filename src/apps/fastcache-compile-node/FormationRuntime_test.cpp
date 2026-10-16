@@ -128,7 +128,7 @@ struct RuntimeRig
         identity = Testing::TestKeyPair(nodeId);
         cfg.identityPublicKey = identity->PublicKey();
         cfg.hostNames = NodeHostNames { .fqdn = nodeId.substr(2) + ".corp.example", .dnsSuffix = {}, .withheld = {} };
-        REQUIRE(ApplyFormation(cfg, body.record, {}).has_value());
+        REQUIRE(ApplyFormation(cfg, body.record, {}, ResolvedNodeKey(cfg)).has_value());
     }
 
     /// @return The seams, reading this rig.
@@ -372,7 +372,7 @@ TEST_CASE("A loopback-named founder that gets a joiner is refused the move by it
     cfg.identityPublicKey = Testing::TestKeyPair("n-solo").PublicKey();
     ApplyHostNames(cfg, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = "localhost" });
     auto const solitary = Testing::Minted("c-solo", 500);
-    REQUIRE(ApplyFormation(cfg, solitary, {}).has_value());
+    REQUIRE(ApplyFormation(cfg, solitary, {}, ResolvedNodeKey(cfg)).has_value());
     REQUIRE_FALSE(StartupPolicyRejection(cfg).has_value()); // the start passes it
     REQUIRE(RunsConsensus(cfg));                            // confined to loopback, and on
 

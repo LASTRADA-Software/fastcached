@@ -42,6 +42,13 @@ NodeReloader::Reparse ReloadCandidateReader(std::span<char const* const> args, R
                                                      .field = {},
                                                      .context = std::move(adopted).error().reason });
 
+        // The identity again, through the function the start used, and BEFORE the formation (#1663):
+        // a record this node founded is judged against `--fleet-id` by this node's own key, and a
+        // candidate holding none refused every pin naming it. A candidate rebuilt without it holds
+        // an empty `--node-id` too, an unreloadable field that has CHANGED -- so every reload would
+        // be refused by name, on a worker whose configuration was perfectly valid.
+        ApplyNodeIdentity(candidate, basis.identity);
+
         // The formation as it is kept NOW: a candidate shaped by no record would run no consensus the
         // running node does, and one shaped by the record the start kept would put a reformed node
         // back in a mode it has left. A record that cannot be read, or is gone, declines the reload.
@@ -59,13 +66,9 @@ NodeReloader::Reparse ReloadCandidateReader(std::span<char const* const> args, R
             return formationRefusal(kept.error());
         if (!kept->record.has_value())
             return formationRefusal(std::string { FormationRecordGone });
-        if (auto applied = ApplyFormation(candidate, *kept->record, kept->remembered); !applied.has_value())
-            return formationRefusal(applied.error());
-
-        // The identity again, through the function the start used. A candidate rebuilt without it
-        // holds an empty `--node-id`, an unreloadable field that has CHANGED -- so every reload
-        // would be refused by name, on a worker whose configuration was perfectly valid.
-        ApplyNodeIdentity(candidate, basis.identity);
+        if (auto applied = ApplyFormation(candidate, *kept->record, kept->remembered, ResolvedNodeKey(candidate));
+            !applied.has_value())
+            return formationRefusal(std::move(applied).error().reason);
         return candidate;
     };
 }

@@ -516,7 +516,7 @@ namespace
     cfg.nodeId = "n-laptop";
     cfg.slots = 0;
     ApplyHostNames(cfg, names);
-    REQUIRE(ApplyFormation(cfg, record, {}).has_value());
+    REQUIRE(ApplyFormation(cfg, record, {}, ResolvedNodeKey(cfg)).has_value());
     return cfg;
 }
 
