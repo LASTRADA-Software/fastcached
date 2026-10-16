@@ -97,4 +97,6 @@ TEST_CASE("An operator verb whose mint fails presents nothing, names why, and sa
     REQUIRE(said.size() == 1);
     CHECK(said.front().contains(Cc::ReasonFor(Cc::MintFailure::Unreachable)));
     CHECK(said.front().contains("127.0.0.1:6674"));
+    // A verb has no local compile to fall back on: its line ends with the verb's own cost.
+    CHECK(said.front().ends_with(RefusedVerbFails));
 }

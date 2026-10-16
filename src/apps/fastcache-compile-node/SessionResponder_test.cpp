@@ -197,7 +197,8 @@ TEST_CASE("A launcher asks this node for no ticket it would refuse, so the refus
                                     Cc::Credential {},
                                     std::string {},
                                     Cc::ExchangeBudget {},
-                                    [&said](std::string_view line) { said.emplace_back(line); } };
+                                    [&said](std::string_view line) { said.emplace_back(line); },
+                                    std::string { Cc::RefusedCompileRunsLocally } };
 
     for (auto const* everybody: { "localhost:6674", "LOCALHOST:6674", "127.0.0.1:6674", "0.0.0.0:6674", "[::]:6674" })
     {

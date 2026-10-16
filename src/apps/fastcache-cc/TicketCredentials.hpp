@@ -9,6 +9,7 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/TicketChoice.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -29,8 +30,9 @@ namespace FastCache::Cc
 
 /// What ONE exchange presents, and -- when a ticket was due and could not be minted -- why not.
 ///
-/// The failure travels with the credential of the exchange it belongs to, rather than being
-/// remembered by the minter: a refusal is explained by the mint of THAT exchange and no other, so
+/// The failure travels with the credential of the exchange it belongs to: the minter remembers a
+/// `MintRetry::NotAgain` failure only to stop ASKING, and still hands it to each later exchange as
+/// that exchange's own. So a refusal is explained by what THAT exchange presented and no other, and
 /// a NotAMember answered to a valid ticket can never be recorded as a missing one.
 struct PresentedCredential
 {
@@ -61,6 +63,63 @@ class ICredentialFor
     }
 };
 
+/// Ceiling on CONNECTING to this machine's node for a mint (#1664).
+///
+/// A mint source is a loopback literal by construction (`TicketSourceFor`), so it is bounded by
+/// what loopback costs and not by a LAN exchange's connect budget. That matters on Windows, where a
+/// connect to a CLOSED loopback port is not refused at once: the stack retries the SYN and answers
+/// `WSAECONNREFUSED` after ~2 s, so a machine with no node used to wait out the whole exchange
+/// budget (a second) on every mint.
+///
+/// **The figures it was chosen from, and their conditions** -- 32-thread hosts, each sampled idle and
+/// under 64 CPU-bound processes, 3,000 connects per row (closed port on Windows: 5), timed in Python
+/// around the connect alone, the worse of idle and loaded shown:
+///
+/// | host | instrument | live listener, max (p99.9) | closed port |
+/// |---|---|---|---|
+/// | Windows 11 26200 | `asyncio` Proactor (IOCP `ConnectEx`) | 0.76 ms (0.60 ms) | 2,016--2,042 ms, refused |
+/// | Windows 11 26200 | blocking `socket.connect` | 0.58 ms (0.58 ms) | 2,031--2,056 ms, refused |
+/// | WSL2 Ubuntu 24.04, kernel 6.6 | `asyncio` selector (`epoll`) | 13.5 ms (7.2 ms) | 0.15--0.47 ms, refused |
+/// | WSL2 Ubuntu 24.04, kernel 6.6 | blocking `socket.connect` | 1.45 ms (0.44 ms) | 0.14 ms max, refused |
+///
+/// The `asyncio` Linux tail is the interpreter's event loop as much as the kernel's -- the blocking
+/// connect on the same host and load tops out at 1.45 ms -- and Linux refuses a closed port at once,
+/// so there the bound is never paid. Fifty milliseconds is over 60 times the Windows maximum and over
+/// 30 times the blocking Linux one, and it is about what a machine with no node pays, ONCE per
+/// invocation (`MintRetry::NotAgain`). End to end on Windows -- a Release build of the launcher, the
+/// MISS and HIT rows against one remote cache, a machine with no node against one whose node mints
+/// -- the difference measured 59--73 ms.
+///
+/// **What it measures is the KERNEL's handshake, not the node.** A loopback connect completes at
+/// the SYN-ACK, which the kernel answers from the listening socket's backlog whatever the node's
+/// own threads are doing; the node's `accept` comes later and is not waited for. So a RUNNING node
+/// misses the bound only when that backlog is full or the host cannot run the kernel's side of the
+/// handshake in time -- and that is **unmeasured**: a busy local node under a `-j 60` build is
+/// #1668's condition, and none of the figures above was taken under it.
+///
+/// **It fails toward fewer tickets, never a failed build.** A running but saturated node that misses
+/// the bound reads as one that did not answer and is REMEMBERED (`MintRetry::NotAgain`): the rest of
+/// that invocation presents no ticket -- its lease and its compile at a remote worker included -- and
+/// each exchange a node-backed cache or scheduler refuses for it ends in a local compile.
+inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };
+
+/// What a refused exchange costs the launcher, which ends a failed mint's line (`TicketCredentials`).
+inline constexpr std::string_view RefusedCompileRunsLocally = "a refused exchange's compile runs locally";
+
+/// The budget a mint runs under, from the exchange budget the launcher was configured with.
+///
+/// Only the CONNECT is tightened, by `WithConnectAtMost`, to `LoopbackConnectBound` or the
+/// configured one if that is tighter -- and a non-positive one, which leaves the platform default in
+/// place and may be minutes, takes the bound. A node that accepted but is busy may answer slowly, so
+/// the round trip keeps the exchange's own total, and a node that does not answer in time only
+/// means no ticket.
+/// @param exchange The launcher's exchange budget.
+/// @return @p exchange with its connect bounded by loopback.
+[[nodiscard]] constexpr ExchangeBudget MintBudget(ExchangeBudget exchange) noexcept
+{
+    return WithConnectAtMost(exchange, LoopbackConnectBound);
+}
+
 /// Mints one ticket per call from this machine's node, over `exchange`, which must be the RAW
 /// exchange -- never a `CredentialedExchange`, which would ask this object for the mint's own
 /// credential.
@@ -70,11 +129,26 @@ class ICredentialFor
 /// audience, so the lease's would be refused at the worker. Minting is a loopback round trip, far
 /// below the exchange it admits.
 ///
-/// **A mint that fails leaves that exchange unauthenticated, and says why twice**: once per process
-/// through `sink` (one process serves one compile), and as the `missing` half of that exchange's
-/// `PresentedCredential`, which `RecordedReason` records in place of the refusal it causes. The
-/// exchange is then refused `NotAMember` remotely, and every refusal ends in a local compile, so a
-/// missing node costs speed, never a build.
+/// **A mint that fails leaves that exchange unauthenticated, and says why on two channels.** One is
+/// `sink`, which prints at most two lines per process: one on the first failure, and one more if a
+/// later failure is remembered (`MintRetry::NotAgain`), since that says something new about every
+/// later exchange. The other is the `missing` half of each failed exchange's
+/// `PresentedCredential`, which `RecordedReason` records in place of a refusal it causes. Whether
+/// the exchange IS refused is its audience's decision: a cache with authentication off serves it,
+/// one backed by a node refuses it `NotAMember`. What a refusal then costs is the caller's
+/// (`refusalCost`): the launcher compiles locally, so a missing node costs it speed, never a build,
+/// while an operator verb fails.
+///
+/// **And a failure whose row says `MintRetry::NotAgain` is not asked again by this process**
+/// (#1664): without a node, every exchange used to wait out a connect of its own before it went
+/// anywhere. Each later exchange still carries the failure as its `missing`, so a refusal it causes
+/// is explained exactly as the first one's is.
+///
+/// **Precondition: every owner is ONE-SHOT.** The memo never expires, which is sound only because
+/// each object lives for one short unit of work -- the launcher's one compile, a node's one operator
+/// verb -- so a node started meanwhile is asked by the next. A long-lived owner would hold a stale
+/// "no node" for its whole life and must not reuse this object: it would need the memo refreshed on
+/// an interval or a host event, never on a miss (AGENT.md, "Caching an expensive repeated answer").
 class TicketCredentials final: public ICredentialFor
 {
   public:
@@ -84,14 +158,18 @@ class TicketCredentials final: public ICredentialFor
     /// @param password The one password configured; presented to @p passwordFor alone.
     /// @param passwordFor The endpoint @p password belongs to (`FASTCACHE_ADDR`); ignored when
     ///        @p password is not configured.
-    /// @param budget The budget one mint runs under: a loopback round trip.
-    /// @param sink Where a failed mint is said, once; may be empty.
+    /// @param budget The launcher's exchange budget; a mint runs under `MintBudget` of it.
+    /// @param sink Where a failed mint is said: on the first failure, and again if one is remembered;
+    ///        may be empty.
+    /// @param refusalCost What a refused exchange costs THIS caller, ending each line @p sink says:
+    ///        `RefusedCompileRunsLocally` for the launcher, the node's operator verbs their own.
     TicketCredentials(IEndpointExchange& exchange,
                       std::optional<std::string> mintFrom,
                       Credential password,
                       std::string passwordFor,
                       ExchangeBudget budget,
-                      std::function<void(std::string_view)> sink) noexcept;
+                      std::function<void(std::string_view)> sink,
+                      std::string refusalCost) noexcept;
 
     /// @copydoc ICredentialFor::Present
     [[nodiscard]] PresentedCredential Present(std::string_view audience) override;
@@ -101,7 +179,8 @@ class TicketCredentials final: public ICredentialFor
     [[nodiscard]] PresentedCredential PasswordCredential(std::string_view audience);
     [[nodiscard]] PresentedCredential MintedCredential(std::string_view audience);
 
-    /// Say @p failure once per process, and present nothing, naming it.
+    /// Say @p failure (at most twice per process: the first failure, and a remembered one), remember
+    /// it when its row says `MintRetry::NotAgain`, and present nothing, naming it.
     /// @param failure Why.
     /// @param detail What the line adds to the fixed reason: the endpoint, the node's words.
     /// @return No credential, and @p failure.
@@ -127,7 +206,10 @@ class TicketCredentials final: public ICredentialFor
     std::string _passwordFor;
     ExchangeBudget _budget;
     std::function<void(std::string_view)> _sink;
+    std::string _refusalCost;
     bool _said { false };
+    /// A failure this process does not ask the node about again (`MintRetry::NotAgain`).
+    std::optional<MintFailure> _remembered;
 };
 
 /// What each exchange that was REFUSED presented, filed under where it went and what it asked.

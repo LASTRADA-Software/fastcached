@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ClusterAdminCli.hpp"
 #include "EndpointDialerTestUtils.hpp"
+#include "OperatorCredentials.hpp"
 
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Core/Ed25519.hpp>
@@ -960,7 +961,8 @@ TEST_CASE("A cluster command presents a ticket minted for the scheduler it reach
     Testing::ScriptedDialer dialer { { {}, replies } };
     Testing::MintsForItsAudience node;
     Cc::TicketCredentials tickets {
-        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {},
+        {},   std::string { RefusedVerbFails }
     };
 
     auto const rendered = RunClusterAdmin(cfg, Ask(ClusterAction::Status), tickets, dialer);
@@ -988,7 +990,8 @@ TEST_CASE("A cluster command refused for want of a ticket says why there was non
     Testing::MintsForItsAudience node;
     node.unreachableAfter = 0;
     Cc::TicketCredentials tickets {
-        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {},
+        {},   std::string { RefusedVerbFails }
     };
 
     auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), tickets, dialer);
@@ -1051,7 +1054,8 @@ TEST_CASE("A cluster command to a remote leader presents a ticket minted for tha
                                        BehindAuth(answer) } };
     Testing::MintsForItsAudience node;
     Cc::TicketCredentials tickets {
-        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {},
+        {},   std::string { RefusedVerbFails }
     };
 
     auto const rendered = RunClusterAdmin(cfg, Ask(ClusterAction::Status), tickets, dialer);
