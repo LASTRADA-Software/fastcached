@@ -62,6 +62,18 @@ readable and silently ignored. Every rule below has already been one of them.
     `--cache-dir` or `--cluster-dir` gets directories root created for an account
     that is not root, so they must change hands too -- and only those, never a
     parent.
+  - **On Linux the PACKAGED UNIT is that handover, so it declares the directory the docs
+    cite.** Under `ProtectSystem=strict` a service writes only what its unit declares,
+    and the one directory the node unit declared persistently, its state directory, is
+    not a `cache_dir`: the node starts beside no entry there it has no row for ("this
+    build keeps no entry by that name"). The unit shipped with no `CacheDirectory=`
+    while the docs cited `cache_dir: /var/cache/fastcache-node`, so following them gave
+    a store the service could not open and the obvious workaround, a directory inside
+    the state directory, gave a node that refused to start -- found installing 0.5.0 on
+    a laptop, nowhere else. `ctest -R node-working-directory` judges every `cache_dir`
+    the docs and the reference configuration cite under `/var/` against the unit's
+    `CacheDirectory=`, and fails OPEN on a path outside `/var/`, which reads the same
+    for a node started by hand.
   - **An owned path is created only when it is absent AND is not a file, and is
     otherwise handed over as whatever it already is.** The field is `ownedPaths`
     and not `ownedDirectories` because `storage_path` is allowed to name ONE CoW
