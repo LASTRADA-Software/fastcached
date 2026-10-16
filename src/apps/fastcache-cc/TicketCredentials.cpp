@@ -28,21 +28,22 @@ namespace
 
     /// A failure asked again (`MintRetry::PerExchange`) speaks for its own exchange alone: the next
     /// may yet carry a ticket.
-    constexpr std::string_view ThisExchangeOnly = "this exchange carries no ticket, and if its cache or scheduler "
-                                                  "requires one it will be refused and its compile run locally";
+    constexpr std::string_view ThisExchangeOnly =
+        "this exchange carries no ticket, and if its cache or scheduler requires one it will be refused";
 
     /// Says only what is KNOWN (#1664), per failure rather than per `MintRetry`, because two
     /// remembered failures know different things: a node that did not answer was ASKED, while with no
     /// source configured nothing ever was. And whether an exchange without a ticket is refused is its
-    /// audience's decision -- a cache with authentication off serves it.
+    /// audience's decision -- a cache with authentication off serves it. What a refusal then COSTS is
+    /// the caller's (`refusalCost`): a launcher compiles locally, an operator verb is refused.
     constexpr EnumTable<MintFailure, MintConsequenceRow> MintConsequenceTable { {
         { .failure = MintFailure::NoSource,
           .consequence = "no exchange of this process with another machine carries a ticket, and one whose cache "
-                         "or scheduler requires a ticket will be refused and its compile run locally" },
+                         "or scheduler requires a ticket will be refused" },
         { .failure = MintFailure::Unreachable,
           .consequence = "the node is not asked again by this process, so every exchange with another machine "
                          "carries no ticket from here on, and one whose cache or scheduler requires a ticket will "
-                         "be refused and its compile run locally" },
+                         "be refused" },
         { .failure = MintFailure::Refused, .consequence = ThisExchangeOnly },
         { .failure = MintFailure::NoTicket, .consequence = ThisExchangeOnly },
     } };
@@ -67,13 +68,15 @@ TicketCredentials::TicketCredentials(IEndpointExchange& exchange,
                                      Credential password,
                                      std::string passwordFor,
                                      ExchangeBudget budget,
-                                     std::function<void(std::string_view)> sink) noexcept:
+                                     std::function<void(std::string_view)> sink,
+                                     std::string refusalCost) noexcept:
     _exchange { exchange },
     _mintFrom { std::move(mintFrom) },
     _password { std::move(password) },
     _passwordFor { std::move(passwordFor) },
     _budget { MintBudget(budget) },
-    _sink { std::move(sink) }
+    _sink { std::move(sink) },
+    _refusalCost { std::move(refusalCost) }
 {
 }
 
@@ -144,8 +147,11 @@ PresentedCredential TicketCredentials::Failed(MintFailure failure, std::string_v
     // a remembered failure ends the asking.
     auto const retry = RetryFor(failure);
     if ((!_said || retry == MintRetry::NotAgain) && _sink)
-        _sink(std::format(
-            "{} ({}); {}", ReasonFor(failure), detail, MintConsequenceTable[static_cast<std::size_t>(failure)].consequence));
+        _sink(std::format("{} ({}); {}, and {}",
+                          ReasonFor(failure),
+                          detail,
+                          MintConsequenceTable[static_cast<std::size_t>(failure)].consequence,
+                          _refusalCost));
     _said = true;
     if (retry == MintRetry::NotAgain)
         _remembered = failure;

@@ -1338,9 +1338,13 @@ void ReportVerification(InvocationRecord const& record, Cc::HitComparison const&
 [[nodiscard]] Cc::TicketCredentials& Tickets(Config const& cfg, bool verbose)
 {
     static auto const raw = Cc::MakeTcpExchange(Notice(verbose));
-    static Cc::TicketCredentials tickets { *raw,           Cc::TicketSourceFor(cfg.addr),
-                                           cfg.credential, cfg.addr,
-                                           BudgetOf(cfg),  [verbose](std::string_view text) { Note(verbose, text); } };
+    static Cc::TicketCredentials tickets { *raw,
+                                           Cc::TicketSourceFor(cfg.addr),
+                                           cfg.credential,
+                                           cfg.addr,
+                                           BudgetOf(cfg),
+                                           [verbose](std::string_view text) { Note(verbose, text); },
+                                           std::string { Cc::RefusedCompileRunsLocally } };
     return tickets;
 }
 

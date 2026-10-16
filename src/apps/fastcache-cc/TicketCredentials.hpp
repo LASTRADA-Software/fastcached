@@ -31,8 +31,9 @@ namespace FastCache::Cc
 
 /// What ONE exchange presents, and -- when a ticket was due and could not be minted -- why not.
 ///
-/// The failure travels with the credential of the exchange it belongs to, rather than being
-/// remembered by the minter: a refusal is explained by the mint of THAT exchange and no other, so
+/// The failure travels with the credential of the exchange it belongs to: the minter remembers a
+/// `MintRetry::NotAgain` failure only to stop ASKING, and still hands it to each later exchange as
+/// that exchange's own. So a refusal is explained by what THAT exchange presented and no other, and
 /// a NotAMember answered to a valid ticket can never be recorded as a missing one.
 struct PresentedCredential
 {
@@ -85,26 +86,37 @@ class ICredentialFor
 /// The `asyncio` Linux tail is the interpreter's event loop as much as the kernel's -- the blocking
 /// connect on the same host and load tops out at 1.45 ms -- and Linux refuses a closed port at once,
 /// so there the bound is never paid. Fifty milliseconds is over 60 times the Windows maximum and over
-/// 30 times the blocking Linux one, and it is what a machine with no node pays, ONCE per invocation
-/// (`MintRetry::NotAgain`).
-/// A live node slower than this to ACCEPT costs no build: the exchange goes without a ticket, which
-/// a node-backed cache refuses and the launcher answers by compiling locally.
+/// 30 times the blocking Linux one, and it is about what a machine with no node pays, ONCE per
+/// invocation (`MintRetry::NotAgain`); end to end on Windows the difference measured 59--73 ms.
+///
+/// **What it measures is the KERNEL's handshake, not the node.** A loopback connect completes at
+/// the SYN-ACK, which the kernel answers from the listening socket's backlog whatever the node's
+/// own threads are doing; the node's `accept` comes later and is not waited for. So a RUNNING node
+/// misses the bound only when that backlog is full or the host cannot run the kernel's side of the
+/// handshake in time -- and that is **unmeasured**: a busy local node under a `-j 60` build is
+/// #1668's condition, and none of the figures above was taken under it.
+///
+/// **It fails toward fewer tickets, never a failed build.** A running but saturated node that misses
+/// the bound reads as one that did not answer and is REMEMBERED (`MintRetry::NotAgain`): the rest of
+/// that invocation presents no ticket -- its lease and its compile at a remote worker included -- and
+/// each exchange a node-backed cache or scheduler refuses for it ends in a local compile.
 inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };
+
+/// What a refused exchange costs the launcher, which ends a failed mint's line (`TicketCredentials`).
+inline constexpr std::string_view RefusedCompileRunsLocally = "its compile runs locally";
 
 /// The budget a mint runs under, from the exchange budget the launcher was configured with.
 ///
-/// Only the CONNECT is tightened, to `LoopbackConnectBound` or the configured one if that is
-/// tighter: a node that accepted but is busy may answer slowly, so the round trip keeps the
-/// exchange's own total -- and a node that does not answer in time only means no ticket.
+/// Only the CONNECT is tightened, by `WithConnectAtMost`, to `LoopbackConnectBound` or the
+/// configured one if that is tighter -- and a non-positive one, which leaves the platform default in
+/// place and may be minutes, takes the bound. A node that accepted but is busy may answer slowly, so
+/// the round trip keeps the exchange's own total, and a node that does not answer in time only
+/// means no ticket.
 /// @param exchange The launcher's exchange budget.
 /// @return @p exchange with its connect bounded by loopback.
 [[nodiscard]] constexpr ExchangeBudget MintBudget(ExchangeBudget exchange) noexcept
 {
-    // Non-positive is `DialOptions`' spelling of *the platform default*, which is no bound at all.
-    exchange.connect = exchange.connect > std::chrono::milliseconds::zero()
-                           ? std::min(exchange.connect, LoopbackConnectBound)
-                           : LoopbackConnectBound;
-    return exchange;
+    return WithConnectAtMost(exchange, LoopbackConnectBound);
 }
 
 /// Mints one ticket per call from this machine's node, over `exchange`, which must be the RAW
@@ -147,12 +159,15 @@ class TicketCredentials final: public ICredentialFor
     /// @param budget The launcher's exchange budget; a mint runs under `MintBudget` of it.
     /// @param sink Where a failed mint is said: on the first failure, and again if one is remembered;
     ///        may be empty.
+    /// @param refusalCost What a refused exchange costs THIS caller, ending each line @p sink says:
+    ///        `RefusedCompileRunsLocally` for the launcher, the node's operator verbs their own.
     TicketCredentials(IEndpointExchange& exchange,
                       std::optional<std::string> mintFrom,
                       Credential password,
                       std::string passwordFor,
                       ExchangeBudget budget,
-                      std::function<void(std::string_view)> sink) noexcept;
+                      std::function<void(std::string_view)> sink,
+                      std::string refusalCost) noexcept;
 
     /// @copydoc ICredentialFor::Present
     [[nodiscard]] PresentedCredential Present(std::string_view audience) override;
@@ -162,7 +177,8 @@ class TicketCredentials final: public ICredentialFor
     [[nodiscard]] PresentedCredential PasswordCredential(std::string_view audience);
     [[nodiscard]] PresentedCredential MintedCredential(std::string_view audience);
 
-    /// Say @p failure once per process, and present nothing, naming it.
+    /// Say @p failure (at most twice per process: the first failure, and a remembered one), remember
+    /// it when its row says `MintRetry::NotAgain`, and present nothing, naming it.
     /// @param failure Why.
     /// @param detail What the line adds to the fixed reason: the endpoint, the node's words.
     /// @return No credential, and @p failure.
@@ -188,6 +204,7 @@ class TicketCredentials final: public ICredentialFor
     std::string _passwordFor;
     ExchangeBudget _budget;
     std::function<void(std::string_view)> _sink;
+    std::string _refusalCost;
     bool _said { false };
     /// A failure this process does not ask the node about again (`MintRetry::NotAgain`).
     std::optional<MintFailure> _remembered;

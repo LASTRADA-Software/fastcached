@@ -49,8 +49,13 @@ OperatorCredentials::OperatorCredentials(NodeConfig const& cfg,
     // The password through the one seam that derives a credential from the configuration, and to
     // `--upstream` alone: every other endpoint admits a machine by its ticket or its node proof
     // and checks no password, so presenting it there only hands the upstream's secret away.
-    _tickets { _raw,         OwnNodeTicketSource(cfg), ConfiguredCredential { cfg, nullptr }.Current(),
-               cfg.upstream, Cc::ExchangeBudget {},    std::move(say) }
+    _tickets { _raw,
+               OwnNodeTicketSource(cfg),
+               ConfiguredCredential { cfg, nullptr }.Current(),
+               cfg.upstream,
+               Cc::ExchangeBudget {},
+               std::move(say),
+               std::string { RefusedVerbFails } }
 {
 }
 

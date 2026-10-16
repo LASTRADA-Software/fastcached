@@ -118,13 +118,15 @@ struct Minting
     explicit Minting(std::optional<std::string> mintFrom = std::string { "127.0.0.1:6674" },
                      Credential password = {},
                      std::string passwordFor = {},
-                     ExchangeBudget budget = {}):
+                     ExchangeBudget budget = {},
+                     std::string refusalCost = std::string { RefusedCompileRunsLocally }):
         tickets { raw,
                   std::move(mintFrom),
                   std::move(password),
                   std::move(passwordFor),
                   budget,
-                  [this](std::string_view line) { said.emplace_back(line); } }
+                  [this](std::string_view line) { said.emplace_back(line); },
+                  std::move(refusalCost) }
     {
     }
 
@@ -460,6 +462,27 @@ TEST_CASE("A failed mint says what is known about the exchanges, never that they
     }
 }
 
+TEST_CASE("What a refusal costs is the caller's to say, not the minter's", "[cc][ticket]")
+{
+    // The node's operator verbs print the same lines and have no local compile to fall back on, so the
+    // line ends with what the CALLER says a refused exchange costs it.
+    constexpr std::string_view VerbCost = "the verb reports that refusal";
+    Minting fix {
+        std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {}, std::string { VerbCost }
+    };
+    fix.raw.mint = RecordingExchange::Mint::Unreachable;
+    std::ignore = fix.tickets.Present("office.corp:6674");
+    REQUIRE(fix.said.size() == 1);
+    REQUIRE(fix.said.front().ends_with(std::string { ", and " } + std::string { VerbCost }));
+    CHECK_FALSE(fix.said.front().contains("compile"));
+
+    Minting launcher;
+    launcher.raw.mint = RecordingExchange::Mint::Unreachable;
+    std::ignore = launcher.tickets.Present("office.corp:6674");
+    REQUIRE(launcher.said.size() == 1);
+    CHECK(launcher.said.front().ends_with(RefusedCompileRunsLocally));
+}
+
 TEST_CASE("A failure asked again and a later one remembered are each said", "[cc][ticket]")
 {
     // The first line spoke for one exchange; the remembered failure is news about every later one.
@@ -578,8 +601,15 @@ TEST_CASE("The decorator files, per refused exchange site, whether that exchange
     // ticket, which the process asks again: an unreachable node is remembered, and the valid
     // tickets this case needs later would never be minted.
     fix.raw.mint = RecordingExchange::Mint::Empty;
-    std::ignore = credentialed.Exchange("office.corp:6674", Wire::EncodeFetch("k"), Credential {}, ExchangeBudget {});
+    auto const callers = ExchangeBudget { .connect = std::chrono::milliseconds { 1'500 } };
+    std::ignore = credentialed.Exchange("office.corp:6674", Wire::EncodeFetch("k"), Credential {}, callers);
     CHECK(credentialed.Refusals().MissingAt(fetchAt("office.corp:6674")) == std::optional { MintFailure::NoTicket });
+
+    // The mint's loopback cap is the MINT's: the FETCH itself dials under the caller's own budget.
+    auto const fetch = std::ranges::find(fix.raw.seen, std::to_underlying(Wire::Op::Fetch), &RecordingExchange::Seen::op);
+    REQUIRE(fetch != fix.raw.seen.end());
+    REQUIRE(fetch->budget.connect == callers.connect);
+    CHECK(fetch->budget == callers);
 
     // A later exchange at the same site that is SERVED leaves the filed refusal as it was.
     fix.raw.refuseCommands = false;

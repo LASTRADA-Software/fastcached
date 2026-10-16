@@ -318,18 +318,14 @@ inline constexpr std::chrono::milliseconds HintConnectBudget { 300 };
 
 /// The compile leg's budget, for a dial at the grant's hint.
 ///
-/// Only `connect` differs, and it is capped rather than replaced: an operator who set a
-/// SHORTER connect timeout keeps it. A non-positive connect is `core::net`'s spelling of
-/// *the platform's default* -- which is minutes, not a third of a second -- so it takes
-/// the cap too, or `FASTCACHE_CONNECT_TIMEOUT=0s` would give a stale hint the longest
-/// wait of all.
+/// Only `connect` differs, capped by `WithConnectAtMost`: a shorter configured connect is
+/// kept, and `FASTCACHE_CONNECT_TIMEOUT=0s` takes the cap rather than giving a stale hint the
+/// platform's default -- minutes, not a third of a second.
 /// @param compile The compile leg's budget as it stands for this dial.
 /// @return The same budget, with its connect ceiling at most `HintConnectBudget`.
 [[nodiscard]] constexpr ExchangeBudget AtDialHint(ExchangeBudget compile) noexcept
 {
-    compile.connect = compile.connect > std::chrono::milliseconds::zero() ? std::min(compile.connect, HintConnectBudget)
-                                                                          : HintConnectBudget;
-    return compile;
+    return WithConnectAtMost(compile, HintConnectBudget);
 }
 
 /// The transport failures at the hint that send the client on to the advertised name.

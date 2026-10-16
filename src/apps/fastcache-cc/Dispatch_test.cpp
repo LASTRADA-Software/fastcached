@@ -1437,7 +1437,8 @@ TEST_CASE("Every exchange of a redirected dispatch presents a ticket naming the 
 
     MintsForItsAudience node;
     TicketCredentials tickets {
-        node, std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {}, {}
+        node, std::string { "127.0.0.1:6674" },         Credential {}, std::string {}, ExchangeBudget {},
+        {},   std::string { RefusedCompileRunsLocally }
     };
     CredentialedExchange credentialed { fleet, tickets };
 
@@ -1504,8 +1505,10 @@ TEST_CASE("A compile refused despite a valid ticket is not explained by the rele
         // The lease's and the compile's mints succeed; the release's does not.
         MintsForItsAudience node;
         node.unreachableAfter = 2;
-        TicketCredentials tickets { node, std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {},
-                                    {} };
+        TicketCredentials tickets {
+            node, std::string { "127.0.0.1:6674" },         Credential {}, std::string {}, ExchangeBudget {},
+            {},   std::string { RefusedCompileRunsLocally }
+        };
         CredentialedExchange credentialed { fleet, tickets };
 
         auto const result = Dispatch(credentialed, Request(args));
@@ -1543,7 +1546,8 @@ TEST_CASE("A compile refused because its own mint failed is explained by that mi
     MintsForItsAudience node;
     node.unreachableAfter = 1;
     TicketCredentials tickets {
-        node, std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {}, {}
+        node, std::string { "127.0.0.1:6674" },         Credential {}, std::string {}, ExchangeBudget {},
+        {},   std::string { RefusedCompileRunsLocally }
     };
     CredentialedExchange credentialed { fleet, tickets };
 

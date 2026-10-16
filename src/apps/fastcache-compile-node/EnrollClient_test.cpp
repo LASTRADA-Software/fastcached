@@ -4,6 +4,7 @@
 #include "EnrollmentAbsence.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeKey.hpp"
+#include "OperatorCredentials.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/EnrollRequestSignature.hpp>
@@ -739,7 +740,8 @@ TEST_CASE("An enrollment command presents a ticket for each endpoint it asks, th
     Testing::ScriptedDialer dialer { { behindAuth(RedirectTo("10.0.0.9:7000")), behindAuth(QuietWindow()) } };
     Testing::MintsForItsAudience node;
     Cc::TicketCredentials tickets {
-        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {},
+        {},   std::string { RefusedVerbFails }
     };
 
     auto const listed = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, tickets, dialer);
@@ -772,7 +774,8 @@ TEST_CASE("An enrollment command refused for want of a ticket says why there was
     Testing::MintsForItsAudience node;
     node.unreachableAfter = 0;
     Cc::TicketCredentials tickets {
-        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {},
+        {},   std::string { RefusedVerbFails }
     };
 
     auto const refused = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, tickets, dialer);
