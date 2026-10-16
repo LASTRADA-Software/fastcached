@@ -29,7 +29,7 @@ namespace FastCache::Node
 
 /// What a refused exchange costs an operator's verb, which ends a failed mint's line
 /// (`Cc::TicketCredentials`): unlike the launcher, it has no local fallback.
-inline constexpr std::string_view RefusedVerbFails = "the verb reports that refusal";
+inline constexpr std::string_view RefusedVerbFails = "a refused exchange fails the verb";
 
 /// One exchange over a connection this dialer opens for it.
 ///

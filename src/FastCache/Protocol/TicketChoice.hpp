@@ -86,11 +86,13 @@ enum class CredentialChoice : std::uint8_t
 /// **PRIVATE: persisted and transmitted nowhere**; its row's reason is what the invocation records.
 enum class MintFailure : std::uint8_t
 {
-    NoSource,    ///< Nothing configured names the port this machine's node answers on.
-    Unreachable, ///< This machine's node did not answer: not running, or not on that port.
-    Refused,     ///< This machine's node refused to mint.
-    NoTicket,    ///< This machine's node answered with no ticket in its reply.
-    Last,        ///< Enumerator count.
+    NoSource, ///< Nothing configured names the port this machine's node answers on.
+    /// This machine's node did not answer: not running, not on that port, not completing the
+    /// loopback connect within the bound (a saturated node, #1668), or accepting and then stalling.
+    Unreachable,
+    Refused,  ///< This machine's node refused to mint.
+    NoTicket, ///< This machine's node answered with no ticket in its reply.
+    Last,     ///< Enumerator count.
 };
 
 /// Whether a failed mint is asked again by the next exchange of the same process (#1664).

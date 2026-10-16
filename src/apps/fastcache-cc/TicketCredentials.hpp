@@ -9,7 +9,6 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/TicketChoice.hpp>
 
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -87,7 +86,9 @@ class ICredentialFor
 /// connect on the same host and load tops out at 1.45 ms -- and Linux refuses a closed port at once,
 /// so there the bound is never paid. Fifty milliseconds is over 60 times the Windows maximum and over
 /// 30 times the blocking Linux one, and it is about what a machine with no node pays, ONCE per
-/// invocation (`MintRetry::NotAgain`); end to end on Windows the difference measured 59--73 ms.
+/// invocation (`MintRetry::NotAgain`). End to end on Windows -- a Release build of the launcher, the
+/// MISS and HIT rows against one remote cache, a machine with no node against one whose node mints
+/// -- the difference measured 59--73 ms.
 ///
 /// **What it measures is the KERNEL's handshake, not the node.** A loopback connect completes at
 /// the SYN-ACK, which the kernel answers from the listening socket's backlog whatever the node's
@@ -103,7 +104,7 @@ class ICredentialFor
 inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };
 
 /// What a refused exchange costs the launcher, which ends a failed mint's line (`TicketCredentials`).
-inline constexpr std::string_view RefusedCompileRunsLocally = "its compile runs locally";
+inline constexpr std::string_view RefusedCompileRunsLocally = "a refused exchange's compile runs locally";
 
 /// The budget a mint runs under, from the exchange budget the launcher was configured with.
 ///
@@ -134,8 +135,9 @@ inline constexpr std::string_view RefusedCompileRunsLocally = "its compile runs 
 /// later exchange. The other is the `missing` half of each failed exchange's
 /// `PresentedCredential`, which `RecordedReason` records in place of a refusal it causes. Whether
 /// the exchange IS refused is its audience's decision: a cache with authentication off serves it,
-/// one backed by a node refuses it `NotAMember`, and every refusal ends in a local compile, so a
-/// missing node costs speed, never a build.
+/// one backed by a node refuses it `NotAMember`. What a refusal then costs is the caller's
+/// (`refusalCost`): the launcher compiles locally, so a missing node costs it speed, never a build,
+/// while an operator verb fails.
 ///
 /// **And a failure whose row says `MintRetry::NotAgain` is not asked again by this process**
 /// (#1664): without a node, every exchange used to wait out a connect of its own before it went

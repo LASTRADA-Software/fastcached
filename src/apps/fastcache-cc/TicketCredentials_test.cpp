@@ -465,16 +465,31 @@ TEST_CASE("A failed mint says what is known about the exchanges, never that they
 TEST_CASE("What a refusal costs is the caller's to say, not the minter's", "[cc][ticket]")
 {
     // The node's operator verbs print the same lines and have no local compile to fall back on, so the
-    // line ends with what the CALLER says a refused exchange costs it.
-    constexpr std::string_view VerbCost = "the verb reports that refusal";
-    Minting fix {
-        std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {}, std::string { VerbCost }
+    // line ends with what the CALLER says a refused exchange costs it -- and no row's own text may
+    // mention a compile, or a verb's line would claim one.
+    constexpr std::string_view VerbCost = "a refused exchange fails the verb";
+    struct Row
+    {
+        char const* what;
+        RecordingExchange::Mint mint;
+        std::optional<std::string> mintFrom = std::string { "127.0.0.1:6674" };
     };
-    fix.raw.mint = RecordingExchange::Mint::Unreachable;
-    std::ignore = fix.tickets.Present("office.corp:6674");
-    REQUIRE(fix.said.size() == 1);
-    REQUIRE(fix.said.front().ends_with(std::string { ", and " } + std::string { VerbCost }));
-    CHECK_FALSE(fix.said.front().contains("compile"));
+    auto const rows = std::to_array<Row>({
+        { .what = "no source", .mint = RecordingExchange::Mint::Ticket, .mintFrom = std::nullopt },
+        { .what = "not answering", .mint = RecordingExchange::Mint::Unreachable },
+        { .what = "refusing", .mint = RecordingExchange::Mint::Refused },
+        { .what = "answering with no ticket", .mint = RecordingExchange::Mint::Empty },
+    });
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        Minting fix { row.mintFrom, Credential {}, std::string {}, ExchangeBudget {}, std::string { VerbCost } };
+        fix.raw.mint = row.mint;
+        std::ignore = fix.tickets.Present("office.corp:6674");
+        REQUIRE(fix.said.size() == 1);
+        REQUIRE(fix.said.front().ends_with(std::string { ", and " } + std::string { VerbCost }));
+        CHECK_FALSE(fix.said.front().contains("compile"));
+    }
 
     Minting launcher;
     launcher.raw.mint = RecordingExchange::Mint::Unreachable;

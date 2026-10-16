@@ -4005,8 +4005,10 @@ half from passing. The in-process fleet asserts it from addresses nobody listed
 - **[#1669](https://github.com/LASTRADA-Software/fastcached/issues/1669)** — the node's
   operator verbs (`--cluster-*`, `--enroll-*`) mint their machine ticket through
   `OperatorCredentials` under a fixed 2 s connect (`MintDialTimeout`), outside the 50 ms
-  loopback bound the launcher's mint runs under since #1664 (`LoopbackConnectBound`), so a
-  verb on a machine with no node still waits out the whole dial before it is refused.
+  loopback bound the launcher's mint runs under since #1664 (`LoopbackConnectBound`), so on
+  Windows, which retries the SYN to a closed loopback port for about 2 s, a verb on a machine
+  with no node still waits out the whole dial before it is refused; Linux refuses a closed
+  loopback port at once.
 - **[#1667](https://github.com/LASTRADA-Software/fastcached/issues/1667)** — a worker's
   memory ceilings are options now (`--compile-request-max`, `--compile-inflight-max`) and
   the budget follows the slots, but three parts stay open there: `fastcache-cli node`
