@@ -2,8 +2,10 @@
 #include "RefusedArguments.hpp"
 
 #include <algorithm>
+#include <array>
 #include <format>
 #include <ranges>
+#include <span>
 #include <string_view>
 #include <utility>
 
@@ -55,10 +57,13 @@ void RefusedArgumentsReport::OnJobRefused(Cc::JobError const& error)
 
     // The arguments when the refusal names them; otherwise the refusal's own sentence, which for a
     // half-given path-mapping pair is fixed text of this build's and names the problem.
-    auto const subjects =
-        error.subjects.empty()
-            ? std::vector<Cc::RefusedArgumentName> { { .argument = error.detail, .judgedFor = std::nullopt } }
-            : error.subjects;
+    //
+    // A NAMED fallback and a choice between two spans, as `main.cpp`'s banner makes it. A conditional
+    // over two vectors copied the named list on every refusal, and its braced arm is what GCC 16
+    // reports at -O2 as a dangling pointer to an unnamed temporary at this function's end.
+    std::array const unnamedSubject { Cc::RefusedArgumentName { .argument = error.detail, .judgedFor = std::nullopt } };
+    auto const subjects = error.subjects.empty() ? std::span<Cc::RefusedArgumentName const> { unnamedSubject }
+                                                 : std::span<Cc::RefusedArgumentName const> { error.subjects };
 
     auto const guard = std::scoped_lock { _mutex };
 
