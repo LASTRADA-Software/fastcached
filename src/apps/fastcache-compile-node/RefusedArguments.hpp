@@ -5,11 +5,15 @@
 
 #include <FastCache/Core/Logger.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <WorkerProtocol.hpp>
@@ -41,6 +45,12 @@ namespace FastCache::Node
 /// *fixed* and *still refused* come to look different. A job that started under the old list and
 /// reports after the change is judged by the list now in force.
 ///
+/// **A refusal names EVERY argument its job was refused over (#1681), and is still ONE compile.**
+/// So compiles are counted by the SET of named arguments they carried, and a compile leaves the
+/// count only once every argument of its set is admitted: admitting one of a compile's four
+/// arguments leaves it refused over the other three, and a count that dropped then would say
+/// fewer compiles are refused than are.
+///
 /// Thread-safe: `OnJobRefused` runs on whichever pool thread ran the job.
 class RefusedArgumentsReport final: public Cc::IJobRefusalObserver
 {
@@ -60,7 +70,8 @@ class RefusedArgumentsReport final: public Cc::IJobRefusalObserver
     RefusedArgumentsReport& operator=(RefusedArgumentsReport&&) = delete;
     ~RefusedArgumentsReport() override = default;
 
-    /// A job was refused; only a `RejectedArgument` refusal is this row's business.
+    /// A job was refused; only a `RejectedArgument` refusal is this row's business, and it is one
+    /// compile however many arguments it names.
     /// @param error The refusal, as the runner reported it.
     void OnJobRefused(Cc::JobError const& error) override;
 
@@ -72,23 +83,42 @@ class RefusedArgumentsReport final: public Cc::IJobRefusalObserver
     /// Say the row as it now stands. Caller holds `_mutex`.
     void RaiseLocked();
 
-    /// One named argument and how many jobs it cost.
+    /// One named argument.
     struct Refused
     {
-        std::string argument;   ///< As the refusal named it.
-        std::uint64_t refusals; ///< Jobs refused over it.
+        std::string argument;    ///< As the refusal named it.
+        std::uint64_t firstSeen; ///< Its place among every argument named so far; the row names in this order.
         /// Every driver that refused it, as each refusal said; never empty.
         std::vector<std::optional<Cc::Flavor>> judgedFor;
     };
+
+    /// Which named arguments one refused compile carried: bit `i` is `_slots[i]`.
+    using ArgumentSet = std::uint32_t;
+    static_assert(MaxNamedArguments <= std::numeric_limits<ArgumentSet>::digits,
+                  "every named argument needs a bit of its own in a compile's set");
+
+    /// The lowest slot naming nothing, if one is left. Caller holds `_mutex`.
+    /// @return Its index.
+    [[nodiscard]] std::optional<std::size_t> FreeSlotLocked() const;
+
+    /// The slot already naming @p argument, if one does. Caller holds `_mutex`.
+    /// @param argument An argument as a refusal named it.
+    /// @return Its slot.
+    [[nodiscard]] std::optional<std::size_t> SlotOfLocked(std::string_view argument) const;
 
     NodeConditions& _conditions;
     ILogger& _logger;
 
     std::mutex _mutex;
     std::vector<std::string> _allowed; ///< The operator's list in force. Guarded by `_mutex`.
-    std::vector<Refused> _named;       ///< Distinct arguments, first seen first. Guarded by `_mutex`.
-    std::uint64_t _unnamed {};         ///< Refusals over arguments past `MaxNamedArguments`. Guarded.
-    bool _saidOverflow {};             ///< Whether the past-the-cap line was written. Guarded.
+    /// The named arguments; a slot frees when the list admits its argument. Guarded by `_mutex`.
+    std::array<std::optional<Refused>, MaxNamedArguments> _slots;
+    /// Refused compiles by the set of named arguments they carried. Guarded by `_mutex`.
+    std::map<ArgumentSet, std::uint64_t> _compiles;
+    /// Compiles refused over at least one argument past `MaxNamedArguments`. Guarded by `_mutex`.
+    std::uint64_t _unnamed {};
+    std::uint64_t _namesGiven {}; ///< Arguments named so far; orders the named. Guarded by `_mutex`.
+    bool _saidOverflow {};        ///< Whether the past-the-cap line was written. Guarded by `_mutex`.
 };
 
 } // namespace FastCache::Node

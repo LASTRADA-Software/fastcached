@@ -4,6 +4,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -80,6 +81,53 @@ enum class CredentialChoice : std::uint8_t
     auto const& [host, port] = *endpoint;
     return FormatHostPort(IsLoopbackHost(host) ? std::string_view { host } : LoopbackLiteral, port);
 }
+
+/// Ceiling on CONNECTING to this machine's node for a mint (#1664), whoever mints.
+///
+/// A mint source is a loopback literal by construction (`TicketSourceFor`), so it is bounded by
+/// what loopback costs and not by a LAN exchange's connect budget. That matters on Windows, where a
+/// connect to a CLOSED loopback port is not refused at once: the stack retries the SYN and answers
+/// `WSAECONNREFUSED` after ~2 s, so a machine with no node used to wait out the whole exchange
+/// budget (a second) on every mint.
+///
+/// **Every mint path dials under it, which is why it lives here and not beside the launcher's**
+/// (#1669): the launcher (`MintBudget`), the node's operator verbs (`OperatorCredentials`, whose
+/// exchange dials with the budget's connect) and `fastcache-cli` (`MintTicket`, over its own
+/// `--connect-timeout`), each capped through `ConnectAtMost`. The operator verbs used to dial under
+/// a fixed 2 s of their own, which on Windows is the whole refusal: a verb on a machine with no
+/// node waited it out before going anywhere.
+///
+/// **The figures it was chosen from, and their conditions** -- 32-thread hosts, each sampled idle and
+/// under 64 CPU-bound processes, 3,000 connects per row (closed port on Windows: 5), timed in Python
+/// around the connect alone, the worse of idle and loaded shown:
+///
+/// | host | instrument | live listener, max (p99.9) | closed port |
+/// |---|---|---|---|
+/// | Windows 11 26200 | `asyncio` Proactor (IOCP `ConnectEx`) | 0.76 ms (0.60 ms) | 2,016--2,042 ms, refused |
+/// | Windows 11 26200 | blocking `socket.connect` | 0.58 ms (0.58 ms) | 2,031--2,056 ms, refused |
+/// | WSL2 Ubuntu 24.04, kernel 6.6 | `asyncio` selector (`epoll`) | 13.5 ms (7.2 ms) | 0.15--0.47 ms, refused |
+/// | WSL2 Ubuntu 24.04, kernel 6.6 | blocking `socket.connect` | 1.45 ms (0.44 ms) | 0.14 ms max, refused |
+///
+/// The `asyncio` Linux tail is the interpreter's event loop as much as the kernel's -- the blocking
+/// connect on the same host and load tops out at 1.45 ms -- and Linux refuses a closed port at once,
+/// so there the bound is never paid. Fifty milliseconds is over 60 times the Windows maximum and over
+/// 30 times the blocking Linux one, and it is about what a machine with no node pays, ONCE per
+/// invocation (`MintRetry::NotAgain`). End to end on Windows -- a Release build of the launcher, the
+/// MISS and HIT rows against one remote cache, a machine with no node against one whose node mints
+/// -- the difference measured 59--73 ms.
+///
+/// **What it measures is the KERNEL's handshake, not the node.** A loopback connect completes at
+/// the SYN-ACK, which the kernel answers from the listening socket's backlog whatever the node's
+/// own threads are doing; the node's `accept` comes later and is not waited for. So a RUNNING node
+/// misses the bound only when that backlog is full or the host cannot run the kernel's side of the
+/// handshake in time -- and that is **unmeasured**: a busy local node under a `-j 60` build is
+/// #1668's condition, and none of the figures above was taken under it.
+///
+/// **It fails toward fewer tickets, never a failed build.** A running but saturated node that misses
+/// the bound reads as one that did not answer and is REMEMBERED (`MintRetry::NotAgain`): the rest of
+/// that invocation presents no ticket -- its lease and its compile at a remote worker included -- and
+/// each exchange a node-backed cache or scheduler refuses for it ends in a local compile.
+inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };
 
 /// Why no ticket was presented.
 ///

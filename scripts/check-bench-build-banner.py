@@ -33,9 +33,9 @@ This binary holds the banner's own unit cases too (`[buildbanner]`, run by
 A failure there is that test's finding: reported here as well it would make one defect two
 reds naming neither, so those cases' verdict is left to it and the stream rules are judged
 anyway. A failure anywhere ELSE stops this check, because the streams it reads are the
-streams those cases write. The exit status is never the verdict either way -- Catch2 spends
-it on the failed-assertion count -- so completeness is read from the document parsing at
-all, which means reaching its own closing tag.
+streams those cases write. The exit status is never the verdict either way -- a short run can
+exit 0 (#1211) -- so completeness is read from the document parsing at all, which means
+reaching its own closing tag.
 
 ## The instrument is proved before the subject is read
 
@@ -195,10 +195,10 @@ def check_run(binary: Path) -> list[str]:
 
     # --- The document is still a document, which is also the completeness reading ---------
     #
-    # Parsed FIRST, and the exit status is never the verdict. Catch2 spends its exit code on
-    # the failed-assertion count, so a number there says nothing on its own -- while a
-    # document that parses has reached its own closing tag, which is what says the run
-    # finished. A crash therefore shows up here, as a document that does not parse.
+    # Parsed FIRST, and the exit status is never the verdict. A number there says nothing on
+    # its own -- a short run can exit 0 (#1211) -- while a document that parses has reached
+    # its own closing tag, which is what says the run finished. A crash therefore shows up
+    # here, as a document that does not parse.
     try:
         root = ElementTree.fromstring(out)
     except ElementTree.ParseError as error:

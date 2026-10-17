@@ -64,9 +64,10 @@ the next regression, while every signal the author sees says the test is bad.
    clause 2 -- the clause the ticket calls the whole ticket. A rule whose
    violation nothing can observe is decoration.
 
-3. **Verdict read from the exit status.** Catch2 spends its exit code on the
-   failed-assertion COUNT, so a *caught* mutation scores as "no verdict" and 4
-   failures collide with `SKIP_RETURN_CODE 4` (#1128/#1152). The verdict here comes
+3. **Verdict read from the exit status.** On Catch2 3.6.0 the exit code was the
+   failed-assertion COUNT, so 4 failures collided with `SKIP_RETURN_CODE 4` (#1128);
+   since 3.7.1 any failure exits 42, which still says nothing about WHICH cases
+   failed -- and a mutation is caught by naming them. The verdict here comes
    from a named FAIL SET parsed out of the OUTPUT. The exit status is recorded as
    evidence and never consulted for the verdict, which makes this structurally
    immune rather than defensively coded.

@@ -2270,7 +2270,11 @@ namespace
             priorities.push_back(keep.has_value() ? KeepPriorityTable[static_cast<std::size_t>(*keep)].priority
                                                   : Priority::Normal);
         }
-        if (std::ranges::none_of(priorities, [](Priority priority) { return priority == Priority::Essential; }))
+        // A table with no columns returned above, so `priorities` is never empty here -- but that
+        // check is forty lines and several opaque calls away, and GCC 16 cannot carry it to
+        // `front()`. Stated where the access is, it needs no carrying.
+        if (!priorities.empty()
+            && std::ranges::none_of(priorities, [](Priority priority) { return priority == Priority::Essential; }))
             priorities.front() = Priority::Essential;
 
         auto const prefixOf = [](std::size_t index) {

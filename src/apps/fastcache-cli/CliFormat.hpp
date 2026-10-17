@@ -69,9 +69,13 @@ static_assert(RowsInEnumeratorOrder(FormatTable, &FormatSpec::format),
               "FormatTable must hold one row per OutputFormat, in enumerator order");
 
 /// The row describing @p format.
-/// @param format The format.
-/// @return Its row; never null for a value below `Last`.
-[[nodiscard]] FormatSpec const* DescriptorOf(OutputFormat format) noexcept;
+///
+/// A reference, as every enumerator-indexed lookup here is: a format is parsed into a row
+/// that exists, and a pointer whose null no caller could act on was dereferenced unchecked at
+/// every call -- which GCC 16 reports as a potential null dereference once it inlines this.
+/// @param format The format; any enumerator below `Last`.
+/// @return Its row.
+[[nodiscard]] FormatSpec const& FormatSpecOf(OutputFormat format) noexcept;
 
 /// The format @p name spells.
 /// @param name The `--format=` value as typed.

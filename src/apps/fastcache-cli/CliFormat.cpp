@@ -144,7 +144,7 @@ namespace
     [[nodiscard]] std::string RenderHumanRecord(Value const& value, RenderOptions const& options)
     {
         auto const& palette = PaletteFor(options.color);
-        auto const absent = AbsentTextFor(options, *DescriptorOf(options.format));
+        auto const absent = AbsentTextFor(options, FormatSpecOf(options.format));
 
         std::size_t nameColumn = 0;
         for (auto const& field: value.fields)
@@ -170,7 +170,7 @@ namespace
     [[nodiscard]] std::string RenderHumanTable(Value const& value, RenderOptions const& options)
     {
         auto const& palette = PaletteFor(options.color);
-        auto const absent = AbsentTextFor(options, *DescriptorOf(options.format));
+        auto const absent = AbsentTextFor(options, FormatSpecOf(options.format));
         auto const columnCount = value.columns.size();
 
         // The scale of each column, asked of the leader's own column tables BY COLUMN NAME --
@@ -300,7 +300,7 @@ namespace
     /// @return The rendered text.
     [[nodiscard]] std::string RenderHuman(Value const& value, RenderOptions const& options)
     {
-        auto const absent = AbsentTextFor(options, *DescriptorOf(options.format));
+        auto const absent = AbsentTextFor(options, FormatSpecOf(options.format));
         switch (value.shape)
         {
             case Shape::Empty:
@@ -389,7 +389,7 @@ namespace
     /// @return The rendered text.
     [[nodiscard]] std::string RenderKv(Value const& value, RenderOptions const& options)
     {
-        auto const absent = AbsentTextFor(options, *DescriptorOf(options.format));
+        auto const absent = AbsentTextFor(options, FormatSpecOf(options.format));
         std::string out;
         switch (value.shape)
         {
@@ -431,7 +431,7 @@ namespace
                                               Separator separator,
                                               std::string (*quote)(std::string_view))
     {
-        auto const absent = AbsentTextFor(options, *DescriptorOf(options.format));
+        auto const absent = AbsentTextFor(options, FormatSpecOf(options.format));
 
         auto const line = [&](std::span<std::string const> cells) {
             std::string out;
@@ -487,12 +487,9 @@ namespace
 
 } // namespace
 
-FormatSpec const* DescriptorOf(OutputFormat format) noexcept
+FormatSpec const& FormatSpecOf(OutputFormat format) noexcept
 {
-    auto const index = static_cast<std::size_t>(format);
-    if (index >= FormatTable.size())
-        return nullptr;
-    return &FormatTable[index];
+    return FormatTable[static_cast<std::size_t>(format)];
 }
 
 std::optional<OutputFormat> FormatFromName(std::string_view name) noexcept

@@ -64,18 +64,17 @@ include(Catch)
 # added without the property would reopen the hole by omission, exactly as the fifth
 # did.
 #
-# **And it is KNOWN BROKEN in the other direction.** `SKIP_RETURN_CODE 4` closed that
-# false RED and opened a false GREEN (#1128): Catch2's exit code IS its failed-assertion
-# count, so a case failing exactly four assertions is scored *skipped*, and so is a case
-# that skips one `SECTION` and fails four assertions in another. The repair for one
-# state collapse was the site of the next, inside the mechanism chosen to prevent state
-# collapse.
+# **On Catch2 3.6.0 it was broken in the other direction.** `SKIP_RETURN_CODE 4` closed
+# that false RED and opened a false GREEN (#1128): the exit code was then the
+# failed-assertion count, so a case failing exactly four assertions was scored
+# *skipped*, and so was a case that skipped one `SECTION` and failed four assertions in
+# another. The repair for one state collapse was the site of the next.
 #
-# It stays because all three alternative channels were measured and every one is worse.
-# The argument is at the top of the top-level CMakeLists -- one place, pointed at rather
-# than restated, because this comment exists five times over -- and the fix is a change
-# of MECHANISM, tracked as #1152. `catch-skip-exit-collision` below asserts the premises
-# that argument rests on, so it cannot rot into a false rule.
+# Catch2 3.7.1 standardised its exit codes -- every case skipped exits 4, any failure 42
+# whatever the count -- and under the Catch2 the top-level CMakeLists pins EXACTLY the
+# property is exact. The argument is there, one place pointed at rather than restated,
+# because this comment exists five times over; `catch-skip-exit-contract` below runs the
+# shapes against the linked Catch2, so the contract cannot rot into a false rule.
 catch_discover_tests(FastCacheTest PROPERTIES SKIP_RETURN_CODE 4 ENVIRONMENT_MODIFICATION "${FASTCACHED_ERROR_DIALOG_ENVIRONMENT}")
 
 # ---------------------------------------------------------------------------
@@ -725,7 +724,7 @@ set_tests_properties("glob-traversals-selftest" PROPERTIES
 
 # ---------------------------------------------------------------------------
 # Every `catch_discover_tests` registration tells ctest what a SKIP looks like, and
-# tells it by matching the case's OUTPUT.
+# tells it by the case's EXIT CODE, `SKIP_RETURN_CODE 4`.
 #
 # A Catch2 case that calls `SKIP(...)` exits 4, and a registration that says nothing
 # leaves ctest scoring that as a FAILURE -- so the binary prints `1 skipped` and ctest
@@ -735,11 +734,11 @@ set_tests_properties("glob-traversals-selftest" PROPERTIES
 # directory away -- so the mechanism was known and simply never carried to the
 # registrations that discover thousands of cases.
 #
-# **But NOT by exit code, which is #1128.** `SKIP_RETURN_CODE 4` was the first repair
-# and it scored a case failing exactly four assertions as *skipped*. The script-driven
-# `77` registrations below are unaffected and stay: a shell script chooses its own exit
-# code, and a Catch2 binary does not -- it spends the status on its failed-assertion
-# count. That difference is the whole reason one mechanism suits one and not the other.
+# **And 4, not 77.** The script-driven `77` registrations below stay: a shell script
+# chooses its own exit code, and a Catch2 binary does not -- it exits 4 when every case
+# skipped and 42 on any failure. On 3.6.0 it spent the status on its failed-assertion
+# count instead, which made 4 a collision with a four-failure case (#1128); the exact
+# Catch2 pin and `catch-skip-exit-contract` are what keep it from being one again.
 #
 # A comment is not the fix and a check is: a SIXTH test binary would reopen this by
 # omission exactly as the fifth did. Same argument as `script-check-signals`, and the
@@ -764,17 +763,13 @@ set_tests_properties("catch-skip-return-code" PROPERTIES
 #
 # Synthetic trees, one verdict asserted each -- the script prints how many it drove,
 # derived, because a total written beside a list of cases is a second source of truth
-# and this one had already drifted. A correct registration passes; a bare one fails and
-# NAMES the file; `SKIP_RETURN_CODE 4` fails, and so does a registration carrying it
-# ALONGSIDE the regex, since ctest honours it independently and the cautious half-step
-# is a no-op that reads as progress; a registration spelling the pattern out instead of
-# expanding the shared variable fails; the property on a continuation line passes; a
-# tree with no registrations reports a broken scan rather than a clean tree; a
-# registration inside a build tree is ignored -- the first version of the check walked
-# into `_deps/catch2-src` and reported vendored code nobody here can edit; the git mode
-# CI actually takes is exercised in both directions; and a shared pattern that is
-# missing or defined EMPTY fails, since an empty regex matches every line and would
-# score every failing case as skipped while every registration still read correctly.
+# and this one had already drifted. A registration carrying `SKIP_RETURN_CODE 4` passes;
+# a bare one fails and NAMES the file; `SKIP_RETURN_CODE 77` fails, since a Catch2 binary
+# never exits 77; the property on a continuation line passes; a tree with no
+# registrations reports a broken scan rather than a clean tree; a registration inside a
+# build tree is ignored -- the first version of the check walked into `_deps/catch2-src`
+# and reported vendored code nobody here can edit; and the git mode CI actually takes is
+# exercised in both directions. The script's header names every case.
 #
 # Per case rather than `WILL_FAIL`, because a check that stopped refusing and one
 # that refuses everything are opposite defects a bare inversion reports identically.
@@ -792,35 +787,31 @@ set_tests_properties("catch-skip-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
-# The reader for #1128's NEGATIVE result.
+# The reader for the exit contract `SKIP_RETURN_CODE 4` above rests on.
 #
-# `SKIP_RETURN_CODE 4` above is a defect we could not close, not a decision: Catch2's
-# exit code IS its failed-assertion count, so a case failing exactly four assertions is
-# scored *skipped*. Three channels were measured and all three are closed -- the exit
-# status is fully occupied, the output is shared with text the subject controls and
-# cannot be anchored through the Windows command line, and `FAIL_REGULAR_EXPRESSION`
-# does not outrank `SKIP_RETURN_CODE`. The argument is in the top-level CMakeLists and
-# in `.agent/rules/testing.md`.
-#
-# **A record saying something cannot be done instructs the next session not to try**,
-# which this project's rulebook names as the expensive shape. So the conclusion gets a
-# READER: this asserts the FACTS the argument rests on rather than the conclusion, and
-# a red here means a premise has MOVED and the ticket should be reopened.
+# The property is exact only because Catch2, since 3.7.1, exits 4 when every case
+# skipped and one fixed failure code on ANY failure, whatever the count. On 3.6.0 the
+# exit code was the failed-assertion count and a case failing exactly four assertions
+# was scored *skipped* (#1128). The top-level CMakeLists pins Catch2 EXACTLY, and this
+# runs every shape of the canary against the Catch2 actually linked: every skip-only
+# shape must exit 4, every failing one -- one failure, four, three hundred, a skip
+# beside failures -- one value that is neither 0 nor 4. A red is a discovery about the
+# linked Catch2, not a defect in the tree.
 #
 # The canary is deliberately NOT registered with `catch_discover_tests`: several of its
-# cases fail on purpose, and it carries the shapes any replacement mechanism must
-# survive -- padded summaries at two widths, a skip in a later SECTION, and a failing
-# case whose own text echoes a summary line.
+# cases fail on purpose. It also `static_assert`s the 4 against Catch2's own
+# `AllTestsSkippedExitCode`, so the literal every registration carries is pinned to the
+# API at compile time.
 add_executable(catch-skip-canary CatchSkipCanary.cpp)
 target_link_libraries(catch-skip-canary PRIVATE Catch2::Catch2WithMain)
 
 add_test(
-    NAME "catch-skip-exit-collision"
+    NAME "catch-skip-exit-contract"
     COMMAND ${CMAKE_COMMAND}
         "-DCANARY=$<TARGET_FILE:catch-skip-canary>"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-catch-skip-exit-collision.cmake"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-catch-skip-exit-contract.cmake"
 )
-set_tests_properties("catch-skip-exit-collision" PROPERTIES
+set_tests_properties("catch-skip-exit-contract" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 120
@@ -2085,9 +2076,9 @@ set_tests_properties("secure-random-cross-process" PROPERTIES
 #
 # **No `SKIP_RETURN_CODE` here, and its absence is load-bearing.** It reads as a
 # redundant observation until #1128: a status this registration does not claim is
-# a status CTest is free to reinterpret. Catch2's exit code IS its failed-assertion
-# count, so a case failing exactly four assertions exits 4, collides with the
-# `SKIP_RETURN_CODE 4` the Catch2 registrations must carry, and ctest reports
+# a status CTest is free to reinterpret. On Catch2 3.6.0 the exit code was the
+# failed-assertion count, so a case failing exactly four assertions exited 4, collided
+# with the `SKIP_RETURN_CODE 4` the Catch2 registrations must carry, and ctest reported
 # `100% tests passed` over a red binary. This check exits 1 on a refusal, claims
 # no skip code, and has no skip path to want one -- so its refusal cannot be
 # silently rescored into a skip. Verified through the real harness rather than
@@ -5547,7 +5538,8 @@ else()
     # That collapse is ctest's vocabulary and not a choice -- a test is passed,
     # failed or skipped, and `SKIP_RETURN_CODE` takes one value -- so the two are
     # told apart by the OUTPUT, which names one `INCONCLUSIVE:` and the other a
-    # missing prerequisite. Same fully-occupied-channel problem as #1152.
+    # missing prerequisite. One status cannot carry two meanings, which is the limit
+    # #1128 ran into on the Catch2 side.
     set_tests_properties("fetch-transfer-bound" PROPERTIES
         LABELS "hygiene"
         SKIP_RETURN_CODE 77
@@ -6712,7 +6704,7 @@ endif()
 #
 # The two halves land together and neither works alone. A script returning 77 with no
 # `SKIP_RETURN_CODE` here is scored a FAILURE -- a false red, and whoever meets it
-# deletes the 77 rather than suspecting the registration (#1152's shape). A
+# deletes the 77 rather than suspecting the registration (#499's shape). A
 # `SKIP_RETURN_CODE` here with a script that still returns 0 changes nothing at all.
 #
 # A failure recorded BEFORE the skip point still fails: the arms return 1 in that
@@ -6827,9 +6819,9 @@ endif()
 # `SKIP_RETURN_CODE 77` is load-bearing. A host with no such driver cannot answer
 # the question, and that is a third outcome beside pass and fail -- without this
 # property ctest scores the skip as a FAILURE, which is #499's false red. It is the
-# script-driven 77 convention and not the Catch2 `SKIP_RETURN_CODE 4` collision
-# (#1128): a shell script chooses its own exit code, where a Catch2 binary spends
-# its status on the failed-assertion count.
+# script-driven 77 convention and not the Catch2 `SKIP_RETURN_CODE 4`: a shell
+# script chooses its own exit code, where a Catch2 binary exits with Catch2's fixed
+# codes -- 4 when every case skipped, 42 on any failure.
 #
 # TIMEOUT 300 against a measured 3.0 s (WSL2 Ubuntu, 8 clang drivers and 6 GCC scope
 # controls) and 3.4 s (Git Bash, 3 drivers), both 2026-09-11. The margin is for a
@@ -6975,8 +6967,8 @@ set_tests_properties("macro-bare-parameters-selftest" PROPERTIES
 #
 # Two of its ten cases are the reason the table has three inputs rather than one:
 # `139 failing assertions with a complete report` and `killed by SIGSEGV with a
-# truncated one` carry the SAME exit status, because Catch2 spends its status on
-# the failure count, and only completeness tells them apart.
+# truncated one` carry the SAME exit status -- as they did on Catch2 3.6.0, which
+# spent its status on the failure count -- and only completeness tells them apart.
 #
 # `if(NOT WIN32)` for the reason `e2e-helpers-selftest` carries it: the script is
 # POSIX, and a Windows counterpart would be a translation rather than new
@@ -8097,9 +8089,9 @@ if(TARGET FastCacheTest)
         # `PASS_REGULAR_EXPRESSION` replaces the exit status as the verdict, which is
         # why the pattern is anchored on `All tests passed`: Catch2 prints that only
         # when every selected case passed, and a run that crashed before printing
-        # anything matches nothing. No `SKIP_RETURN_CODE` here -- Catch2's exit code
-        # is its failed-assertion count clamped at 255 (#1152), and the pattern has
-        # already replaced the status.
+        # anything matches nothing. No `SKIP_RETURN_CODE` here: every selected case
+        # must PASS for the count to be the count, so a run that skipped is a failure
+        # of this check, never a state to report.
         PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 260 test cases[)]"
         LABELS "hygiene"
         TIMEOUT 300

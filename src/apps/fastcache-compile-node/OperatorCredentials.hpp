@@ -4,7 +4,6 @@
 #include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
 
-#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <optional>
@@ -15,7 +14,6 @@
 #include <CacheProtocol.hpp>
 #include <Dispatch.hpp>
 #include <TicketCredentials.hpp>
-#include <core/net/IConnector.hpp>
 
 namespace FastCache::Node
 {
@@ -35,16 +33,19 @@ inline constexpr std::string_view RefusedVerbFails = "a refused exchange fails t
 ///
 /// `Cc::TicketCredentials` mints over a `Cc::IEndpointExchange`, and a one-shot verb runs on the
 /// process main thread with no reactor to run `Cc::MakeTcpExchange` on. So this dials through the
-/// seam every other one-shot dial takes and exchanges with `Cc::ExchangeFramed`. The bound is the
-/// dial's own `options` and the dialer's per-call ceiling, not `ExchangeBudget`, which only a
-/// reactor can enforce.
+/// seam every other one-shot dial takes and exchanges with `Cc::ExchangeFramed`.
+///
+/// **The CONNECT is the budget's**, because a dial enforces its own connect ceiling: that is what
+/// lets `Cc::MintBudget` reach an operator verb's mint, which dialled under a fixed 2 s of its own
+/// until #1669 -- on Windows the whole wait for a closed loopback port. The budget's total and idle
+/// bounds need a reactor, which a one-shot verb does not run, so the dialer's per-call ceiling stands
+/// in for them.
 class DialedExchange final: public Cc::IEndpointExchange
 {
   public:
     /// @param dialer How each endpoint is reached. Borrowed.
     /// @param notice Where "your credential went unchecked" is reported. Borrowed.
-    /// @param options Ceiling on each dial.
-    DialedExchange(IEndpointDialer& dialer, Cc::CredentialNotice& notice, core::net::DialOptions options) noexcept;
+    DialedExchange(IEndpointDialer& dialer, Cc::CredentialNotice& notice) noexcept;
 
     /// @copydoc Cc::IEndpointExchange::Exchange
     [[nodiscard]] Cc::CacheOutcome Exchange(std::string_view hostPort,
@@ -55,7 +56,6 @@ class DialedExchange final: public Cc::IEndpointExchange
   private:
     IEndpointDialer& _dialer;
     Cc::CredentialNotice& _notice;
-    core::net::DialOptions _options;
 };
 
 /// Where this machine's own node answers `MINT-TICKET`, as a verb this process runs and exits sees
@@ -67,9 +67,6 @@ class DialedExchange final: public Cc::IEndpointExchange
 /// @param cfg The configuration the verb was invoked with.
 /// @return `host:port` to mint from, or nullopt when @p cfg serves no node port.
 [[nodiscard]] std::optional<std::string> OwnNodeTicketSource(NodeConfig const& cfg);
-
-/// How long a mint may take to connect: it is a loopback round trip.
-inline constexpr std::chrono::milliseconds MintDialTimeout { 2'000 };
 
 /// What an operator's one-shot verb presents to each endpoint it dials.
 ///

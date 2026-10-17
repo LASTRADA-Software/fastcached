@@ -1399,8 +1399,8 @@ TEST_CASE("FileTrust: the service's own entry lets it create owner-only state in
     CHECK(FastCache::Testing::ApplyAccessList(administratorsOnly, L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)"));
 
     CHECK(controlRefused);
-    // REQUIRE: the key is what the node failed on, and one failed assertion keeps a regression's
-    // exit code clear of the 4 ctest reads as a skip (#1152) -- this case fails four otherwise.
+    // REQUIRE: the key is what the node failed on, and stopping there makes a regression one
+    // failure rather than four -- which on Catch2 3.6.0 exited 4, read as a skip (#1128).
     INFO("node-key: " << keyError.message());
     REQUIRE_FALSE(keyError);
     INFO("cluster: " << directoryError.message());

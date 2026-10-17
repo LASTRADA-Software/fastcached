@@ -2262,11 +2262,11 @@ TEST_CASE("An admission refused before a command exists carries no receipt", "[d
     //
     // These two arms return before `Offer` is reached, so there is no command for a
     // receipt to have been taken from. Their sibling case covers the arms that get
-    // further, and the SPLIT is deliberate rather than tidy: a Catch2 binary spends
-    // its exit status on its failed-assertion count, and at exactly FOUR that collides
-    // with `SKIP_RETURN_CODE 4` and is scored SKIPPED rather than failed (#1128,
-    // mechanism open as #1152). Four arms in one case is four assertions one defect
-    // can fail together, which is the single total this harness cannot report.
+    // further, and the SPLIT is deliberate rather than tidy: on Catch2 3.6.0 a binary
+    // spent its exit status on its failed-assertion count, and at exactly FOUR that
+    // collided with `SKIP_RETURN_CODE 4` and was scored SKIPPED rather than failed
+    // (#1128). Four arms in one case is four assertions one defect can fail together,
+    // which was the single total that harness could not report.
     SECTION("a caller the fleet has not admitted")
     {
         Admitting fleet;

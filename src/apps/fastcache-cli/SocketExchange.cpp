@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "SocketExchange.hpp"
 
+#include <FastCache/Core/ConnectCeiling.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Protocol/TicketChoice.hpp>
@@ -132,9 +133,15 @@ namespace
     };
 
     /// Mint a ticket naming @p audience from this machine's node.
+    ///
+    /// Connecting to it is capped at `Cc::LoopbackConnectBound`, whatever `--connect-timeout` says
+    /// (#1669): the source is a loopback literal (`Cc::TicketSourceFor`), and on Windows a connect to
+    /// a closed loopback port is refused only after ~2 s, so a machine with no node would otherwise
+    /// wait that out on every exchange with another machine. The reads keep `timeouts.io`: a node
+    /// that accepted may still be busy.
     /// @param audience The endpoint the ticket is for, as `EndpointText` spells it.
     /// @param mintFrom `--mint-from`, or unset for @p audience's port.
-    /// @param timeouts How long.
+    /// @param timeouts How long, as configured; the connect is capped here.
     /// @param dial How the node is reached.
     /// @return The ticket, held where it is wiped on release, or why there is none.
     [[nodiscard]] std::expected<SecureString, MintRefusal> MintTicket(std::string_view audience,
@@ -153,7 +160,9 @@ namespace
 
         // Presenting nothing: the mint is admitted as this machine, by the connection, and a loopback
         // audience is one `ChooseCredential` answers with nothing -- so this cannot recurse.
-        auto minter = NodeExchange::Open(at, timeouts, NodeCredentials {}, dial);
+        auto const mintTimeouts =
+            DialTimeouts { .connect = ConnectAtMost(timeouts.connect, Cc::LoopbackConnectBound), .io = timeouts.io };
+        auto minter = NodeExchange::Open(at, mintTimeouts, NodeCredentials {}, dial);
         if (!minter.has_value())
             return std::unexpected(MintRefusal { .failure = Cc::MintFailure::Unreachable,
                                                  .detail = std::format("at {}: {}", *source, minter.error().detail) });

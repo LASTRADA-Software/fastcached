@@ -31,13 +31,14 @@
 #
 # ## Neither input is sufficient alone, and the reason is arithmetic
 #
-# **Catch2 spends its exit status on the failure count**, clamped at 255. So a
+# **On Catch2 3.6.0 the exit status was the failure count**, clamped at 255. So a
 # run killed by SIGSEGV (128 + 11 = 139) and a run with 139 failing assertions
-# produce the SAME status, and no reading of the status alone separates them.
-# Completeness does: a killed run's report stops mid-document. And #1211 measured
-# the other direction too -- exits 0 / 139 / 0 / 0 / 139 / 139 across six runs
-# whose element counts were 551 / 507 / 551 / 551 / 518 / 518, so a SHORT run
-# exited 0 at least once.
+# produced the SAME status, and no reading of the status alone separated them.
+# Catch2 3.7.1 fixed the failure code at 42, which separates those two and nothing
+# else: #1211 measured the other direction too -- exits 0 / 139 / 0 / 0 / 139 / 139
+# across six runs whose element counts were 551 / 507 / 551 / 551 / 518 / 518, so
+# a SHORT run exited 0 at least once. Completeness does: a killed run's report
+# stops mid-document.
 #
 # Completeness is therefore asked FIRST, and the status only refines it.
 #

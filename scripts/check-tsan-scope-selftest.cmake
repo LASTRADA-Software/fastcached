@@ -434,8 +434,25 @@ FastCachedSelftestCase("a-file-row-that-does-not-exist" refuse "names neither a 
 # declaration; these two are the directions that must not be silent. The
 # bumped one is what the whole tripwire exists to do, and the missing one is
 # the reading it must never take as "no, labels are not available".
-file(READ "${tree}/CMakeLists.txt" bumped)
-string(REPLACE "VERSION ${FastCachedCatch2TagLabelWatermark}" "VERSION 3.9.0" bumped "${bumped}")
+#
+# The bumped version is DERIVED from the watermark, one patch past it. It was the literal 3.9.0,
+# which stopped being a bump the day the watermark was raised to 3.16.1: the case then staged a
+# DOWNGRADE, the check rightly said nothing, and the arm that exists to fire never could again.
+file(READ "${tree}/CMakeLists.txt" declared)
+if(NOT FastCachedCatch2TagLabelWatermark MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    message(FATAL_ERROR
+        "check-tsan-scope-selftest: the watermark '${FastCachedCatch2TagLabelWatermark}' is not x.y.z, "
+        "so no version past it can be derived to stage a bump with")
+endif()
+math(EXPR pastPatch "${CMAKE_MATCH_3} + 1")
+set(pastWatermark "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${pastPatch}")
+string(REPLACE "VERSION ${FastCachedCatch2TagLabelWatermark}" "VERSION ${pastWatermark}" bumped "${declared}")
+if(bumped STREQUAL declared)
+    message(FATAL_ERROR
+        "check-tsan-scope-selftest: the staged CMakeLists.txt does not declare Catch2 at the watermark "
+        "${FastCachedCatch2TagLabelWatermark}, so replacing it staged nothing and the bump case would "
+        "judge the unmodified tree")
+endif()
 FastCachedWrite("CMakeLists.txt" "${bumped}")
 FastCachedSelftestCase("a-catch2-bump-past-the-watermark" refuse "past the")
 

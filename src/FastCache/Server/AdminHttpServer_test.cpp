@@ -973,9 +973,9 @@ TEST_CASE("AdminHttp: signals landing on the accept thread do not stop /healthz"
     REQUIRE(sent);
 
     // The loop reported nothing -- the registry `/healthz` answers from is empty -- and is still
-    // running. **At most THREE assertions can fail in this case, and that is load-bearing**: ctest
-    // scores a Catch2 exit of exactly 4 as Skipped (#1152), and the regression this case exists for
-    // failed four when "still running" was asserted twice, reading as a skip under ctest.
+    // running. **At most THREE assertions can fail in this case, and that was load-bearing**: on
+    // Catch2 3.6.0 ctest scored an exit of exactly 4 as Skipped (#1128), and the regression this case
+    // exists for failed four when "still running" was asserted twice, reading as a skip under ctest.
     CHECK(acceptLoops.snapshot().empty());
     CHECK(std::ranges::none_of(logger.Snapshot(), [](FastCache::CapturingLogger::Record const& record) {
         return record.level == FastCache::LogLevel::Error;

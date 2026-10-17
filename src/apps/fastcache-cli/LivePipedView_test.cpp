@@ -203,7 +203,7 @@ TEST_CASE("a piped run writes its header once and one line per sample with no es
     // the header's line is counted too.
     for (auto const format: { OutputFormat::Human, OutputFormat::Tsv, OutputFormat::Csv })
     {
-        INFO("format: " << DescriptorOf(format)->name);
+        INFO("format: " << FormatSpecOf(format).name);
         auto const stream = Stream(ReadReadFailRead(), format);
         CHECK(std::ranges::count(stream, '\x1b') == 0);
 

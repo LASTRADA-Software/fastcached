@@ -6,6 +6,8 @@
 #include "FileBytes.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Core/PeerText.hpp>
+#include <FastCache/Protocol/NodeConditionWire.hpp>
 
 #include <algorithm>
 #include <array>
@@ -19,6 +21,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 
 namespace FastCache::Cc
@@ -174,7 +177,7 @@ namespace
     /// exceeds Clang's 256-deep expression nesting limit and fails to compile. A
     /// stated extent only diagnoses rows being ADDED, so the `static_assert` below
     /// the table closes the other direction.
-    constexpr std::array<AllowedArg, 343> AllowedArgs {
+    constexpr std::array<AllowedArg, 346> AllowedArgs {
         // -- optimization ------------------------------------------------------
         AllowedArg { .spelling = "O", .families = DriverFamily::Any },
         AllowedArg { .spelling = "O0", .families = DriverFamily::Any },
@@ -301,6 +304,32 @@ namespace
         AllowedArg { .spelling = "gpubnames", .families = DriverFamily::Any },
         AllowedArg { .spelling = "ggnu-pubnames", .families = DriverFamily::Any },
         AllowedArg { .spelling = "gcodeview", .families = DriverFamily::Any },
+        // What a clang object RECORDS about where it was built (#1681: Lastrada's clang-cl line
+        // carries all three). Each value is recorded, never opened, and each row is `.`-shaped
+        // (`NoPathSeparator`): a directory the line names would be the client's, not the worker's.
+        // Measured with clang 22.1.8, one TU compiled by the client from its build directory
+        // (relative `/Fo`, absolute source) against the worker's compile of the client's `/E` text
+        // from its own directory into `scratch/job-N` (`/TP /Fo<scratch>/tu.o`):
+        //
+        //   clang-cl `/Z7`, no flag              LF_BUILDINFO cwd and `-cc1` line differ (two cwd tokens)
+        //   `-fdebug-compilation-dir=.`          cwd `.` on BOTH; one `-cc1` token left
+        //   `-fcoverage-compilation-dir=.`       only the recorded `-cc1` line moves; `.text`/`.debug$S` identical
+        //   `-gno-codeview-command-line`         the `-cc1` line and build tool are gone on BOTH
+        //   clang++ `-g` (ELF), no flag          `DW_AT_comp_dir` differs
+        //   `-fdebug-compilation-dir=.`          `DW_AT_comp_dir` `.` on BOTH; the CU name is the client's
+        //   the other two on ELF                 objects byte-identical to the no-flag pair
+        //
+        // So each brings the worker's object closer to the client's and none moves it further;
+        // `S_OBJNAME` and the scratch source name differ with or without them, the COFF cost the
+        // rulebook already accepts. A client that maps its build directory gets with the flag what
+        // it got without: the worker's directory rules do not match `.`. gcc has none of the three
+        // and refuses each, on a client and a worker alike. `-fcoverage-mapping` stays a `Deny` row,
+        // so the coverage directory is inert on any compile this worker runs.
+        AllowedArg {
+            .spelling = "fdebug-compilation-dir=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "fcoverage-compilation-dir=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "gno-codeview-command-line", .families = DriverFamily::Any },
         AllowedArg { .spelling = "p", .families = DriverFamily::Any },
         AllowedArg { .spelling = "pg", .families = DriverFamily::Any },
 
@@ -642,16 +671,41 @@ namespace
 
 JobError JobError::RejectedArgumentNaming(std::string_view argument, std::optional<Flavor> judgedFor)
 {
-    auto const named = PrintableArgument(argument);
+    std::array<std::string, 1> const arguments { std::string { argument } };
+    return RejectedArgumentsNaming(arguments, judgedFor);
+}
 
-    return JobError { .reason = JobRefusal::RejectedArgument,
-                      .detail = std::format("argument {} is not on this worker's accepted-flag list for its "
-                                            "driver family",
-                                            named),
-                      .subject = named,
-                      // Only while the name IS the argument: a cut or reduced name asked of the
-                      // rules again is a different argument, which can pass where this one did not.
-                      .judgedFor = named == argument ? judgedFor : std::nullopt };
+JobError JobError::RejectedArgumentsNaming(std::span<std::string const> arguments, std::optional<Flavor> judgedFor)
+{
+    constexpr std::string_view Predicate = " not on this worker's accepted-flag list for its driver family";
+
+    std::vector<RefusedArgumentName> subjects;
+    std::vector<std::string> names;
+    subjects.reserve(arguments.size());
+    names.reserve(arguments.size());
+    for (auto const& argument: arguments)
+    {
+        auto named = PrintableArgument(argument);
+        // Only while the name IS the argument: a cut or reduced name asked of the rules again is
+        // a different argument, which can pass where this one did not.
+        subjects.push_back(
+            RefusedArgumentName { .argument = named, .judgedFor = named == argument ? judgedFor : std::nullopt });
+        names.push_back(std::move(named));
+    }
+
+    // One argument keeps the sentence it always had; several are one sentence, cut where the row
+    // the node raises from it would be and with the rest counted, so a client's log line stays
+    // bounded however many a job carried. `subjects` keeps every one either way.
+    auto detail = names.size() == 1
+                      ? std::format("argument {} is{}", names.front(), Predicate)
+                      : std::format("{} are{}",
+                                    ListWithinCeiling("arguments",
+                                                      names,
+                                                      CompileCacheWire::MaxConditionDetailBytes - Predicate.size()
+                                                          - std::string_view { " are" }.size()),
+                                    Predicate);
+
+    return JobError { .reason = JobRefusal::RejectedArgument, .detail = std::move(detail), .subjects = std::move(subjects) };
 }
 
 bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver, std::span<std::string const> operatorAllowed)
@@ -941,8 +995,7 @@ std::expected<std::optional<std::string>, JobError> WorkerSourcePathRule(std::st
         return std::unexpected(JobError { .reason = JobRefusal::RejectedArgument,
                                           .detail = "a source-path replacement and the path it replaces travel "
                                                     "together; one without the other is half a rule",
-                                          .subject = {},
-                                          .judgedFor = std::nullopt });
+                                          .subjects = {} });
 
     // From here on every way of not building a rule is NO RULE, which is
     // `WorkerSourceNameRule`'s answer and not `WorkerPrefixMapRules`'. The client did
@@ -1073,8 +1126,7 @@ std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::stri
         return std::unexpected(JobError { .reason = JobRefusal::RejectedArgument,
                                           .detail = "a compilation-directory replacement needs the directory it "
                                                     "replaces",
-                                          .subject = {},
-                                          .judgedFor = std::nullopt });
+                                          .subjects = {} });
 
     // A family with no row is a worker that cannot honour the request at all. Refused
     // rather than skipped, unlike the source-name rule: a mapping the client ASKED for
@@ -1086,8 +1138,7 @@ std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::stri
             JobError { .reason = JobRefusal::SpawnFailed,
                        .detail = "this worker's driver family has no path-mapping switch, so a dispatched object "
                                  "cannot record the compilation directory the client asked for",
-                       .subject = {},
-                       .judgedFor = std::nullopt });
+                       .subjects = {} });
 
     // ALL THREE values, through the same predicate `WorkerSourceNameRule` uses -- two
     // copies of one alphabet is two chances to diverge -- and the two halves are
@@ -1103,8 +1154,7 @@ std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::stri
             JobError { .reason = JobRefusal::SpawnFailed,
                        .detail = "this worker's own compile directory cannot be spelled inside a mapping rule, so no "
                                  "unambiguous rule exists",
-                       .subject = {},
-                       .judgedFor = std::nullopt });
+                       .subjects = {} });
 
     auto const ruleFor = [&](std::string_view directory) {
         return PrefixMapRule(*row, directory, replacement);
@@ -1213,12 +1263,10 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
         // reporting `UnknownFingerprint` there tells an operator the fleet is matching
         // the wrong machines when the answer is "this one is still starting" (#365).
         if (!_survey.HasCompleted())
-            return std::unexpected(JobError {
-                .reason = JobRefusal::ToolchainSurveyInFlight, .detail = {}, .subject = {}, .judgedFor = std::nullopt });
+            return std::unexpected(JobError { .reason = JobRefusal::ToolchainSurveyInFlight, .detail = {}, .subjects = {} });
         auto const found = _toolchains.find(job.fingerprint);
         if (found == _toolchains.end())
-            return std::unexpected(JobError {
-                .reason = JobRefusal::UnknownFingerprint, .detail = {}, .subject = {}, .judgedFor = std::nullopt });
+            return std::unexpected(JobError { .reason = JobRefusal::UnknownFingerprint, .detail = {}, .subjects = {} });
         compiler = found->second;
     }
 
@@ -1244,8 +1292,7 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
         return std::unexpected(JobError { .reason = JobRefusal::CompilerUnclassified,
                                           .detail = "this worker's configured compiler matches no known driver "
                                                     "family, so its command line cannot be built safely",
-                                          .subject = {},
-                                          .judgedFor = std::nullopt });
+                                          .subjects = {} });
 
     // Checked again here, on the receiving side, and against an ALLOWLIST -- see
     // `IsAcceptableJobArgument`. The client's filter protects an honest client from
@@ -1262,10 +1309,16 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
         std::shared_lock const guard { _extraAllowedArgsMutex };
         extraAllowed = _extraAllowedArgs;
     }
-    if (auto const offender = std::ranges::find_if(
-            job.args, [&](std::string const& arg) { return !IsAcceptableJobArgument(arg, driver, extraAllowed); });
-        offender != job.args.end())
-        return std::unexpected(JobError::RejectedArgumentNaming(*offender, driver.flavor));
+    // EVERY argument, not the first (#1681). Stopping at the first named one argument per
+    // refusal, so an operator admitting it met the next only after a reload: four rounds for one
+    // clang-cl line. Each refused argument is named once, in the order the job carried them.
+    std::vector<std::string> refused;
+    std::unordered_set<std::string_view> seen;
+    for (auto const& arg: job.args)
+        if (!IsAcceptableJobArgument(arg, driver, extraAllowed) && seen.insert(arg).second)
+            refused.push_back(arg);
+    if (!refused.empty())
+        return std::unexpected(JobError::RejectedArgumentsNaming(refused, driver.flavor));
 
     // Every path below is the worker's. Nothing the client sent decides where a byte
     // lands -- not the source name, not the object name, not the directory.
@@ -1273,8 +1326,7 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     auto const scratch = _scratchRoot / std::format("job-{}", _nextJob.fetch_add(1, std::memory_order_relaxed));
     std::filesystem::create_directories(scratch, ec);
     if (ec)
-        return std::unexpected(
-            JobError { .reason = JobRefusal::ScratchUnavailable, .detail = {}, .subject = {}, .judgedFor = std::nullopt });
+        return std::unexpected(JobError { .reason = JobRefusal::ScratchUnavailable, .detail = {}, .subjects = {} });
 
     // Removed however this returns, including on a refusal below: a worker that
     // leaked a directory per job would fill its disk in a long-running build.
@@ -1305,12 +1357,10 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     {
         std::ofstream out { source, std::ios::binary };
         if (!out)
-            return std::unexpected(JobError {
-                .reason = JobRefusal::ScratchUnavailable, .detail = {}, .subject = {}, .judgedFor = std::nullopt });
+            return std::unexpected(JobError { .reason = JobRefusal::ScratchUnavailable, .detail = {}, .subjects = {} });
         out.write(job.preprocessed.data(), static_cast<std::streamsize>(job.preprocessed.size()));
         if (!out.good())
-            return std::unexpected(JobError {
-                .reason = JobRefusal::ScratchUnavailable, .detail = {}, .subject = {}, .judgedFor = std::nullopt });
+            return std::unexpected(JobError { .reason = JobRefusal::ScratchUnavailable, .detail = {}, .subjects = {} });
     }
 
     std::vector<std::string> argv;
@@ -1347,8 +1397,7 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
                                               .detail = "this worker cannot read its own working directory, so a "
                                                         "dispatched object cannot record the compilation directory "
                                                         "the client asked for",
-                                              .subject = {},
-                                              .judgedFor = std::nullopt });
+                                              .subjects = {} });
 
         // Through `CompilerWorkingDirectory` for the same reason the client's side is:
         // the rule this builds has to match what the compiler about to be spawned will
@@ -1459,8 +1508,7 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
         // The compiler could not be spawned at all. Deliberately NOT reported as a
         // failed compile: the client must be able to tell "this worker is broken"
         // from "your code does not compile", because only the second is its answer.
-        return std::unexpected(
-            JobError { .reason = JobRefusal::SpawnFailed, .detail = {}, .subject = {}, .judgedFor = std::nullopt });
+        return std::unexpected(JobError { .reason = JobRefusal::SpawnFailed, .detail = {}, .subjects = {} });
 
     CompileOutcome outcome {
         .exitCode = run.exitCode,
@@ -1476,8 +1524,7 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
             // The compiler said it succeeded and produced nothing readable. Refused
             // rather than returned as an empty object, which the client would write
             // to disk and cache.
-            return std::unexpected(JobError {
-                .reason = JobRefusal::ScratchUnavailable, .detail = {}, .subject = {}, .judgedFor = std::nullopt });
+            return std::unexpected(JobError { .reason = JobRefusal::ScratchUnavailable, .detail = {}, .subjects = {} });
         outcome.object = *std::move(bytes);
     }
     return outcome;

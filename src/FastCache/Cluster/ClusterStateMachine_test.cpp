@@ -355,9 +355,10 @@ TEST_CASE("A snapshot that cannot be decoded is named for where it came from, an
     // is asserted to name ITSELF and not the other, so a line that said both passes neither.
     //
     // Each section's first phrase is a REQUIRE. A line naming the wrong origin fails the
-    // four checks below it together, and a Catch2 binary's exit status is its failed
-    // assertion count -- four is `SKIP_RETURN_CODE`, so that defect was scored SKIPPED,
-    // not failed (#1152). Measured, on this case, by neutering the origin out of the line.
+    // four checks below it together, and on Catch2 3.6.0 a binary's exit status was its
+    // failed assertion count -- four is `SKIP_RETURN_CODE`, so that defect was scored
+    // SKIPPED, not failed (#1128). Measured, on this case, by neutering the origin out of
+    // the line.
     CapturingLogger logger;
     ClusterStateMachine machine { logger, {} };
 

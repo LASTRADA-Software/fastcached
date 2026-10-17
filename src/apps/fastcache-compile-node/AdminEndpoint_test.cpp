@@ -1458,7 +1458,6 @@ struct ChartFixture
                 return route.handler(request);
         }
         FAIL("no route for " << path);
-        return {};
     }
 
     [[nodiscard]] static std::string_view HeaderValue(AdminResponse const& response, std::string_view name)

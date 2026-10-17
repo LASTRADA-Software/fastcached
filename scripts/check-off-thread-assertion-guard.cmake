@@ -14,8 +14,15 @@
 #
 # An executable LINKS Catch2 when its link edge for this configuration names the Catch2
 # library itself (`libCatch2.a`, `libCatch2d.a`, `Catch2.lib`, `Catch2d.lib`, or a shared
-# spelling), at a boundary: `libCatch2Main.a` is a different library and is not the test. It
-# is COVERED when the same edge names the guard's object.
+# spelling -- VERSIONED included, `libCatch2.so.3.13.0` and `libCatch2.3.13.0.dylib`, which
+# is how a distribution's Catch2 reaches the link line when `find_package` resolves it), at a
+# boundary: `libCatch2Main.a` is a different library and is not the test. It is COVERED when
+# the same edge names the guard's object.
+#
+# The versioned spelling was missing, and a Fedora Catch2 3.13 made every edge invisible: the
+# check refused "nothing links Catch2" over nine binaries that each carried the guard. That
+# direction is the loud one. The quiet one is a second binary on that spelling WITHOUT the
+# guard, which an unrecognised spelling skips rather than refuses.
 #
 # ## Outcomes
 #
@@ -74,7 +81,7 @@ foreach(edge IN LISTS linkEdges)
         continue()
     endif()
     set(name "${CMAKE_MATCH_1}")
-    if(NOT edge MATCHES "(^|[ /])(lib)?Catch2d?\\.(a|lib|so|dylib)( |$)")
+    if(NOT edge MATCHES "(^|[ /])(lib)?Catch2d?(\\.[0-9]+)*\\.(a|lib|so|dylib)(\\.[0-9]+)*( |$)")
         continue()
     endif()
     math(EXPR catchEdges "${catchEdges} + 1")

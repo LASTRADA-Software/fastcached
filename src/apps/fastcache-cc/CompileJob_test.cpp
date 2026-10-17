@@ -3,6 +3,8 @@
 #include "CompileJob.hpp"
 #include "StubObjectTestSupport.hpp"
 
+#include <FastCache/Protocol/NodeConditionWire.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -1273,6 +1275,80 @@ TEST_CASE("A clang-cl unit with a SYSTEM include directory is dispatched, and th
     CHECK_FALSE(IsAcceptableJobArgument("/imsvcdeps", clangCl, { std::vector<std::string> { "/imsvcdeps" } }));
 }
 
+TEST_CASE("What a clang object records about where it was built travels, and nothing it could open does",
+          "[compile-job][msvc][clang-cl][refused-arguments]")
+{
+    // #1681. Lastrada's clang-cl line carries all three, and each was refused -- so every unit of
+    // that build compiled on its client. Each value is RECORDED and never opened, and the
+    // measurement on the rows says what each does to the worker's object: brings it closer to the
+    // client's, never further.
+    for (auto const* flag: { "-fdebug-compilation-dir=.", "-fcoverage-compilation-dir=.", "-gno-codeview-command-line" })
+    {
+        INFO("flag " << flag);
+        CHECK(IsAcceptableJobArgument(flag, DriverOf(Flavor::ClangCl)));
+        CHECK(IsAcceptableJobArgument(flag, DriverOf(Flavor::Clang)));
+    }
+
+    // A directory the line names is the CLIENT's, so the rows admit `.`-shaped values and the
+    // shape rule refuses one carrying a path -- through an operator entry as well.
+    for (auto const* pathValued: { "-fdebug-compilation-dir=/home/ci/build", R"(-fcoverage-compilation-dir=C:\build)" })
+    {
+        INFO("argument " << pathValued);
+        std::vector<std::string> const naming { std::string { pathValued } };
+        CHECK_FALSE(IsAcceptableJobArgument(pathValued, DriverOf(Flavor::ClangCl), naming));
+    }
+
+    // The coverage family's other members are still refused by ROW: an operator naming them
+    // admits nothing, so narrowing `fcoverage` to its members re-opened none of them.
+    for (auto const* hostile: { "-fcoverage-mapping", "-fcoverage-mcdc", "-fcoverage-prefix-map=a=b" })
+    {
+        INFO("argument " << hostile);
+        std::vector<std::string> const naming { std::string { hostile } };
+        CHECK_FALSE(IsAcceptableJobArgument(hostile, DriverOf(Flavor::Clang), naming));
+    }
+
+    // And the line end to end: the launcher keeps the three, and a clang-cl worker runs it.
+    std::vector<std::string> const argv {
+        R"(C:\LLVM\bin\clang-cl.exe)",
+        "/nologo",
+        "-TP",
+        "/DWIN32",
+        "/EHsc",
+        "/Od",
+        "-MDd",
+        "-Z7",
+        "-fdebug-compilation-dir=.",
+        "-fcoverage-compilation-dir=.",
+        "-gno-codeview-command-line",
+        "/W4",
+        "/WX",
+        R"(/Fosrc\a.cpp.obj)",
+        R"(/Fdsrc\a.pdb)",
+        "-c",
+        "--",
+        R"(C:\src\a.cpp)",
+    };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+    auto const remote = RemoteCompileArgs(cmd, argv, {});
+    INFO("the launcher refused: " << remote.error_or(""));
+    REQUIRE(remote.has_value());
+
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "clang-cl", argv.front() } }, ToolchainSurvey::Completed() };
+    auto job = Job(*remote);
+    job.fingerprint = "clang-cl";
+    auto const outcome = jobs.Run(job);
+    INFO("the worker refused: " << (outcome.has_value() ? std::string {} : outcome.error().detail));
+    REQUIRE(outcome.has_value());
+    for (auto const* flag: { "-fdebug-compilation-dir=.", "-fcoverage-compilation-dir=.", "-gno-codeview-command-line" })
+    {
+        INFO("flag " << flag);
+        CHECK(std::ranges::contains(runner.Argv(), flag));
+    }
+}
+
 TEST_CASE("Of the external-header family, what decides warnings travels and the directories never do", "[compile-job][msvc]")
 {
     // The rows are drawn from a measurement (see the `external:W` row): the level and
@@ -1359,10 +1435,82 @@ TEST_CASE("A refusal names the offending argument without echoing arbitrary byte
     // Each of those names something that is not the argument, so none says which driver judged
     // it: asked of the rules again, `-W?[31mred?` is a different argument from the one refused.
     // An argument named verbatim keeps its driver, which is what lets a reader re-ask the rules.
-    CHECK_FALSE(control.judgedFor.has_value());
-    CHECK_FALSE(huge.judgedFor.has_value());
-    CHECK_FALSE(invalid.judgedFor.has_value());
-    CHECK(JobError::RejectedArgumentNaming("-fanalyzer", Flavor::Gcc).judgedFor == Flavor::Gcc);
+    for (auto const* reduced: { &control, &huge, &invalid })
+    {
+        REQUIRE(reduced->subjects.size() == 1);
+        CHECK_FALSE(reduced->subjects.front().judgedFor.has_value());
+    }
+    auto const verbatim = JobError::RejectedArgumentNaming("-fanalyzer", Flavor::Gcc);
+    REQUIRE(verbatim.subjects.size() == 1);
+    CHECK(verbatim.subjects.front().judgedFor == Flavor::Gcc);
+}
+
+TEST_CASE("A runner names every argument it refuses, not the first", "[compile-job][refused-arguments]")
+{
+    // #1681. Stopping at the first refused argument named one per refusal, so an operator admitting
+    // it with `--allow-compile-arg` met the next only after a reload -- four rounds for one clang-cl
+    // line. Every refused argument is named, each once, in the order the job carried them; the
+    // allowed ones around them are not.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+    auto const refused = jobs.Run(Job({ "-O2", "-fanalyzer", "-Wall", "-fnew-flag", "-fanalyzer", "-Xclang" }));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == JobRefusal::RejectedArgument);
+    CHECK(runner.Argv().empty());
+
+    std::vector<std::string> named;
+    for (auto const& subject: refused.error().subjects)
+    {
+        named.push_back(subject.argument);
+        CHECK(subject.judgedFor == Flavor::Gcc);
+    }
+    CHECK(named == std::vector<std::string> { "-fanalyzer", "-fnew-flag", "-Xclang" });
+    CHECK(refused.error().detail
+          == "arguments -fanalyzer, -fnew-flag, -Xclang are not on this worker's accepted-flag list for its driver "
+             "family");
+}
+
+TEST_CASE("A single refused argument keeps the sentence it always had", "[compile-job][refused-arguments]")
+{
+    // The launcher records this sentence in its invocation log and its tests read it, so naming
+    // EVERY argument must not reword the common case of one.
+    constexpr std::string_view Sentence =
+        "argument -fanalyzer is not on this worker's accepted-flag list for its driver family";
+    CHECK(JobError::RejectedArgumentNaming("-fanalyzer", Flavor::Gcc).detail == Sentence);
+
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+    auto const refused = jobs.Run(Job({ "-O2", "-fanalyzer", "-fanalyzer" }));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().detail == Sentence);
+    CHECK(refused.error().subjects.size() == 1);
+}
+
+TEST_CASE("A refusal naming more arguments than fit counts the rest, and keeps every one",
+          "[compile-job][refused-arguments]")
+{
+    // The sentence rides the reply into the client's log, so it is cut where the node's own row
+    // would be -- with how many were left out SAID rather than the list stopping mid-name. The
+    // subjects, which the node lists from, keep every argument whatever the sentence holds.
+    std::vector<std::string> many;
+    for (auto const index: std::views::iota(0, 40))
+        many.push_back(std::format("-fdistinct-refused-argument-{:02}", index));
+    auto const error = JobError::RejectedArgumentsNaming(many, Flavor::Gcc);
+
+    CHECK(error.detail.size() <= FastCache::CompileCacheWire::MaxConditionDetailBytes);
+    CHECK(error.detail.starts_with("arguments -fdistinct-refused-argument-00, "));
+    CHECK(error.detail.ends_with(" are not on this worker's accepted-flag list for its driver family"));
+    auto const said = static_cast<std::size_t>(
+        std::ranges::count_if(many, [&](std::string const& argument) { return error.detail.contains(argument); }));
+    REQUIRE(said > 0);
+    REQUIRE(said < many.size());
+    // The FIRST ones are the ones named, and the count is of exactly the rest.
+    CHECK(std::ranges::all_of(many | std::views::take(said),
+                              [&](std::string const& argument) { return error.detail.contains(argument); }));
+    CHECK(error.detail.contains(std::format(" and {} more are not", many.size() - said)));
+    CHECK(error.subjects.size() == many.size());
 }
 
 TEST_CASE("The output flag follows the worker's own driver family", "[compile-job]")

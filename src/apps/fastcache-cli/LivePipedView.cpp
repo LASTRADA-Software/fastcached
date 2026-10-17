@@ -130,7 +130,7 @@ std::string_view PipedRecordView::AbsentText() const noexcept
 {
     if (_absentOverride.has_value() && _format != OutputFormat::Json)
         return *_absentOverride;
-    return DescriptorOf(_format)->absentText;
+    return FormatSpecOf(_format).absentText;
 }
 
 DashboardFrame PipedRecordView::PlacedFrame(DashboardModel const& model)

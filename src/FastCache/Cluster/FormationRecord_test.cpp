@@ -317,9 +317,9 @@ TEST_CASE("A record another build wrote is refused by name and damage is not cal
 {
     auto bytes = EncodeFormationRecord(SolitaryRecord("c", 1));
     auto later = bytes;
-    later[FormationRecordFormatOffset] = std::byte { FormationRecordFormat + 1 };
+    later.at(FormationRecordFormatOffset) = std::byte { FormationRecordFormat + 1 };
     // A later layout may carry a mode this build has no name for; the format still decides.
-    later[FormationRecordModeOffset] = std::byte { 0x7E };
+    later.at(FormationRecordModeOffset) = std::byte { 0x7E };
     auto const refused = DecodeFormationRecord(later);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
@@ -331,13 +331,13 @@ TEST_CASE("A record another build wrote is refused by name and damage is not cal
     CHECK(damaged.error().code == ConsensusErrorCode::MalformedFrame);
 
     auto unknownMode = bytes;
-    unknownMode[FormationRecordModeOffset] = std::byte { 0x7E };
+    unknownMode.at(FormationRecordModeOffset) = std::byte { 0x7E };
     auto const unnamed = DecodeFormationRecord(unknownMode);
     REQUIRE_FALSE(unnamed.has_value());
     CHECK(unnamed.error().code == ConsensusErrorCode::MalformedFrame);
 
     auto notARecord = bytes;
-    notARecord[0] = std::byte { 'X' };
+    notARecord.at(0) = std::byte { 'X' };
     auto const foreign = DecodeFormationRecord(notARecord);
     REQUIRE_FALSE(foreign.has_value());
     CHECK(foreign.error().code == ConsensusErrorCode::MalformedFrame);
@@ -364,7 +364,7 @@ TEST_CASE("A formation record a later build wrote is kept and never written over
     Testing::ScratchDirectory const scratch { "formation-later" };
     auto const path = scratch.Path() / std::string { FormationRecordFileName };
     auto later = EncodeFormationRecord(SolitaryRecord("later", 3));
-    later[FormationRecordFormatOffset] = std::byte { FormationRecordFormat + 1 };
+    later.at(FormationRecordFormatOffset) = std::byte { FormationRecordFormat + 1 };
     REQUIRE(Consensus::ReplaceFileAtomically(path, later, StateFile::Formation).has_value());
 
     FileFormationStore store { scratch.Path() };
@@ -549,7 +549,7 @@ TEST_CASE("An earlier record format is another layout, refused by name, and neve
     {
         INFO("format " << int { format });
         auto older = EncodeFormationRecord(SolitaryRecord("c", 1));
-        older[FormationRecordFormatOffset] = std::byte { format };
+        older.at(FormationRecordFormatOffset) = std::byte { format };
         auto const refused = DecodeFormationRecord(older);
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
@@ -573,13 +573,13 @@ TEST_CASE("A format 6 record joining a fleet past the carrier cap is refused by 
     record.joining = JoinTarget { .summary = summary, .provenKey = {}, .askedAtUnixSeconds = 7 };
     auto written = EncodeFormationRecord(record);
 
-    written[FormationRecordFormatOffset] = std::byte { 6 };
+    written.at(FormationRecordFormatOffset) = std::byte { 6 };
     auto const older = DecodeFormationRecord(written);
     REQUIRE_FALSE(older.has_value());
     CHECK(older.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
     CHECK(older.error().context.contains("format 6"));
 
-    written[FormationRecordFormatOffset] = std::byte { FormationRecordFormat };
+    written.at(FormationRecordFormatOffset) = std::byte { FormationRecordFormat };
     auto const current = DecodeFormationRecord(written);
     REQUIRE_FALSE(current.has_value());
     CHECK(current.error().code == ConsensusErrorCode::MalformedFrame);
@@ -608,7 +608,7 @@ TEST_CASE("A learner's record holding the previous roster layout is refused by t
     record.fleet =
         FleetMembership { .clusterId = "c-office", .roster = oldRoster, .createdAtUnixSeconds = 1, .admittedBy = {} };
     auto written = EncodeFormationRecord(record);
-    written[FormationRecordFormatOffset] = std::byte { 3 }; // as the build before the roster moved wrote it
+    written.at(FormationRecordFormatOffset) = std::byte { 3 }; // as the build before the roster moved wrote it
 
     auto const refused = DecodeFormationRecord(written);
     REQUIRE_FALSE(refused.has_value());

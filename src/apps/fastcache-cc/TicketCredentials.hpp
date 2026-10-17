@@ -9,7 +9,6 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/TicketChoice.hpp>
 
-#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -62,46 +61,6 @@ class ICredentialFor
         return Present(audience).credential;
     }
 };
-
-/// Ceiling on CONNECTING to this machine's node for a mint (#1664).
-///
-/// A mint source is a loopback literal by construction (`TicketSourceFor`), so it is bounded by
-/// what loopback costs and not by a LAN exchange's connect budget. That matters on Windows, where a
-/// connect to a CLOSED loopback port is not refused at once: the stack retries the SYN and answers
-/// `WSAECONNREFUSED` after ~2 s, so a machine with no node used to wait out the whole exchange
-/// budget (a second) on every mint.
-///
-/// **The figures it was chosen from, and their conditions** -- 32-thread hosts, each sampled idle and
-/// under 64 CPU-bound processes, 3,000 connects per row (closed port on Windows: 5), timed in Python
-/// around the connect alone, the worse of idle and loaded shown:
-///
-/// | host | instrument | live listener, max (p99.9) | closed port |
-/// |---|---|---|---|
-/// | Windows 11 26200 | `asyncio` Proactor (IOCP `ConnectEx`) | 0.76 ms (0.60 ms) | 2,016--2,042 ms, refused |
-/// | Windows 11 26200 | blocking `socket.connect` | 0.58 ms (0.58 ms) | 2,031--2,056 ms, refused |
-/// | WSL2 Ubuntu 24.04, kernel 6.6 | `asyncio` selector (`epoll`) | 13.5 ms (7.2 ms) | 0.15--0.47 ms, refused |
-/// | WSL2 Ubuntu 24.04, kernel 6.6 | blocking `socket.connect` | 1.45 ms (0.44 ms) | 0.14 ms max, refused |
-///
-/// The `asyncio` Linux tail is the interpreter's event loop as much as the kernel's -- the blocking
-/// connect on the same host and load tops out at 1.45 ms -- and Linux refuses a closed port at once,
-/// so there the bound is never paid. Fifty milliseconds is over 60 times the Windows maximum and over
-/// 30 times the blocking Linux one, and it is about what a machine with no node pays, ONCE per
-/// invocation (`MintRetry::NotAgain`). End to end on Windows -- a Release build of the launcher, the
-/// MISS and HIT rows against one remote cache, a machine with no node against one whose node mints
-/// -- the difference measured 59--73 ms.
-///
-/// **What it measures is the KERNEL's handshake, not the node.** A loopback connect completes at
-/// the SYN-ACK, which the kernel answers from the listening socket's backlog whatever the node's
-/// own threads are doing; the node's `accept` comes later and is not waited for. So a RUNNING node
-/// misses the bound only when that backlog is full or the host cannot run the kernel's side of the
-/// handshake in time -- and that is **unmeasured**: a busy local node under a `-j 60` build is
-/// #1668's condition, and none of the figures above was taken under it.
-///
-/// **It fails toward fewer tickets, never a failed build.** A running but saturated node that misses
-/// the bound reads as one that did not answer and is REMEMBERED (`MintRetry::NotAgain`): the rest of
-/// that invocation presents no ticket -- its lease and its compile at a remote worker included -- and
-/// each exchange a node-backed cache or scheduler refuses for it ends in a local compile.
-inline constexpr std::chrono::milliseconds LoopbackConnectBound { 50 };
 
 /// What a refused exchange costs the launcher, which ends a failed mint's line (`TicketCredentials`).
 inline constexpr std::string_view RefusedCompileRunsLocally = "a refused exchange's compile runs locally";
@@ -158,7 +117,9 @@ class TicketCredentials final: public ICredentialFor
     /// @param password The one password configured; presented to @p passwordFor alone.
     /// @param passwordFor The endpoint @p password belongs to (`FASTCACHE_ADDR`); ignored when
     ///        @p password is not configured.
-    /// @param budget The launcher's exchange budget; a mint runs under `MintBudget` of it.
+    /// @param budget The caller's exchange budget; a mint runs under `MintBudget` of it -- on every
+    ///        exchange this takes, since each dials with the budget's connect (`MakeTcpExchange`,
+    ///        and the node's `DialedExchange` since #1669).
     /// @param sink Where a failed mint is said: on the first failure, and again if one is remembered;
     ///        may be empty.
     /// @param refusalCost What a refused exchange costs THIS caller, ending each line @p sink says:

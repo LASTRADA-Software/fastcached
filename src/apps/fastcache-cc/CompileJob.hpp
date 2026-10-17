@@ -98,12 +98,28 @@ enum class JobRefusal : std::uint8_t
     Last, ///< Not a refusal, and has no row: `RefusalTable`'s length.
 };
 
-/// Why a job was refused, and — where there is one — which argument caused it.
+/// One argument a `RejectedArgument` refusal names, and the rules that refused it.
+struct RefusedArgumentName
+{
+    /// The argument, reduced the way `JobError::detail` reduces it (`PrintableArgument`).
+    std::string argument;
+    /// The driver whose argument rules refused it, so a reader can ask those rules again
+    /// (`IsAcceptableJobArgument`) rather than a copy of them.
+    ///
+    /// Disengaged when no such question can be asked of `argument` and answered for the argument
+    /// that arrived: a path-mapping value no argument rule judged, and a name that
+    /// `RejectedArgumentNaming` had to cut or reduce -- the reduced text is not the argument, and
+    /// judged in its place it can pass where the argument does not. Per argument rather than per
+    /// refusal, so one reduced name does not take the question away from its verbatim siblings.
+    std::optional<Flavor> judgedFor;
+};
+
+/// Why a job was refused, and — where there is one — which arguments caused it.
 ///
 /// The reason is still the enum `RefusalTable` is indexed by; `detail` is the
 /// human-readable specifics that belong on the wire but not in a table. It carries
-/// the offending flag for `RejectedArgument`, so a client's local fallback can say
-/// *which* argument the fleet would not take rather than only that one existed —
+/// the offending flags for `RejectedArgument`, so a client's local fallback can say
+/// *which* arguments the fleet would not take rather than only that one existed —
 /// over-refusal is otherwise invisible until someone correlates a hit-rate dip with
 /// a build's flags by hand. Empty for every refusal that has nothing to add.
 ///
@@ -122,21 +138,18 @@ struct JobError
     /// into a log. Detail set at the other refusal sites is this file's own literal
     /// text and needs no such treatment.
     std::string detail;
-    /// The argument a `RejectedArgument` refusal names, alone and already reduced the way
-    /// `detail` reduces it; empty for every refusal that names none.
+    /// EVERY argument a `RejectedArgument` refusal names, in the order the job carried them;
+    /// empty for every refusal that names none.
+    ///
+    /// Every one, not the first (#1681): a worker that named only the first refused argument made
+    /// an operator admitting it with `--allow-compile-arg` meet the next only after a reload --
+    /// four rounds for one clang-cl line. ALL of them even when `detail` has to stop naming them,
+    /// because the node's row is built from this list and not from the sentence.
     ///
     /// Beside `detail` rather than parsed back out of it: `detail` is a sentence for a person
     /// and may be reworded, while the node LISTS refused arguments in a condition, and a list
     /// built by cutting words out of a sentence breaks the day the sentence changes.
-    std::string subject;
-    /// The driver whose argument rules refused `subject`, so a reader can ask those rules again
-    /// (`IsAcceptableJobArgument`) rather than a copy of them.
-    ///
-    /// Disengaged when no such question can be asked of `subject` and answered for the argument
-    /// that arrived: a refusal naming no argument, a path-mapping value no argument rule judged,
-    /// and a `subject` that `RejectedArgumentNaming` had to cut or reduce -- the reduced text is
-    /// not the argument, and judged in its place it can pass where the argument does not.
-    std::optional<Flavor> judgedFor;
+    std::vector<RefusedArgumentName> subjects;
 
     /// A `RejectedArgument` refusal naming the offending argument.
     ///
@@ -151,6 +164,18 @@ struct JobError
     ///        did. Required, so a new call site says which rather than inheriting "none".
     /// @return The refusal.
     [[nodiscard]] static JobError RejectedArgumentNaming(std::string_view argument, std::optional<Flavor> judgedFor);
+
+    /// A `RejectedArgument` refusal naming every argument in @p arguments (#1681).
+    ///
+    /// One argument reads exactly as `RejectedArgumentNaming`'s sentence. Several are listed in
+    /// one, cut where `CompileCacheWire::MaxConditionDetailBytes` would be passed with the rest
+    /// counted -- the ceiling of the row the node raises from this refusal, so the two stop
+    /// naming at the same length -- while `subjects` keeps every one of them.
+    /// @param arguments The arguments the allowlist refused, as they arrived; at least one.
+    /// @param judgedFor The driver whose argument rules refused them.
+    /// @return The refusal.
+    [[nodiscard]] static JobError RejectedArgumentsNaming(std::span<std::string const> arguments,
+                                                          std::optional<Flavor> judgedFor);
 
     /// @param error The error.
     /// @param reason The reason to compare against.

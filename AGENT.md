@@ -1281,12 +1281,12 @@ and what they may assume.
   with a `git ls-files` primary and a walk fallback self-tested only the FALLBACK while CI took
   GIT. The mode is part of the OUTPUT and asserted on both sides.
 - A Catch2 `SKIP(...)` exits **4**, and ctest must be told what that means or it scores a skip as a
-  FAILURE. **And the mechanism that fixes that RED is itself broken**: Catch2's exit code **is** its
-  failed-assertion count clamped at 255, so `SKIP_RETURN_CODE 4` scores a case failing exactly four
-  assertions as *skipped*. It stays because all three alternative channels are worse and **no Linux
-  gate can reproduce any of that**; the fix is a change of MECHANISM, open as #1152.
-  `catch-skip-exit-collision` asserts the premises, `src/tests/CatchSkipCanary.cpp` the shapes, and
-  **adding shapes cannot make a pattern safe.**
+  FAILURE. `SKIP_RETURN_CODE 4` is exact only under Catch2's EXIT CONTRACT (3.7.1+: all skipped is 4,
+  any failure 42 whatever the count); on 3.6.0 the code WAS the failure count and four failures read
+  *skipped* (#1128). So Catch2 is pinned EXACTLY (`FIND_PACKAGE_ARGUMENTS "EXACT"`) — a compatible
+  `find_package` took a machine's other 3.x — and `catch-skip-exit-contract` runs every shape of
+  `src/tests/CatchSkipCanary.cpp` against the linked build. The mechanism is the exit code, NEVER a
+  pattern: **adding shapes cannot make a pattern safe.**
 - The converse, and the direction nobody investigates: `SUCCEED` is right when a case RAN and had
   nothing to assert, wrong when it could not run — a PASS for a property nothing established,
   exactly where coverage is thinnest. "Covered by another test" is a reason to SKIP, never to pass.

@@ -1721,9 +1721,9 @@ TEST_CASE("An oversize refusal past the drain bound survives the close that foll
     // EOF everywhere. The case above guards the at-capacity site; this is the other site that
     // closes after refusing, and it had no case at all.
     //
-    // Every assertion that decides the case is a `REQUIRE`: a case that fails exactly four
-    // assertions exits 4, which ctest scores as SKIPPED (#1152), and a guard for a refusal
-    // must not be able to fail silently.
+    // Every assertion that decides the case is a `REQUIRE`: on Catch2 3.6.0 a case that failed
+    // exactly four assertions exited 4, which ctest scored as SKIPPED (#1128), and a guard for a
+    // refusal must not be able to fail silently under any Catch2.
     Fleet fleet;
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(
@@ -4093,7 +4093,6 @@ class HandshakeCaller
         if (!_sealer.has_value())
         {
             FAIL("a frame was sealed before the proof agreed a key");
-            return {};
         }
         auto const tag = _sealer->Seal(frame.first(Wire::RequestHeaderSize), frame.subspan(Wire::RequestHeaderSize));
         auto bytes = std::vector<std::byte> { frame.begin(), frame.end() };

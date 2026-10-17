@@ -283,7 +283,6 @@ TEST_CASE("A refusal before an outcome runs answers what that outcome's reader r
                     break;
                 case FastCache::ExitReader::Last:
                     FAIL("Last is no reader");
-                    break;
             }
         }
     // Written out, so a row that stops deriving fails by name: a named file that is absent is

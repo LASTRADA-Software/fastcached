@@ -2383,7 +2383,8 @@ TEST_CASE("A worker refusing an argument is read by the client as exactly that, 
     auto const seen = fixture.refusals.Seen();
     REQUIRE(seen.size() == 1);
     CHECK(seen.front().reason == JobRefusal::RejectedArgument);
-    CHECK(seen.front().subject == "-fanalyzer");
+    REQUIRE(seen.front().subjects.size() == 1);
+    CHECK(seen.front().subjects.front().argument == "-fanalyzer");
 }
 
 TEST_CASE("A refusal that names no argument reaches the observer with no subject", "[worker-protocol][decline]")
@@ -2395,7 +2396,7 @@ TEST_CASE("A refusal that names no argument reaches the observer with no subject
     auto const seen = fix.refusals.Seen();
     REQUIRE(seen.size() == 1);
     CHECK(seen.front().reason == JobRefusal::UnknownFingerprint);
-    CHECK(seen.front().subject.empty());
+    CHECK(seen.front().subjects.empty());
 }
 
 TEST_CASE("A worker that has not registered honours no grant, however authentic", "[cc][lease][fleet]")

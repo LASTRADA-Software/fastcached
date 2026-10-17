@@ -1187,9 +1187,9 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
     // Before a single step: everything the snapshot covered is back.
     //
     // The revocation is a REQUIRE, and not for tidiness. A missed restore fails every
-    // check below together, and exactly four of them used to: a Catch2 binary's exit
-    // status is its failed-assertion count, and four collides with `SKIP_RETURN_CODE 4`,
-    // so the neutered fix was scored SKIPPED rather than failed (#1152) -- measured, on
+    // check below together, and exactly four of them used to: on Catch2 3.6.0 a binary's
+    // exit status was its failed-assertion count, and four collided with `SKIP_RETURN_CODE
+    // 4`, so the neutered fix was scored SKIPPED rather than failed (#1128) -- measured, on
     // this case, before this line was a REQUIRE. Stopping at the headline property
     // makes that defect one failure, whatever is appended below it.
     auto const restored = machine.State();
@@ -1218,8 +1218,8 @@ TEST_CASE("A driver over recovered state its application cannot read is refused,
     // refusal hand the application nothing: every command first, read-only, then the
     // snapshot, which replaces or changes nothing. The journal is the evidence -- a
     // refused command must leave no "restore" in it -- so it is each section's REQUIRE:
-    // a wrong order fails every check after it together, and four failures in one run are
-    // scored SKIPPED rather than failed (#1152).
+    // a wrong order fails every check after it together, and on Catch2 3.6.0 four failures
+    // in one run were scored SKIPPED rather than failed (#1128).
     Journal journal;
     RecordingStorage storage { journal };
     RecordingTransport transport { journal };

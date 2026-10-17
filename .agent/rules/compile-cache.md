@@ -1610,6 +1610,15 @@ The baseline is not a formality. Write each compile to a *different* `/Fo` name
 and every command line differs, `/Z7` embeds the command line, and the baseline
 stops being one — the same confound that cost #493 a re-run.
 
+- **A build that fixes the directory itself, `-fdebug-compilation-dir=.`, is DISPATCHED with
+  it (#1681)**, and that is the one remedy above that reaches clang-cl's `LF_BUILDINFO`: the
+  value is recorded rather than opened, so it travels with `-fcoverage-compilation-dir=.` and
+  `-gno-codeview-command-line`, each `.`-shaped or bare. Measured client against worker
+  (clang 22.1.8, the conditions on the rows in `CompileJob.cpp`): it makes the COFF current
+  directory and the ELF `DW_AT_comp_dir` `.` on BOTH ends where they differed, the other two
+  only remove what differed, and none moves the worker's object further from the client's.
+  The worker's own directory rules stay as they are: they match no `.`, so a client that also
+  maps its build directory gets the same object with the flag as without.
 - **It is not `/Z7`, and the launcher does not create the precondition.** `cl` with
   no debug flag at all already differs cross-root: `.debug$S` carries an
   `S_OBJNAME` record holding the resolved **absolute** object path, and `.chks64`

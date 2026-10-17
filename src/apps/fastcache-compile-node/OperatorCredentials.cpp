@@ -9,25 +9,24 @@
 #include <utility>
 
 #include <core/async/SyncRun.hpp>
+#include <core/net/IConnector.hpp>
 
 namespace FastCache::Node
 {
 
-DialedExchange::DialedExchange(IEndpointDialer& dialer,
-                               Cc::CredentialNotice& notice,
-                               core::net::DialOptions options) noexcept:
+DialedExchange::DialedExchange(IEndpointDialer& dialer, Cc::CredentialNotice& notice) noexcept:
     _dialer { dialer },
-    _notice { notice },
-    _options { options }
+    _notice { notice }
 {
 }
 
 Cc::CacheOutcome DialedExchange::Exchange(std::string_view hostPort,
                                           std::vector<std::byte> frame,
                                           Cc::Credential const& credential,
-                                          Cc::ExchangeBudget /*budget*/)
+                                          Cc::ExchangeBudget budget)
 {
-    auto client = _dialer.Dial(hostPort, _options);
+    auto client =
+        _dialer.Dial(hostPort, core::net::DialOptions { .connectTimeout = budget.connect, .keepAlive = budget.keepAlive });
     if (client == nullptr)
         return Cc::CacheOutcome {}; // `Transport`, `Unreached`: nothing was sent
     return core::async::syncRun(Cc::ExchangeFramed(client.get(), &_notice, std::move(frame), credential));
@@ -45,7 +44,7 @@ OperatorCredentials::OperatorCredentials(NodeConfig const& cfg,
                                          IEndpointDialer& dialer,
                                          std::function<void(std::string_view)> say):
     _notice { say },
-    _raw { dialer, _notice, core::net::DialOptions { .connectTimeout = MintDialTimeout } },
+    _raw { dialer, _notice },
     // The password through the one seam that derives a credential from the configuration, and to
     // `--upstream` alone: every other endpoint admits a machine by its ticket or its node proof
     // and checks no password, so presenting it there only hands the upstream's secret away.
@@ -53,6 +52,8 @@ OperatorCredentials::OperatorCredentials(NodeConfig const& cfg,
                OwnNodeTicketSource(cfg),
                ConfiguredCredential { cfg, nullptr }.Current(),
                cfg.upstream,
+               // The default budget, whose connect `TicketCredentials` caps at `Cc::LoopbackConnectBound`
+               // (`Cc::MintBudget`) and `_raw` dials with.
                Cc::ExchangeBudget {},
                std::move(say),
                std::string { RefusedVerbFails } }

@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -68,9 +69,10 @@ class ScriptedNodes
     [[nodiscard]] SocketDial Dial()
     {
         return [this](Endpoint const& endpoint,
-                      DialTimeouts /*timeouts*/) -> std::expected<std::unique_ptr<core::net::ISocket>, ExchangeError> {
+                      DialTimeouts timeouts) -> std::expected<std::unique_ptr<core::net::ISocket>, ExchangeError> {
             auto const text = EndpointText(endpoint);
             _dialled.push_back(text);
+            _timeouts.push_back(timeouts);
             auto const found = _sockets.find(text);
             if (found == _sockets.end())
                 return std::unexpected(ExchangeError { .kind = ExchangeFailure::Unreachable, .detail = "unscripted" });
@@ -93,9 +95,18 @@ class ScriptedNodes
         return _dialled;
     }
 
+    /// @param index Which dial, counting from zero, unreachable ones included.
+    /// @return The timeouts it was made with.
+    [[nodiscard]] DialTimeouts TimeoutsOn(std::size_t index) const
+    {
+        REQUIRE(index < _timeouts.size());
+        return _timeouts[index];
+    }
+
   private:
     std::map<std::string, std::unique_ptr<FastCache::Testing::ScriptedSocket>> _sockets;
     std::vector<std::string> _dialled;
+    std::vector<DialTimeouts> _timeouts; ///< One per dial, in the order of `_dialled`.
 };
 
 /// @param reply A command's reply.
@@ -124,6 +135,42 @@ class ScriptedNodes
 }
 
 } // namespace
+
+TEST_CASE("A mint connects to this machine's node under the loopback bound, whatever --connect-timeout says",
+          "[cli][node][ticket]")
+{
+    // #1669: the mint dialled this machine's node with the command's own connect (5 s by default),
+    // and on Windows a connect to a closed loopback port is refused only after ~2 s. Capped, never
+    // raised: a shorter --connect-timeout is kept. The node on the other machine keeps the
+    // configured connect, and the mint keeps the configured reads.
+    using std::chrono::milliseconds;
+    struct Row
+    {
+        char const* name;
+        milliseconds connect;     ///< --connect-timeout.
+        milliseconds mintConnect; ///< What the mint dials with.
+    };
+    for (auto const& row:
+         { Row { .name = "the default", .connect = DialTimeouts {}.connect, .mintConnect = Cc::LoopbackConnectBound },
+           Row { .name = "shorter than the bound", .connect = milliseconds { 20 }, .mintConnect = milliseconds { 20 } },
+           Row { .name = "the platform's own", .connect = milliseconds { 0 }, .mintConnect = Cc::LoopbackConnectBound } })
+    {
+        INFO(row.name);
+        ScriptedNodes nodes;
+        nodes.Serve("127.0.0.1:6674", Minted("minted-for-it"));
+        nodes.Serve("node.example.com:6674", BehindAuth(Reply(Wire::Status::Ok, {})));
+        auto const timeouts = DialTimeouts { .connect = row.connect, .io = milliseconds { 7'000 } };
+
+        auto opened = NodeExchange::Open(
+            Endpoint { .host = "node.example.com", .port = 6674 }, timeouts, NodeCredentials {}, nodes.Dial());
+        REQUIRE(opened.has_value());
+
+        REQUIRE(nodes.Dialled() == std::vector<std::string> { "node.example.com:6674", "127.0.0.1:6674" });
+        CHECK(nodes.TimeoutsOn(0).connect == row.connect);
+        CHECK(nodes.TimeoutsOn(1).connect == row.mintConnect);
+        CHECK(nodes.TimeoutsOn(1).io == timeouts.io);
+    }
+}
 
 TEST_CASE("node-status against a remote node presents a ticket minted for it; against loopback it sends the request "
           "alone",
