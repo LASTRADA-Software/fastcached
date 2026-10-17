@@ -1456,6 +1456,11 @@ TEST_CASE("What a clang object records about where it was built travels through 
     CHECK_FALSE(IsAcceptableJobArgument("/clang:-fdebug-compilation-dir=/home/build", clangCl));
     CHECK_FALSE(IsAcceptableJobArgument(R"(/clang:-fcoverage-compilation-dir=C:\build)", clangCl));
 
+    // Narrowing the deny prefix to its members did not admit the family: a `-fcoverage-*` no row
+    // names is still refused, by absence, bare and through the pass-through alike.
+    CHECK_FALSE(IsAcceptableJobArgument("-fcoverage-something", DriverOf(Flavor::Clang)));
+    CHECK_FALSE(IsAcceptableJobArgument("/clang:-fcoverage-something", clangCl));
+
     // The coverage family's other members stay refused by ROW through the pass-through, with an
     // operator naming each one whole.
     for (auto const* hostile: { "-fcoverage-mapping", "-fcoverage-mcdc", "-fcoverage-prefix-map=a=b" })
