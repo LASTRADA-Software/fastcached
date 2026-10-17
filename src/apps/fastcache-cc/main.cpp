@@ -168,6 +168,7 @@ struct Config
     std::string addr;
     std::string srcRoot;
     std::string buildTree;
+    std::string depsRoot; ///< `FASTCACHE_DEPS_DIR`; empty when the build names none.
     std::string prefetchGroup { "default" };
     bool verbose { false };
     bool stats { true };  ///< Record each invocation to the per-user log.
@@ -354,6 +355,7 @@ struct Config
     // breaks the depfile a build system reads back.
     c.srcRoot = Cc::WithoutTrailingSeparator(EnvOr(Cc::EnvName::SourceDir, ""));
     c.buildTree = Cc::WithoutTrailingSeparator(EnvOr(Cc::EnvName::BinaryDir, ""));
+    c.depsRoot = Cc::WithoutTrailingSeparator(EnvOr(Cc::EnvName::DepsDir, ""));
     c.prefetchGroup = EnvOr(Cc::EnvName::PrefetchGroup, "default");
     c.verbose = EnvSet(Cc::EnvName::Verbose);
     c.stats = !EnvSet(Cc::EnvName::NoStats);
@@ -2890,7 +2892,9 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
     // The host's narrow-text policy goes in here and nowhere else, because this is
     // the one object every path a compiler emitted passes through. It is read from
     // the platform at exactly this call site so everything it reaches stays pure.
-    Cc::RootReconciler reconciler { cfg.srcRoot, cfg.buildTree, PathResolver(), FastCache::HostNarrowTextPolicy() };
+    Cc::RootReconciler reconciler {
+        cfg.srcRoot, cfg.buildTree, PathResolver(), FastCache::HostNarrowTextPolicy(), cfg.depsRoot
+    };
     PathCanon::Layout const& layout = reconciler.Layout();
 
     // Asked before ANYTHING else the cache does, direct mode included, and that
@@ -2915,10 +2919,8 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
     // aliased one — an `-I` pointing at a symlinked include directory is the
     // ordinary case — and there are few enough arguments that resolving each
     // completely costs nothing measurable.
-    auto const relativizedArgs =
-        Cc::RelativizeArgs(argv.subspan(1), cfg.srcRoot, cfg.buildTree, [&reconciler](std::string_view path) {
-            return reconciler.Directory(path);
-        });
+    auto const relativizedArgs = Cc::RelativizeArgs(
+        argv.subspan(1), layout, [&reconciler](std::string_view path) { return reconciler.Directory(path); });
     // ONE probe for two questions where the driver allows it (#1237). The banner
     // and the target triple both come out of a clang driver's `-###`, and this is
     // a process per translation unit, so a second spawn here is a second spawn per
@@ -3542,6 +3544,21 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
              "a captured region names a path that is not text this host can read; not caching "
              "-- try a UTF-8 console code page");
         return code;
+    }
+
+    // The dependency root is tokenized HERE, and every other root by the server. A server
+    // canonicalizes with the two roots the STORE frame carries and knows no third; this
+    // machine's dependency cache would otherwise reach the value as an absolute path, and a
+    // hit on a machine whose cache sits in another home would replay a depfile naming headers
+    // that are not there -- refused as stale, so the shared key would buy nothing. The
+    // server leaves a `<DEPROOT>` span alone, and the hit localizes it against its own root.
+    if (!layout.dependencyRoot.empty())
+    {
+        PathCanon::Layout const dependencyOnly { .sourceRoot = {},
+                                                 .buildTree = {},
+                                                 .dependencyRoot = layout.dependencyRoot };
+        for (auto& region: value.textRegions)
+            region.bytes = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, dependencyOnly);
     }
 
     auto const encoded = EncodeCompileValue(value);

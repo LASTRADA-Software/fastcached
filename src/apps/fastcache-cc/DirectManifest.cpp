@@ -660,9 +660,8 @@ std::string AnchorWorkingDirectory(std::string_view directory, PathCanon::Layout
     // Longest root first, matching CanonicalizeOne's rule: a build tree nested
     // inside the source root must anchor to the build tree, or the tail spliced
     // back below would be relative to the wrong one.
-    std::array<std::string const*, 2> roots { &layout.buildTree, &layout.sourceRoot };
-    if (layout.buildTree.size() < layout.sourceRoot.size())
-        std::ranges::reverse(roots);
+    std::array<std::string const*, 3> roots { &layout.buildTree, &layout.dependencyRoot, &layout.sourceRoot };
+    std::ranges::stable_sort(roots, std::ranges::greater {}, [](std::string const* root) { return root->size(); });
 
     for (auto const* root: roots)
     {
@@ -1017,7 +1016,10 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
     // hashes were read after the compile, so an edit saved during it paired the new content
     // with the old object. `objkey` did not move, because the objects under their keys were
     // never the defect.
-    KeyDigest digest { "manifest-v8" };
+    //
+    // v9 is the lock-step half of `objkey-v8` (the dependency root): a v8 manifest stores
+    // an object key of the generation before it.
+    KeyDigest digest { "manifest-v9" };
     digest.Field(toolchainStamp);
     digest.Field(canonicalSource);
     for (auto const& arg: relativizedArgs)

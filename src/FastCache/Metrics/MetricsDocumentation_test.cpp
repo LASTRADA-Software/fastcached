@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/CheckoutPaths.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -245,7 +246,7 @@ constexpr std::string_view NodePrefix = "fastcache_";
 
 TEST_CASE("Every fastcached_ series the daemon renders is documented, and vice versa", "[metrics][docs]")
 {
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
     auto const read = ReadWhole(root / DeploymentPage);
     // A page that cannot be read is not a page with nothing wrong in it. Four
     // states, and "could not observe" must not collapse into "observed and fine".
@@ -288,7 +289,7 @@ TEST_CASE("The daemon's two compile-cache store refusals are named on the page",
     // about. They are also the two an operator needs BOTH ends of, because the node
     // has an identically-shaped twin of the first and watching only that reads a
     // mixed fleet as a converged one.
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
     auto const read = ReadWhole(root / DeploymentPage);
     REQUIRE(read.has_value());
     auto const& page = Unwrap(read);
@@ -322,7 +323,7 @@ TEST_CASE("Every fastcache_ series the node renders is documented, and vice vers
     // worse direction and the one that gets acted on. `RenderPrometheus` is the
     // authority on what is exported; the catalog is the authority on what is
     // counted, and they are not the same set.
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
     auto const read = ReadWhole(root / NodePage);
     // A page that cannot be read is not a page with nothing wrong in it.
     REQUIRE(read.has_value());
@@ -357,7 +358,7 @@ TEST_CASE("The node's page is scanned whole, not just its tables", "[metrics][do
     //
     // Asserted rather than left as a comment: the scan must see series from more
     // than one region of the page, or it has been narrowed without anybody noticing.
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
     auto const read = ReadWhole(root / NodePage);
     REQUIRE(read.has_value());
     auto const& page = Unwrap(read);

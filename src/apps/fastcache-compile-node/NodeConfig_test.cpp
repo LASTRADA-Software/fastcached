@@ -52,6 +52,7 @@
 
 #include <core/Ranges.hpp>
 #include <tests/AccessList.hpp>
+#include <tests/CheckoutPaths.hpp>
 #include <tests/HostNamingFakes.hpp>
 #include <tests/NodeFlagNames.hpp>
 #include <tests/NodeFormationFakes.hpp>
@@ -4640,8 +4641,8 @@ TEST_CASE("NodeSecretFiles: the worker actually asks, and that is asserted", "[n
     // A source scan because `main.cpp` is in no test target. Full-line comments are
     // stripped first: a COMMENT is not a call site, and the call site here sits under
     // twenty lines of comment that name the very function being looked for.
-    std::ifstream source { std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node"
-                           / "main.cpp" };
+    std::ifstream source { std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps"
+                           / "fastcache-compile-node" / "main.cpp" };
     REQUIRE(source.is_open());
 
     std::string code;

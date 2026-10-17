@@ -15,6 +15,8 @@
 #include <string_view>
 #include <utility>
 
+#include <tests/CheckoutPaths.hpp>
+
 using FastCache::ProcessExit;
 using FastCache::Node::NodeRefusalCause;
 
@@ -77,8 +79,8 @@ constexpr auto CauseVerdicts = std::to_array<CauseVerdict>({
 /// @return Its bytes; the case has failed when it cannot be read.
 [[nodiscard]] std::string NodeMain()
 {
-    auto const path =
-        std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node" / "main.cpp";
+    auto const path = std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps"
+                      / "fastcache-compile-node" / "main.cpp";
     REQUIRE(std::filesystem::exists(path));
     // Through the stream buffer, for `PosixDaemonHost_test`'s measured reason.
     std::ifstream in { path, std::ios::binary };

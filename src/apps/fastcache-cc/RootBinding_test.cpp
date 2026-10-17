@@ -168,7 +168,7 @@ class BoundCheckout
                   std::string_view cwd,
                   std::string_view compilerCwd,
                   IPathResolver& resolver):
-        reconciler { exported.sourceRoot, exported.buildTree, resolver },
+        reconciler { exported.sourceRoot, exported.buildTree, resolver, {}, exported.dependencyRoot },
         checkout { BindCheckout(reconciler, cwd, compilerCwd) }
     {
     }
@@ -404,7 +404,7 @@ TEST_CASE("Two checkouts exporting the same RELATIVE roots get different bound k
     // to ONE bound key in every checkout, so a marker led the second checkout to the first
     // one's copy -- `cl /FC` printed the first one's path under `(root-bound: served from ...)`.
     IdentityResolver resolver;
-    auto const relative = PathCanon::Layout { .sourceRoot = ".", .buildTree = "build" };
+    auto const relative = PathCanon::Layout { .sourceRoot = ".", .buildTree = "build", .dependencyRoot = "deps" };
     BoundCheckout const boundA { relative, R"(D:\work\checkout-a)", R"(D:\work\checkout-a)", resolver };
     auto const& a = boundA.checkout;
     BoundCheckout const boundB { relative, R"(D:\work\checkout-b)", R"(D:\work\checkout-b)", resolver };
@@ -790,7 +790,11 @@ TEST_CASE("A root-bound key folds the named parts and nothing else changes it", 
     // these -- rather than pasted from a run.
     auto const pinned = CheckoutWith("/src", "/build", "/build");
     CHECK(ComputeRootBoundKey(Portable, pinned, sourceOnly) == "d0b6ebf12452a1f2bbbbcf05ac0625bd");
-    CHECK(ComputeRootBoundKey(Portable, pinned, all) == "6db382f9fcb4721f7feb2aa44d864a69");
+    // Over the three parts it was reproduced for: the dependency root, added after, folds
+    // through the same loop and moves a key only when an object names it.
+    auto const reproducedParts =
+        CheckoutParts {}.With(CheckoutPart::SourceRoot).With(CheckoutPart::BuildTree).With(CheckoutPart::WorkingDirectory);
+    CHECK(ComputeRootBoundKey(Portable, pinned, reproducedParts) == "6db382f9fcb4721f7feb2aa44d864a69");
 }
 
 TEST_CASE("The marker carries its parts and is recognised, and nothing else is", "[launcher][rootbinding]")
@@ -946,7 +950,7 @@ TEST_CASE("A root-bound miss names the parts, never which of them differs, in it
     // parts the object names, and they are one text.
     auto const sameCheckoutSecondBuildDirectory = CheckoutParts::All();
     auto const reason = BoundMissReason(sameCheckoutSecondBuildDirectory);
-    CHECK(reason.contains("source-root,build-tree,working-directory"));
+    CHECK(reason.contains("source-root,build-tree,dependency-root,working-directory"));
     CHECK_FALSE(reason.contains("another checkout"));
     CHECK_FALSE(reason.contains("another build directory"));
 

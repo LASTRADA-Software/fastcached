@@ -290,6 +290,37 @@ enum class PathValueRole : std::uint8_t
     /// `-include`, because the drivers resolve the longest spelling and so must this
     /// table -- matched as `-include` with the value `-pch`, it would leave the line.
     PrecompiledHeaderInput,
+
+    /// A path rewrite that ALSO reaches the preprocessed text (`-ffile-prefix-map`,
+    /// `-fmacro-prefix-map`): it maps `__FILE__` and `__builtin_FILE`, which is what a
+    /// project adds so its objects stop naming its checkout -- Catch2's own CMake passes
+    /// `-ffile-prefix-map=<checkout>/=` on every compile.
+    ///
+    /// Keyed as `PrefixMap` is -- the head relativized, the replacement literal -- and
+    /// differing in the two places where reaching the text matters: it STAYS on the
+    /// preprocess line, so the key hashes the `__FILE__` the real compile produces, and
+    /// a line carrying one is never dispatched, since a worker compiling the client's
+    /// `#line`-marked text would embed `source_location` names the client's mapping never
+    /// touched. Unrecognised, the flag reached the key verbatim with the checkout's
+    /// absolute root in it, and every checkout of such a project missed.
+    SourcePrefixMap,
+};
+
+/// What a dispatched compile's line does with a path-valued flag.
+///
+/// Private: read where the worker's line is built and never stored or sent, so no
+/// enumerator carries a value.
+enum class RemoteLine : std::uint8_t
+{
+    /// Left off: the value names something on THIS machine the worker has no use for --
+    /// headers already inlined, an object and a depfile the client writes itself.
+    Dropped,
+    /// Sent verbatim: a rewrite the worker's compiler must apply to the client's paths in
+    /// the text it is handed, opening none of them (`-fmacro-prefix-map`). Asked AHEAD of the
+    /// role's `UndispatchableBecause`, which is what lets one row of a refused role travel:
+    /// `-ffile-prefix-map`, which also rewrites debug records a worker maps by its own rules,
+    /// stays refused by the role.
+    Forwarded,
 };
 
 /// One spelling of a flag whose value is a filesystem path.
@@ -325,6 +356,10 @@ struct PathValueFlag
     /// parser refuses the bare spelling as uncacheable rather than reading
     /// `-clang:dep.d` as a path. CMake's Ninja generator emits the fused form (#1531).
     bool joinedOnly { false };
+
+    /// What a dispatched compile's line does with it. A column rather than a role test,
+    /// because two rows of one role differ here.
+    RemoteLine remote { RemoteLine::Dropped };
 };
 
 /// Every flag whose value is a filesystem path, in one table.

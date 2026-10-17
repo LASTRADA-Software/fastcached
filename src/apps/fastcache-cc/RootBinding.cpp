@@ -442,6 +442,11 @@ namespace
           .absolute = [](CheckoutRoots const& c) -> std::string const& { return c.exported.buildTree; },
           .resolved = [](CheckoutRoots const& c) -> std::string const& { return c.resolved.buildTree; },
           .spelled = [](CheckoutRoots const& c) -> std::string const& { return c.exported.buildTree; } },
+        { .part = CheckoutPart::DependencyRoot,
+          .name = "dependency-root",
+          .absolute = [](CheckoutRoots const& c) -> std::string const& { return c.exported.dependencyRoot; },
+          .resolved = [](CheckoutRoots const& c) -> std::string const& { return c.resolved.dependencyRoot; },
+          .spelled = [](CheckoutRoots const& c) -> std::string const& { return c.exported.dependencyRoot; } },
         { .part = CheckoutPart::WorkingDirectory,
           .name = "working-directory",
           .absolute = [](CheckoutRoots const& c) -> std::string const& { return c.workingDirectory; },
@@ -529,12 +534,14 @@ CheckoutRoots BindCheckout(RootReconciler& reconciler,
     checkout.workingDirectory = std::string { workingDirectory };
     checkout.compilerWorkingDirectory = std::string { compilerWorkingDirectory };
     checkout.exported = PathCanon::Layout { .sourceRoot = AbsoluteAgainst(exported.sourceRoot, workingDirectory),
-                                            .buildTree = AbsoluteAgainst(exported.buildTree, workingDirectory) };
+                                            .buildTree = AbsoluteAgainst(exported.buildTree, workingDirectory),
+                                            .dependencyRoot = AbsoluteAgainst(exported.dependencyRoot, workingDirectory) };
     auto const resolve = [&resolver](std::string const& path) {
         return path.empty() ? std::string {} : resolver.ResolveDirectory(path);
     };
     checkout.resolved = PathCanon::Layout { .sourceRoot = resolve(checkout.exported.sourceRoot),
-                                            .buildTree = resolve(checkout.exported.buildTree) };
+                                            .buildTree = resolve(checkout.exported.buildTree),
+                                            .dependencyRoot = resolve(checkout.exported.dependencyRoot) };
     checkout.resolvedWorkingDirectory = resolve(checkout.workingDirectory);
 
     // Each part's 8.3 short form joins the alias list: a compiler handed `...\BUILDV~1`

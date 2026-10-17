@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/CheckoutPaths.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -157,7 +158,7 @@ TEST_CASE("Every daemonizing binary states its own working directory, and a comp
     {
         INFO(site.file << ": " << site.rationale);
 
-        auto const path = std::filesystem::path { FASTCACHED_SOURCE_DIR } / site.file;
+        auto const path = std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / site.file;
         REQUIRE(std::filesystem::exists(path));
 
         // Through the stream BUFFER, never `std::istreambuf_iterator`. GCC at `-O3`

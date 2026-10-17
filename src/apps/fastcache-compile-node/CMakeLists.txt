@@ -319,17 +319,12 @@ if(FASTCACHED_BUILD_TESTS)
     # agree with the code and drift from the package in silence. The uninstaller
     # deletes the executable that would otherwise answer for itself, so a label
     # that drifted leaves a job registered with nothing left able to remove it.
+    #
+    # The repository root the documentation checks read is NOT a definition here: it
+    # comes from <tests/CheckoutPaths.hpp>, included by the cases that read it, so the
+    # checkout's path stays out of every other unit's cache key.
     target_compile_definitions(fastcache-compile-node-tests PRIVATE
-        FASTCACHED_MACOS_NODE_LABEL="${FASTCACHED_MACOS_NODE_LABEL}"
-        # The repository root, so DocumentedCommandLines_test.cpp can read the
-        # documentation pages it checks. The docs are not build inputs, so there is
-        # no generated copy to point at and no reason to make one.
-        #
-        # PROJECT_SOURCE_DIR rather than CMAKE_SOURCE_DIR: the two differ the moment
-        # this tree is consumed with add_subdirectory(), and the check would then
-        # iterate a `docs/` belonging to somebody else -- or, far more likely, throw
-        # a filesystem_error for a directory that is not there.
-        FASTCACHED_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+        FASTCACHED_MACOS_NODE_LABEL="${FASTCACHED_MACOS_NODE_LABEL}")
     if(WIN32)
         target_link_libraries(fastcache-compile-node-tests PRIVATE ws2_32)
     endif()

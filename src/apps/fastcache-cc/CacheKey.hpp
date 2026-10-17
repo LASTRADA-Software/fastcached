@@ -148,6 +148,17 @@ struct KeyInputs
                                                       std::string_view buildTree,
                                                       PathCanon::PathTransform const& resolve = {});
 
+/// `RelativizeArgs` over a whole layout, its dependency root included: a path under
+/// `layout.dependencyRoot` becomes a `<DEPROOT>` token, so an include directory into a
+/// per-user dependency cache stops keeping the user's home in every key.
+/// @param args    The raw compile arguments (excluding the compiler).
+/// @param layout  The roots to relativize against.
+/// @param resolve Optional spelling reconciliation for each isolated path.
+/// @return The arguments with rooted paths tokenized.
+[[nodiscard]] std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
+                                                      PathCanon::Layout const& layout,
+                                                      PathCanon::PathTransform const& resolve = {});
+
 /// The first argument carrying a path this launcher can neither key nor guard, or
 /// nothing when the whole command line is safe to cache (issue #104).
 ///

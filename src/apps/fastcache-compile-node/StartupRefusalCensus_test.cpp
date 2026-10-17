@@ -46,6 +46,8 @@
 #include <utility>
 #include <vector>
 
+#include <tests/CheckoutPaths.hpp>
+
 namespace
 {
 
@@ -596,7 +598,8 @@ struct SourceFile
 /// @return Its text; the case has failed when it is missing.
 [[nodiscard]] std::string NodeSource(std::string_view name)
 {
-    auto const path = std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node" / name;
+    auto const path =
+        std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps" / "fastcache-compile-node" / name;
     INFO(path.string());
     REQUIRE(std::filesystem::exists(path));
     // Through the stream buffer, for `PosixDaemonHost_test`'s measured reason.
@@ -652,7 +655,8 @@ template <typename ReadSource>
 /// @return The files; the case has failed when a named one is missing.
 [[nodiscard]] std::vector<SourceFile> ScannedFiles()
 {
-    auto const directory = std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node";
+    auto const directory =
+        std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps" / "fastcache-compile-node";
     std::vector<std::filesystem::path> paths;
     for (auto const& entry: std::filesystem::directory_iterator { directory })
     {

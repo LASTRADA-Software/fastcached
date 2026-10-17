@@ -33,6 +33,7 @@
 #include <vector>
 
 #include <core/Ranges.hpp>
+#include <tests/CheckoutPaths.hpp>
 #include <tests/FirewallFakes.hpp>
 #include <tests/ScriptedServiceCalls.hpp>
 #include <tests/SteppedDrainWait.hpp>
@@ -710,7 +711,7 @@ TEST_CASE("Every shipped systemd unit restarts a failure and never a refusal", "
     REQUIRE_FALSE(exempted.empty());
     auto const prevent = std::format("\nRestartPreventExitStatus={}\n", exempted);
 
-    auto const directory = std::filesystem::path { FASTCACHED_SOURCE_DIR } / "packaging" / "linux";
+    auto const directory = std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "packaging" / "linux";
     REQUIRE(std::filesystem::is_directory(directory));
     auto units = std::size_t { 0 };
     for (auto const& entry: std::filesystem::directory_iterator { directory })

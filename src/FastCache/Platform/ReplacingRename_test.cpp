@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include <tests/CheckoutPaths.hpp>
+
 #if defined(_WIN32)
     #include <windows.h>
 #endif
@@ -200,7 +202,7 @@ TEST_CASE("A file replaces another through the one rename, and every other renam
     // The node's durable writer and the launcher's atomic write were each a copy of the
     // POSIX-semantics rename, and two copies are two places a fix lands in one of. Counted per file,
     // so a second rename in a row's own file is a finding too.
-    auto const root = std::filesystem::path { FASTCACHED_SOURCE_DIR };
+    auto const root = std::filesystem::path { FastCache::Testing::CheckoutSourceDir };
     auto filesRead = std::size_t { 0 };
     auto hits = std::vector<std::pair<std::string, std::size_t>> {};
     for (auto const* const tree: { "src/FastCache", "src/apps" })

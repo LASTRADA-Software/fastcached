@@ -359,7 +359,7 @@ same on both — the same defect with no MSVC anywhere near it.
   older launcher keeps resolving to an older object; direct mode is on by default and
   short-circuits before the preprocessed path,
   so without the second bump the re-key never happens where it matters most. The coupling is
-  ONE-WAY, though, and both tags currently read `v7`: an `objkey` bump must drag the manifest
+  ONE-WAY, though, and the tags read `objkey-v8` and `manifest-v9`: an `objkey` bump must drag the manifest
   tag with it, while the reverse is free — and free is the direction `v5` itself moved in
   (issue #111), the manifest half forced and the object half taken only to keep the two from
   sitting numerically apart.
@@ -1127,6 +1127,26 @@ same on both — the same defect with no MSVC anywhere near it.
       too, so the precaution is now belt-and-braces rather than the thing holding the case
       up. Every other case keeps its roots unambiguous,
       so a regression in the reconciliation cannot present as a failure of something else.
+- **A dependency cache outside the checkout is a ROOT of its own** (`<DEPROOT>`,
+  `PathCanon::Layout::dependencyRoot`, `FASTCACHE_DEPS_DIR`, which the module sets from
+  `CPM_SOURCE_CACHE`). CPM files each dependency under the commit it pinned, so the bytes are
+  machine-independent while the location (`~/.cache/...`) is per user. Measured on this repo,
+  two Docker machines with different homes: 10 of 1155 hits; the same two with the cache at
+  ONE path: 794. Under no root, every include directory into it reached the key verbatim.
+  - **The launcher tokenizes it in a value's text regions ITSELF, before the STORE**, with a
+    layout naming only that root. A server canonicalizes with the two roots its frame
+    carries and knows no third, so its behaviour cannot move and `CompileValueVersion` did
+    not; it leaves a `<DEPROOT>` span alone. Left absolute, the other machine's replayed
+    depfile names headers that are not there and the hit is refused as STALE, so a shared key
+    would buy nothing.
+  - **It relates as a root does**: its headers are content to the classifier, keyed in the
+    dependency set and revalidated by direct mode, and an object naming it is bound
+    (`CheckoutPart::DependencyRoot`, marker name `dependency-root`).
+  - **Its debug records are NOT mapped**, and that is a gap rather than a design: a dispatched
+    compile carries one directory-and-replacement pair, so a third debug rule would make a
+    local and a dispatched object differ in their debug records under one key. A Debug
+    build's object compiled from a dependency source therefore names the producing
+    machine's cache in DWARF; code is unaffected and release builds carry none.
 ## Relativizing a path-valued flag
 
 <!-- agent-tripwire: `/` introduces an option only on a Windows layout; on POSIX it starts a path -->
@@ -1694,16 +1714,42 @@ stops being one — the same confound that cost #493 a re-run.
   key — both flags tokenize to the same canonical text — while their objects
   differ. That is the #203 symptom reappearing inside the fix for it, and the only
   instrument that sees it is reading `comp_dir` directly.
-- **Only the DEBUG spelling is in the table.** `-fmacro-prefix-map` and
-  `-ffile-prefix-map` rewrite `__FILE__`, which lands in the preprocessed text the
-  key hashes — measured on both drivers with the source named absolutely, where
-  `-fdebug-prefix-map` leaves that text byte-identical and the other two do not.
-  A row for either would make the flag dropped from the preprocess line (every
-  role but `IncludeDir` is), so the key would hash text the real compile does not
-  produce, and a dispatched compile would bake the UNMAPPED `__FILE__` into an
-  object stored under the same key a locally mapped one uses. Unrecognised, they
-  reach the key verbatim and two checkouts miss — the safe direction, and the
-  behaviour that was already there.
+- **The table KEYS all three spellings; the module ADDS the debug one always and
+  `-fmacro-prefix-map` under `fastcache-cc` alone.**
+  `-fmacro-prefix-map` and `-ffile-prefix-map` rewrite `__FILE__`, which lands in the
+  preprocessed text the key hashes — measured on both drivers with the source named
+  absolutely, where `-fdebug-prefix-map` leaves that text byte-identical and the other
+  two do not. So they are a role of their own, `PathValueRole::SourcePrefixMap`, and
+  the role differs from `PrefixMap` in exactly the two places where reaching the text
+  matters:
+  - **It STAYS on the preprocess line** (`DroppedFromPreprocess`), so the key hashes
+    the `__FILE__` the real compile produces. Dropping it — what every role but
+    `IncludeDir` gets — is the reason this bullet used to forbid a row at all.
+  - **On a dispatched line the two spellings part** (`PathValueFlag::remote`, a COLUMN):
+    a worker compiles text whose `#line` markers name the client's paths, so without the
+    client's rule it would embed `source_location` names unmapped, under the key a mapped
+    one uses. `-fmacro-prefix-map` is FORWARDED verbatim and the worker's allowlist admits
+    it (`ArgValue::PrefixMapRule`: its halves are paths and it opens neither);
+    `-ffile-prefix-map` is REFUSED by name, because it also rewrites debug records the
+    worker maps by its own `-fdebug-prefix-map` rules.
+  - **The module maps `__FILE__` for the checkout (`<src>/=`) and the dependency cache
+    (`<cache>/=deps/`, LAST)** — `_fc_source_prefix_map_rules`, checked by
+    `ctest -R debug-prefix-map-rules` — and only when `fastcache-cc` is the launcher, the
+    one that keys the rule portably. Measured on this repo before it: every Catch2 test
+    object (358 of 1017) named its checkout and was stored per checkout.
+  - **And the build tree's PLACE under the source root is keyed** whenever one is
+    present. `-ffile-prefix-map=<SRCROOT>/=` turns a generated header into
+    `build/gen.hpp` in one checkout and `out/build/r/gen.hpp` in another; nothing else
+    in the key records where the build tree sits (its paths tokenize as
+    `<BUILDTREE>`), a `source_location` there reaches no key text, and the result is
+    relative, so the root-binding scan cannot see it. A tree outside the source root
+    is keyed as OUTSIDE, never by its path.
+  - **What it cost while it was unrecognised**: it reached the key verbatim, absolute
+    root included. Catch2's own CMake passes `-ffile-prefix-map=<checkout>/=` on every
+    compile, so no two checkouts of Catch2 shared anything — measured 0 of 107 hits
+    from a second folder, 107 of 107 with the rows, every served object byte-identical
+    to that folder's own uncached compile. No `objkey`/`manifest` bump, by `v3`'s
+    argument in `ComputeKey`: one input stopped carrying a machine-specific string.
 - **A root with a SPACE is not mapped, and that is a refusal.** The rules are
   spliced into `CMAKE_<LANG>_FLAGS`, which is space-separated, so a rule naming
   `/Users/john doe/proj` reaches the driver as two arguments and every compile

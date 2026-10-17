@@ -428,27 +428,34 @@ namespace
     // the producing machine's object path into every Windows key and two checkouts
     // at different roots could never share an entry.
 
-    constexpr std::array<PathValueFlag, 29> PathValues { {
-        // The prefix-map row first, being the longest spelling. GNU-only: `cl` has
+    constexpr std::array<PathValueFlag, 31> PathValues { {
+        // The prefix-map rows first, being the longest spellings. GNU-only: `cl` has
         // no path-map switch at all, and clang-cl accepts `-ffile-prefix-map`
         // while ignoring it for the records that matter -- measured, an object
         // built with it still differs cross-root by the same 23 bytes in
         // `S_OBJNAME` and the embedded `-cc1` line.
         //
-        // ONLY the debug spelling, and the omission of `-fmacro-prefix-map` and
-        // `-ffile-prefix-map` is deliberate rather than an oversight. Every row
-        // here is dropped from the preprocess line unless its role is
-        // `IncludeDir`, and that is safe exactly when the flag cannot change
+        // Two roles, because the three spellings differ in whether they reach the
         // preprocessed text. Measured on gcc 14 and clang 20, source named
         // absolutely, `-E -P`: `-fdebug-prefix-map` leaves the text byte-identical,
-        // while the other two rewrite `__FILE__` in it. A row for either would
-        // therefore hash text the real compile does not produce -- and worse, a
-        // dispatched compile would bake the UNMAPPED `__FILE__` into an object
-        // stored under the same key a locally-mapped one uses. Unrecognised, they
-        // reach the key verbatim and two checkouts simply miss, which is the safe
-        // direction and is the behaviour that was already there.
+        // while the other two rewrite `__FILE__` in it. So the debug spelling is
+        // `PrefixMap`, dropped from the preprocess line like every role but the
+        // include directory, and the other two are `SourcePrefixMap`, which stays
+        // there -- a row that dropped them would hash text the real compile does
+        // not produce. They were unrecognised until then, which reached the key
+        // verbatim and cost every checkout of a project passing one (Catch2 does)
+        // all of its sharing.
         { .spelling = "-fdebug-prefix-map",
           .role = PathValueRole::PrefixMap,
+          .families = DriverFamily::Gnu,
+          .valueTailSeparator = '=' },
+        { .spelling = "-fmacro-prefix-map",
+          .role = PathValueRole::SourcePrefixMap,
+          .families = DriverFamily::Gnu,
+          .valueTailSeparator = '=',
+          .remote = RemoteLine::Forwarded },
+        { .spelling = "-ffile-prefix-map",
+          .role = PathValueRole::SourcePrefixMap,
           .families = DriverFamily::Gnu,
           .valueTailSeparator = '=' },
         { .spelling = "/external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
@@ -672,7 +679,8 @@ namespace
     /// text on stdout, and a dependency flag would overwrite the build's own
     /// depfile with the probe's; what decides which headers the text is made of --
     /// an include directory, a forced include, a precompiled header -- is exactly
-    /// what the preprocessor needs and stays.
+    /// what the preprocessor needs and stays, and so does a source prefix map, which
+    /// rewrites the `__FILE__` the key hashes.
     /// @param role The role to test.
     /// @return True when the flag (and its value) is dropped.
     [[nodiscard]] constexpr bool DroppedFromPreprocess(PathValueRole role) noexcept
@@ -682,6 +690,7 @@ namespace
             case PathValueRole::IncludeDir:
             case PathValueRole::ForcedInclude:
             case PathValueRole::PrecompiledHeaderInput:
+            case PathValueRole::SourcePrefixMap:
                 return false;
             case PathValueRole::ObjectOutput:
             case PathValueRole::DepFile:
@@ -708,6 +717,12 @@ namespace
         {
             case PathValueRole::PrecompiledHeaderInput:
                 return "reads a precompiled header from this machine, which no preprocess can inline for a worker";
+            // The worker compiles text whose `#line` markers name the CLIENT's paths, so
+            // without the client's rule its `source_location` names them unmapped -- in an
+            // object stored under the key a locally mapped one uses.
+            case PathValueRole::SourcePrefixMap:
+                return "rewrites the source paths the object embeds, and a worker compiling this machine's text "
+                       "could not apply it";
             case PathValueRole::IncludeDir:
             case PathValueRole::ForcedInclude:
             case PathValueRole::ObjectOutput:
@@ -1061,6 +1076,7 @@ namespace
             // Nor this: the compiler applies the rewrite itself, and the launcher
             // only has to relativize the root it names so the key stays portable.
             case PathValueRole::PrefixMap:
+            case PathValueRole::SourcePrefixMap:
                 break;
         }
         return nullptr;
@@ -1593,6 +1609,23 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
         // (the headers are already inlined, and the path names nothing there).
         if (auto const match = MatchPathValueFlag(a, IntroducersOf(driver.family), driver.family))
         {
+            // A source prefix map cannot be dropped: the worker compiles text whose `#line`
+            // markers name the CLIENT's paths, so without the client's rule its
+            // `source_location` would name them unmapped. `-fmacro-prefix-map` TRAVELS -- the
+            // worker applies it to those strings and opens nothing -- so its row is forwarded
+            // ahead of the role's refusal, which `-ffile-prefix-map` still meets: it also
+            // rewrites debug records the worker maps by its own rules.
+            if (match->flag.remote == RemoteLine::Forwarded)
+            {
+                // A separated value travels with its flag, as the build wrote both.
+                out.emplace_back(a);
+                if (match->value.empty() && i + 1 < argv.size())
+                {
+                    out.emplace_back(argv[i + 1]);
+                    skipUntil = i + 2;
+                }
+                continue;
+            }
             if (auto const because = UndispatchableBecause(match->flag.role); !because.empty())
                 return std::unexpected(std::format("{} {}", match->flag.spelling, because));
             // Only a bare occurrence consumes the next argument; a fused one already

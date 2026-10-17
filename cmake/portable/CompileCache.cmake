@@ -123,6 +123,36 @@ function(_fc_debug_prefix_map_rules binaryDir sourceDir outRules outSourceMapped
     set(${outRules} "${rules}" PARENT_SCOPE)
 endfunction()
 
+# Which `-fmacro-prefix-map` rules a source root and a dependency cache deserve -- the
+# rewrite of `__FILE__` and `__builtin_FILE`, checked as a computation beside the debug
+# rules (`ctest -R debug-prefix-map-rules`).
+#
+# What it buys: an object naming its checkout -- every Catch2 assertion records `__FILE__`
+# -- is stored per checkout by `fastcache-cc`'s root binding, so a second folder or machine
+# recompiles it. Mapped, it names `src/foo_test.cpp` everywhere and shares. The launcher keys
+# the rule's HEAD portably and keeps the flag on its preprocess line, and a worker applies it
+# (`PathValueRole::SourcePrefixMap`, `RemoteLine::Forwarded`).
+#
+# The source root maps to NOTHING, so a file reads as its path inside the checkout; the
+# dependency cache to the literal `deps/`, which names no machine. The dependency rule goes
+# LAST, because GCC and Clang honour the last matching rule and a cache kept inside the
+# checkout must still name its dependencies by the machine-independent spelling. A root with
+# a SPACE contributes no rule, for `_fc_debug_prefix_map_rules`' reason.
+#
+# @param sourceDir The source tree.
+# @param depsDir   The dependency source cache, or empty.
+# @param outRules  Set to the `<from>=<to>` rules, in the order they are passed.
+function(_fc_source_prefix_map_rules sourceDir depsDir outRules)
+    set(rules "")
+    if(NOT sourceDir MATCHES " ")
+        list(APPEND rules "${sourceDir}/=")
+    endif()
+    if(NOT "${depsDir}" STREQUAL "" AND NOT depsDir MATCHES " ")
+        list(APPEND rules "${depsDir}/=deps/")
+    endif()
+    set(${outRules} "${rules}" PARENT_SCOPE)
+endfunction()
+
 # Resolve the compile-cache address from what the environment PRESENTED, keeping
 # "set but empty" distinct from "not set at all".
 #
@@ -475,10 +505,33 @@ endif()
 # How the CACHE exchange is configured, in one place: the probe below must test the very cache
 # environment the build will use, or it would vouch for a configuration nothing else runs.
 # Dispatch is the one setting the probe deliberately does NOT share; the next block says why.
+# Where this machine keeps third-party sources the build reads from OUTSIDE the checkout --
+# CPM's source cache, under the user's home by default. `fastcache-cc` keys and replays it as a
+# root of its own (`<DEPROOT>`), so two machines whose caches sit in different homes still
+# share: without it every include directory into the cache reached the key verbatim, and two
+# users never shared an object. Asked of CPM's own variable, cache entry first and then the
+# environment, the order CPM reads them in; an explicit FASTCACHE_DEPS_DIR outranks both, and
+# none of them set names no root, which is how the launcher behaved before it had one.
+set(_fc_deps_dir "")
+if(DEFINED FASTCACHE_DEPS_DIR)
+    set(_fc_deps_dir "${FASTCACHE_DEPS_DIR}")
+elseif(DEFINED ENV{FASTCACHE_DEPS_DIR})
+    set(_fc_deps_dir "$ENV{FASTCACHE_DEPS_DIR}")
+elseif(CPM_SOURCE_CACHE)
+    set(_fc_deps_dir "${CPM_SOURCE_CACHE}")
+elseif(DEFINED ENV{CPM_SOURCE_CACHE})
+    set(_fc_deps_dir "$ENV{CPM_SOURCE_CACHE}")
+endif()
+if(NOT _fc_deps_dir STREQUAL "")
+    file(TO_CMAKE_PATH "${_fc_deps_dir}" _fc_deps_dir)
+    string(REGEX REPLACE "/$" "" _fc_deps_dir "${_fc_deps_dir}")
+endif()
+
 set(_fc_fastcache_env
     "FASTCACHE_ADDR=${FASTCACHE_ADDR}"
     "FASTCACHE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-    "FASTCACHE_BINARY_DIR=${CMAKE_BINARY_DIR}")
+    "FASTCACHE_BINARY_DIR=${CMAKE_BINARY_DIR}"
+    "FASTCACHE_DEPS_DIR=${_fc_deps_dir}")
 
 # Where a miss is dispatched, decided once: see `_fc_dispatch_state` for why configure decides it
 # and the build's environment does not. Joined to the LAUNCHER's environment only, never the
@@ -1797,9 +1850,10 @@ if(_fc_cache_chosen)
     # all. `.agent/rules/compile-cache.md` records that as an accepted cost.
     #
     # `-fdebug-prefix-map` and not `-ffile-prefix-map`, which also implies
-    # `-fmacro-prefix-map` and would rewrite `__FILE__` -- in the preprocessed text
-    # the launcher's key is taken over, which the real compile would then not
-    # produce. Program-visible file names are not this module's to fix, and the
+    # `-fmacro-prefix-map` and would rewrite `__FILE__` -- the program's own text,
+    # which a module that only fronts the compiler has no business changing. A build
+    # that passes one ITSELF is keyed portably and kept on the preprocess line
+    # (`PathValueRole::SourcePrefixMap`). Program-visible file names are not this module's to fix, and the
     # launcher does not need it to: the preprocessed key alone sees a `__FILE__`
     # expansion, while the direct-mode key never does and `std::source_location`
     # reaches no key at all, so `fastcache-cc` reads the OBJECT instead and keys an
@@ -1883,6 +1937,19 @@ if(_fc_cache_chosen)
     list(TRANSFORM _fc_prefix_maps PREPEND "-fdebug-prefix-map=" OUTPUT_VARIABLE _fc_prefix_map_flags)
     list(JOIN _fc_prefix_map_flags " " _fc_prefix_map_flags)
 
+    # And `__FILE__` / `__builtin_FILE`, for `fastcache-cc` ALONE: it is the launcher that keys
+    # these rules portably and that otherwise stores an object naming its checkout per
+    # checkout, so mapping is what lets every Catch2 test object share across folders and
+    # machines. Under ccache or sccache the rule's root would sit in their key and buy nothing,
+    # and changing the program's own `__FILE__` for no gain is not this module's to do.
+    set(_fc_source_map_flags "")
+    if(_fc_cache_chosen STREQUAL "fastcache_cc")
+        _fc_source_prefix_map_rules("${CMAKE_SOURCE_DIR}" "${_fc_deps_dir}" _fc_source_maps)
+        list(TRANSFORM _fc_source_maps PREPEND "-fmacro-prefix-map=" OUTPUT_VARIABLE _fc_source_map_flags)
+        list(JOIN _fc_source_map_flags " " _fc_source_map_flags)
+    endif()
+    set(_fc_source_map_langs "")
+
     # A language this project has not ENABLED is asked nothing: `check_compiler_flag`
     # is a hard `CMake Error` ("C: needs to be enabled before use") otherwise, which
     # fails the configure -- the one thing this file may not do. Measured rather than
@@ -1920,7 +1987,23 @@ if(_fc_cache_chosen)
         else()
             list(APPEND _fc_prefix_map_skipped "${_lang} (driver rejected the flag)")
         endif()
+
+        if(NOT _fc_source_map_flags STREQUAL "")
+            check_compiler_flag(${_lang} "-fmacro-prefix-map=/a=/b" FASTCACHE_${_lang}_HAS_MACRO_PREFIX_MAP)
+            if(FASTCACHE_${_lang}_HAS_MACRO_PREFIX_MAP)
+                string(APPEND CMAKE_${_lang}_FLAGS " ${_fc_source_map_flags}")
+                list(APPEND _fc_source_map_langs ${_lang})
+            else()
+                list(APPEND _fc_prefix_map_skipped "${_lang} (driver rejected -fmacro-prefix-map)")
+            endif()
+        endif()
     endforeach()
+
+    if(_fc_source_map_langs)
+        list(JOIN _fc_source_map_langs "/" _fc_source_map_langs)
+        message(STATUS "[cache] Mapping __FILE__ for ${_fc_source_map_langs} so test and dependency objects "
+                       "share across checkouts and machines: ${_fc_source_map_flags}")
+    endif()
 
     # Say which languages got it AND which did not, rather than only the happy
     # half: a driver that cannot take the flag still caches, still shares, and

@@ -6,6 +6,7 @@
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
+#include <algorithm>
 #include <format>
 #include <optional>
 #include <span>
@@ -156,11 +157,46 @@ std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
                                         std::string_view buildTree,
                                         PathCanon::PathTransform const& resolve)
 {
-    PathCanon::Layout const layout { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } };
+    return RelativizeArgs(
+        args,
+        PathCanon::Layout { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } },
+        resolve);
+}
+
+std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
+                                        PathCanon::Layout const& layout,
+                                        PathCanon::PathTransform const& resolve)
+{
+    std::string_view const sourceRoot = layout.sourceRoot;
+    std::string_view const buildTree = layout.buildTree;
     std::vector<std::string> out;
-    out.reserve(args.size());
+    out.reserve(args.size() + 1);
     for (auto const& arg: args)
         out.push_back(RelativizeOne(arg, layout, resolve));
+
+    // A source prefix map rewrites a BUILD-TREE path through whichever rule covers it,
+    // so `-ffile-prefix-map=<SRCROOT>/=` turns a generated header into `build/gen.hpp` in
+    // one checkout and `out/build/x/gen.hpp` in another. Nothing above records where the
+    // build tree sits under the source root -- its paths tokenize as `<BUILDTREE>` -- and
+    // a `source_location` in such a header reaches no key text, so two layouts would share
+    // a key while their objects name different files, relative and therefore invisible to
+    // the root-binding scan. Folded in only when such a map is present, so no other key
+    // moves; a leading NUL is a byte no argument can carry.
+    auto const introducers = IntroducersFor(layout);
+    auto const mapsSource = std::ranges::any_of(args, [introducers](std::string const& arg) {
+        auto const match = MatchPathValueFlag(arg, introducers, DriverFamily::Any);
+        return match.has_value() && match->flag.role == PathValueRole::SourcePrefixMap;
+    });
+    if (mapsSource)
+    {
+        PathCanon::Layout const sourceOnly { .sourceRoot = std::string { sourceRoot }, .buildTree = {} };
+        auto const position = buildTree.empty() ? std::string {} : PathCanon::Canonicalize(buildTree, sourceOnly);
+        // A build tree outside the source root is recorded as THAT and never by its path,
+        // which would put the machine's own location back into the key.
+        out.push_back(std::format("{}build-tree-under-source-root={}",
+                                  '\0',
+                                  position == buildTree ? std::string_view { "(outside)" } : std::string_view { position }));
+    }
     return out;
 }
 
@@ -298,7 +334,16 @@ std::string ComputeKey(KeyInputs const& inputs)
     // what a FETCH does on meeting its marker, and an older entry was written by neither
     // rule. `manifest-v7` moves with it, in the lock-step ComputeManifestKey describes --
     // and for a second reason of its own, since direct mode is where the defect lived.
-    KeyDigest digest { "objkey-v7" };
+    //
+    // v8 retires every value stored before the dependency root (`FASTCACHE_DEPS_DIR`,
+    // `PathCanon::Layout::dependencyRoot`). This construction is unchanged and the golden
+    // vector moved for the tag alone; what changed is what a value's text regions may carry
+    // -- a `<DEPROOT>` span a launcher of this generation localizes and an older one would
+    // replay verbatim -- and the root-bound marker's part names, which gained
+    // `dependency-root`. Bumped so the two generations never exchange an entry rather than
+    // relying on their keys differing, which they do only for units that read a
+    // dependency. `manifest-v9` moves with it, in the lock-step ComputeManifestKey records.
+    KeyDigest digest { "objkey-v8" };
     digest.Field(inputs.compilerId);
     digest.Field(inputs.preprocessed);
     for (auto const& arg: inputs.relativizedArgs)

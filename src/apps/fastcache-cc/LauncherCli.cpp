@@ -169,6 +169,13 @@ namespace
                                 "cache is working." },
         EnvVarSpec { .name = EnvName::SourceDir, .summary = "Checkout source root, for keying and path canonicalization." },
         EnvVarSpec { .name = EnvName::BinaryDir, .summary = "Build output root." },
+        EnvVarSpec { .name = EnvName::DepsDir,
+                     .summary = "Where this machine keeps third-party sources the build\n"
+                                "reads from outside the checkout (CPM's source cache).\n"
+                                "Keyed and replayed as a root of its own, so machines\n"
+                                "whose caches sit in different homes still share.\n"
+                                "Unset: such paths are keyed as written, which shares\n"
+                                "only between builds that keep them in one place." },
         EnvVarSpec { .name = EnvName::PrefetchGroup,
                      .summary = "Prefetch grouping id (default \"default\"). Not part of the\n"
                                 "cache key, so it never partitions the cache." },

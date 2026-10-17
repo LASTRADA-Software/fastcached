@@ -134,7 +134,67 @@ foreach(row IN LISTS Layouts)
 endforeach()
 
 list(LENGTH Layouts layoutCount)
-if(problems GREATER 0)
-    message(FATAL_ERROR "debug-prefix-map rules: ${problems} layout(s) wrong out of ${layoutCount}")
+
+# ---------------------------------------------------------------------------
+# The `-fmacro-prefix-map` rules: source dir | dependency cache | expected rules
+#
+# The dependency rule is LAST because GCC and Clang honour the last matching rule; a cache
+# kept inside the checkout must still name its files by the machine-independent `deps/`.
+
+if(NOT COMMAND _fc_source_prefix_map_rules)
+    message(FATAL_ERROR
+        "_fc_source_prefix_map_rules is not defined. Either the define-only guard in "
+        "cmake/portable/CompileCache.cmake returned before the function, or the function was renamed "
+        "and this check now proves nothing.")
 endif()
-message(STATUS "debug-prefix-map rules: ${layoutCount} layouts correct")
+
+set(SourceLayouts
+    # This project's own: a checkout and a per-user CPM cache in the home directory.
+    "/co/src|/home/u/.cache/fastcached/cpm|/co/src/=,/home/u/.cache/fastcached/cpm/=deps/"
+    # No dependency cache: the source rule alone.
+    "/co/src||/co/src/="
+    # A cache INSIDE the checkout: both rules, the cache's last so it wins.
+    "/co/src|/co/src/.cpm|/co/src/=,/co/src/.cpm/=deps/"
+    # A space declines exactly the root carrying it.
+    "/co/src|/home/john doe/cpm|/co/src/="
+    "/co/john doe/src|/home/u/cpm|/home/u/cpm/=deps/"
+)
+
+set(sourceProblems 0)
+foreach(row IN LISTS SourceLayouts)
+    string(REPLACE "|" ";" fields "${row}")
+    list(GET fields 0 sourceDir)
+    list(GET fields 1 depsDir)
+    list(LENGTH fields fieldCount)
+    set(expectedRules "")
+    if(fieldCount GREATER 2)
+        list(GET fields 2 expectedRules)
+        string(REPLACE "," ";" expectedRules "${expectedRules}")
+    endif()
+
+    _fc_source_prefix_map_rules("${sourceDir}" "${depsDir}" rules)
+    if(NOT "${rules}" STREQUAL "${expectedRules}")
+        message(STATUS "  source='${sourceDir}' deps='${depsDir}'")
+        message(STATUS "    expected rules: ${expectedRules}")
+        message(STATUS "    actual rules:   ${rules}")
+        math(EXPR sourceProblems "${sourceProblems} + 1")
+    endif()
+
+    # Asked of the RESULT: each replacement ends up inside objects every machine shares, so it
+    # may name nothing that exists only here -- nothing at all, or the literal `deps/`.
+    foreach(rule IN LISTS rules)
+        string(REGEX REPLACE "^.*=" "" replacement "${rule}")
+        if(NOT replacement MATCHES "^(deps/)?$")
+            message(STATUS "  source='${sourceDir}' deps='${depsDir}'")
+            message(STATUS "    replacement '${replacement}' is not machine-independent")
+            math(EXPR sourceProblems "${sourceProblems} + 1")
+        endif()
+    endforeach()
+endforeach()
+list(LENGTH SourceLayouts sourceLayoutCount)
+
+if(problems GREATER 0 OR sourceProblems GREATER 0)
+    message(FATAL_ERROR "prefix-map rules: ${problems} debug layout(s) wrong out of ${layoutCount}, "
+                        "${sourceProblems} source layout(s) wrong out of ${sourceLayoutCount}")
+endif()
+message(STATUS "prefix-map rules: ${layoutCount} debug layouts and ${sourceLayoutCount} source layouts correct")
