@@ -7,6 +7,8 @@
 #include <FastCache/CompileCache/PathCanon.hpp>
 
 #include <algorithm>
+#include <array>
+#include <expected>
 #include <format>
 #include <optional>
 #include <span>
@@ -256,6 +258,120 @@ namespace
         return std::format("{}{}", throughLineNumber, rest);
     }
 } // namespace
+
+namespace
+{
+    /// Bare switches a response file may not carry, because the launcher reads them off the
+    /// command line: what is compiled, and which dependency record a hit must write. The
+    /// path-valued ones (`-o`, `-MF`, `/Fo`, ...) are asked of `PathValueFlags()` instead.
+    constexpr std::array<std::string_view, 15> CommandLineOnlySwitches {
+        "-c",
+        "/c",
+        "-S",
+        "-E",
+        "/E",
+        "/EP",
+        "/P",
+        "-M",
+        "-MM",
+        "-MD",
+        "-MMD",
+        "-MG",
+        "-MP",
+        "/showIncludes",
+        "-showIncludes",
+    };
+
+    /// Path-valued roles a response file may not carry: outputs and the dependency record.
+    constexpr std::array<PathValueRole, 4> CommandLineOnlyRoles {
+        PathValueRole::ObjectOutput, PathValueRole::DepFile, PathValueRole::DepTarget, PathValueRole::DebugOutput
+    };
+
+    /// Why a response file's text must keep the compile uncached, or nothing.
+    /// @param path The file as the command line named it.
+    /// @param text Its bytes.
+    /// @return The reason, or nullopt.
+    [[nodiscard]] std::optional<std::string> ResponseFileRefusal(std::string_view path, std::string_view text)
+    {
+        // Split on blanks and shed quotes: a REFUSAL may over-recognise (it costs a miss), so
+        // this need not be the driver's own grammar -- the key never reads these tokens.
+        auto rest = text;
+        while (!rest.empty())
+        {
+            auto const start = rest.find_first_not_of(" \t\r\n");
+            if (start == std::string_view::npos)
+                break;
+            rest.remove_prefix(start);
+            auto const end = rest.find_first_of(" \t\r\n");
+            auto token = rest.substr(0, end);
+            rest.remove_prefix(end == std::string_view::npos ? rest.size() : end);
+            auto const isQuote = [](char c) {
+                return c == '"' || c == '\'';
+            };
+            while (!token.empty() && isQuote(token.front()))
+                token.remove_prefix(1);
+            while (!token.empty() && isQuote(token.back()))
+                token.remove_suffix(1);
+
+            if (token.starts_with('@'))
+                return std::format(
+                    "response file {} names another response file ({}), whose text the key cannot see", path, token);
+            if (std::ranges::contains(CommandLineOnlySwitches, token))
+                return std::format(
+                    "response file {} carries {}, which the launcher must read off the command line", path, token);
+            if (auto const match = MatchPathValueFlag(token, "-/", DriverFamily::Any);
+                match.has_value() && std::ranges::contains(CommandLineOnlyRoles, match->flag.role))
+                return std::format("response file {} carries {}, which the launcher must read off the command line",
+                                   path,
+                                   match->flag.spelling);
+        }
+        return std::nullopt;
+    }
+} // namespace
+
+std::expected<std::vector<std::string>, std::string> ResponseFileKeyItems(std::span<std::string const> args,
+                                                                          PathCanon::Layout const& layout,
+                                                                          ResponseFileReader const& read)
+{
+    // The roots, longest first, so a build tree nested in the source root is replaced before
+    // the source root's own occurrences are -- `PathCanon`'s longest-match rule, as text.
+    std::vector<std::pair<std::string_view, std::string_view>> roots;
+    for (auto const& [root, token]:
+         { std::pair { std::string_view { layout.buildTree }, std::string_view { "<BUILDTREE>" } },
+           std::pair { std::string_view { layout.dependencyRoot }, std::string_view { "<DEPROOT>" } },
+           std::pair { std::string_view { layout.sourceRoot }, std::string_view { "<SRCROOT>" } } })
+        if (!root.empty())
+            roots.emplace_back(root, token);
+    std::ranges::stable_sort(roots, std::ranges::greater {}, [](auto const& row) { return row.first.size(); });
+
+    std::vector<std::string> items;
+    for (auto const& arg: args)
+    {
+        if (!arg.starts_with('@') || arg.size() == 1)
+            continue;
+        auto const path = std::string_view { arg }.substr(1);
+        auto text = read(path);
+        if (!text.has_value())
+            return std::unexpected(std::format("response file {} cannot be read, so its arguments cannot be keyed", path));
+        if (auto const refusal = ResponseFileRefusal(path, *text))
+            return std::unexpected(*refusal);
+
+        for (auto const& [root, token]: roots)
+        {
+            auto at = text->find(root);
+            while (at != std::string::npos)
+            {
+                text->replace(at, root.size(), token);
+                at = text->find(root, at + token.size());
+            }
+        }
+        // A leading NUL is a byte no argument can carry, so the item cannot be mistaken for one.
+        // The file's NAME is not repeated: the relativized arguments already carry it, and the
+        // raw spelling may be absolute.
+        items.push_back(std::format("{}response-file\n{}", '\0', *text));
+    }
+    return items;
+}
 
 std::string KeyedPreprocessedText(std::string_view text)
 {

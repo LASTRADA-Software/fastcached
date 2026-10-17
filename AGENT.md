@@ -160,7 +160,7 @@ the only place it is written down.
 
 **[`.agent/rules/compile-cache.md`](.agent/rules/compile-cache.md)** — what the
 launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
-- Preprocess KEEPING line markers; the key keeps their line numbers and drops their paths — `/E`, never `/P`.
+- Preprocess KEEPING line markers; the key keeps their line numbers and drops their paths — `/E`, never `/P`; an `@file`'s TEXT is keyed.
 - `/` introduces an option only on a Windows layout; on POSIX it starts a path.
 - Only machine-independent dependency paths are hashed, and a path is classified
   by what it *resolves to*, never by its spelling. A CPM cache is a ROOT (`<DEPROOT>`, `FASTCACHE_DEPS_DIR`).

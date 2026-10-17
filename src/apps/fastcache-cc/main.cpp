@@ -2919,8 +2919,30 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
     // aliased one — an `-I` pointing at a symlinked include directory is the
     // ordinary case — and there are few enough arguments that resolving each
     // completely costs nothing measurable.
-    auto const relativizedArgs = Cc::RelativizeArgs(
+    auto relativizedArgs = Cc::RelativizeArgs(
         argv.subspan(1), layout, [&reconciler](std::string_view path) { return reconciler.Directory(path); });
+
+    // What a response file SAYS, which the driver expands and the arguments above only name.
+    // Keyed beside them, so the object key and the manifest key alike see it -- without it a
+    // file changed from `-O0` to `-O2` was answered with the `-O0` object (`ResponseFileKeyItems`).
+    auto const responseFiles =
+        Cc::ResponseFileKeyItems(argv.subspan(1), layout, [](std::string_view path) -> std::optional<std::string> {
+            auto const file = FastCache::PathFromNarrowText(path);
+            if (!file.has_value())
+                return std::nullopt;
+            auto const bytes = Cc::ReadFileBytes(*file);
+            if (!bytes.has_value())
+                return std::nullopt;
+            return std::string { reinterpret_cast<char const*>(bytes->data()), bytes->size() };
+        });
+    if (!responseFiles.has_value())
+    {
+        // The detail goes in a Note: the reason is what `--show-stats` tallies, and one naming
+        // a file is a row per file.
+        Note(record.verbose, responseFiles.error());
+        return Decline(record, "a response file's arguments cannot be keyed; not caching");
+    }
+    relativizedArgs.insert(relativizedArgs.end(), responseFiles->begin(), responseFiles->end());
     // ONE probe for two questions where the driver allows it (#1237). The banner
     // and the target triple both come out of a clang driver's `-###`, and this is
     // a process per translation unit, so a second spawn here is a second spawn per

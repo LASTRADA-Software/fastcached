@@ -32,6 +32,13 @@ collapse or a mis-serve and is now covered by regression tests:
   The path is safe to drop because nothing a key could see depends on it: `__FILE__` is
   already expanded in the text, and a name recorded after preprocessing is root binding's
   and the prefix maps' to answer.
+  - **A response file's TEXT is part of the key, never only its name**
+    (`ResponseFileKeyItems`). The driver expands `@file` itself, so the arguments inside
+    reached neither the object key nor the manifest key: changing `-O0` to `-O2` in the file
+    was answered with the `-O0` object, a direct-mode HIT. Its BYTES are keyed, with the
+    three roots tokenized, so no tokenizer here can disagree with the driver's. A file that
+    cannot be read, names another response file, or carries an output or dependency-file
+    flag (which the launcher must read off the command line) keeps the compile uncached.
   - On MSVC never `/P` beside it: `/P` preprocesses to a `<base>.i` file rather than
     stdout, and `/EP /P` left the launcher hashing an empty stdout, so a Windows key
     carried nothing from the source and an edited file was answered with the object
