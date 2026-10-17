@@ -1098,6 +1098,9 @@ Consequences that are each load-bearing:
     allocations:
 
     <!-- table-total: none -->
+- **[#1701](https://github.com/LASTRADA-Software/fastcached/issues/1701)** — the memcached and Redis surfaces can modify 0xFC compile keys (no namespace), and a
+  `CompileValue` carries no checksum.
+- **[#1706](https://github.com/LASTRADA-Software/fastcached/issues/1706)** — the node's private tier: a FETCH's upstream write-back can overwrite a newer local STORE.
     | standard library | `sizeof` | inline capacity | first allocating length |
     |---|--:|--:|--:|
     | libstdc++ 14 | 32 | 15 | 16 |

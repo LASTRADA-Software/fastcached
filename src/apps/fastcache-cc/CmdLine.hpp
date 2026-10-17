@@ -362,6 +362,17 @@ struct PathValueFlag
     RemoteLine remote { RemoteLine::Dropped };
 };
 
+/// Whether an argument asks the driver to target THIS machine's CPU (`-march=native`,
+/// `-mcpu=native`, `-mtune=native`).
+///
+/// The text names no CPU, so the key cannot read one out of it: two machines passing the
+/// same `-march=native` compile for different instruction sets under identical arguments
+/// (#1688). The key folds what the driver resolves it to instead, and a worker -- which would
+/// resolve it to ITS CPU -- is never handed one.
+/// @param arg One argument.
+/// @return True when it names the host CPU.
+[[nodiscard]] bool NamesHostCpu(std::string_view arg) noexcept;
+
 /// Every flag whose value is a filesystem path, in one table.
 ///
 /// The single source of truth for three questions that used to be answered by

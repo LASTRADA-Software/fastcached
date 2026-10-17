@@ -2362,6 +2362,16 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
                 "STORE key={} bytes={} {}", plan.objectKey, encoded.size(), Cc::RecordedReason(outcome, presented.missing)));
     else
         Note(record.verbose, std::format("STORE exchange failed key={}", plan.objectKey));
+
+    // A compile whose store did not land is not a MISS, which the log defines as compiled AND
+    // stored: the next build misses again, and only its own outcome says why (#1707).
+    if (!outcome.IsHit() && (record.outcome == Cc::Outcome::Miss || record.outcome == Cc::Outcome::Stale))
+    {
+        record.outcome = Cc::Outcome::Unstored;
+        record.outcomeDetail = outcome.kind == Cc::CacheOutcomeKind::Rejected
+                                   ? std::string { "the cache refused the store" }
+                                   : std::format("the store {}", Cc::DescribeTransportFailure(outcome.transportFailure));
+    }
 }
 
 /// DIRECT MODE. Preprocessing a translation unit to derive its key costs ~1.4 s
@@ -2943,6 +2953,21 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
         return Decline(record, "a response file's arguments cannot be keyed; not caching");
     }
     relativizedArgs.insert(relativizedArgs.end(), responseFiles->begin(), responseFiles->end());
+
+    // What `-march=native` names on THIS machine, asked of the driver itself (#1688): the
+    // argument names no CPU, so without this two machines share an object built for one of
+    // them. The unit's own line with `-###` appended, because that runs nothing, writes
+    // nothing, and resolves `native` against everything else the line says (`--target`, `-m32`).
+    if (std::ranges::any_of(argv.subspan(1), Cc::NamesHostCpu))
+    {
+        std::vector<std::string> listing { argv.begin(), argv.end() };
+        listing.emplace_back("-###");
+        auto const run = ProcessRunner().RunCaptureSplit(listing);
+        auto const hostCpu = run.exitCode == 0 ? Cc::HostCpuKeyItem(run.err) : std::nullopt;
+        if (!hostCpu.has_value())
+            return Decline(record, "the CPU -march=native names could not be resolved; not caching");
+        relativizedArgs.push_back(*hostCpu);
+    }
     // ONE probe for two questions where the driver allows it (#1237). The banner
     // and the target triple both come out of a clang driver's `-###`, and this is
     // a process per translation unit, so a second spawn here is a second spawn per
@@ -3226,6 +3251,9 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
     };
 
     auto const cacheStarted = std::chrono::steady_clock::now();
+    // A hit that came back and was refused as STALE, recorded as such rather than as a cold
+    // miss (#1707): a key that is stale every time is a defect `--show-stats` must show.
+    bool staleHit = false;
 
     // How the fetch ended, for the two questions below: whether a MISS may be
     // traced, and whether the STORE is worth the transfer. Carried out of the block
@@ -3394,6 +3422,7 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
                     // of a generation this build cannot read.
                     return Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitObjectUnwritable));
                 }
+                staleHit = materialized.disposition == HitDisposition::Stale;
                 // Stale: the object is fine but the dependency record it carries is not
                 // true here -- or the depfile this build names could not be written, which
                 // says nothing against the entry -- so fall through and compile for real. The STORE that follows
@@ -3418,8 +3447,10 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
     {
         // Which parts, from the marker -- and no claim about WHICH of them differs, which
         // this end cannot know: the trace and the tallied reason say the same thing.
-        TraceOutcome(
-            record, Cc::Outcome::Miss, key, boundMiss.has_value() ? Cc::BoundMissQualifier(*boundMiss) : std::string {});
+        TraceOutcome(record,
+                     staleHit ? Cc::Outcome::Stale : Cc::Outcome::Miss,
+                     key,
+                     boundMiss.has_value() ? Cc::BoundMissQualifier(*boundMiss) : std::string {});
         // A miss carrying a reason, as a crossed reply is: the cache answered honestly, and
         // what it holds under this key names paths this compile does not share -- or this
         // compile's own copy was evicted. Worth ranking, because a translation unit that is a

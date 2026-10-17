@@ -165,6 +165,9 @@ TEST_CASE("ToStringView names every outcome by its token")
     CHECK(ToStringView(Outcome::Unavailable) == "UNAVAILABLE");
     CHECK(ToStringView(Outcome::VerifyMismatch) == "VERIFY-MISMATCH");
     CHECK(ToStringView(Outcome::InputsMoved) == "INPUTS-MOVED");
+    CHECK(ToStringView(Outcome::Unstored) == "UNSTORED");
+    CHECK(ToStringView(Outcome::Stale) == "STALE");
+    CHECK(ToStringView(Outcome::VerifyFailed) == "VERIFY-FAILED");
 }
 
 TEST_CASE("Every outcome reads back from the log as itself", "[stats][1650]")
@@ -174,8 +177,9 @@ TEST_CASE("Every outcome reads back from the log as itself", "[stats][1650]")
     // record carries. `Unavailable` is last on purpose -- it is also what an unknown token reads
     // back as, so a token the parser lost would pass for it; every other entry cannot.
     ScopedStateDir const scoped;
-    constexpr std::array outcomes { Outcome::Hit,         Outcome::Miss,       Outcome::Uncacheable, Outcome::VerifyMismatch,
-                                    Outcome::InputsMoved, Outcome::Unavailable };
+    constexpr std::array outcomes { Outcome::Hit,         Outcome::Miss,     Outcome::Uncacheable, Outcome::VerifyMismatch,
+                                    Outcome::InputsMoved, Outcome::Unstored, Outcome::Stale,       Outcome::VerifyFailed,
+                                    Outcome::Unavailable };
     for (auto const outcome: outcomes)
         AppendRecord(MakeRecord(outcome, "main", std::string { ToStringView(outcome) } + ".cpp", 10));
     auto const records = ParseLog("");
@@ -193,6 +197,9 @@ TEST_CASE("A hit the verifier rejected is recorded as its own outcome and never 
     // fresh object: the cache's was wrong. Recording that as a HIT counted every wrong
     // object the verifier caught as a success.
     CHECK(OutcomeOfServedHit(HitVerdict::Mismatched) == Outcome::VerifyMismatch);
+    // A hit whose fresh compile FAILED is not a hit either (#1707): a source that does not
+    // compile has no object of its own, so the one served for it is suspect.
+    CHECK(OutcomeOfServedHit(HitVerdict::FreshCompileFailed) == Outcome::VerifyFailed);
     // Every other verdict leaves the served object where the build uses it.
     for (auto const verdict:
          { HitVerdict::NotChecked, HitVerdict::Matched, HitVerdict::Inconclusive, HitVerdict::Unsupported })
@@ -246,6 +253,32 @@ TEST_CASE("A compile an edit raced is recorded under its own token and reads bac
     auto const records = ParseLog("");
     REQUIRE(records.size() == 1);
     CHECK(records.front().outcome == Outcome::InputsMoved);
+}
+
+TEST_CASE("FormatReport names stale hits, unstored compiles and failed verifications apart from misses", "[stats][1707]")
+{
+    // Each read as an ordinary MISS or HIT before, so a cache whose stores failed, whose
+    // entries were stale every time, or whose hits the verifier could not compile looked
+    // healthy on the one report an operator reads.
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::Stale, "main", "stale.cpp", 300));
+    AppendRecord(MakeRecord(Outcome::Unstored, "main", "unstored.cpp", 300));
+    AppendRecord(MakeRecord(Outcome::VerifyFailed, "main", "broken.cpp", 300));
+
+    auto const report = FormatReport("");
+    REQUIRE(report.contains("compiles     : 4"));
+    CHECK(report.contains("stale hits   : 1"));
+    CHECK(report.contains("unstored     : 1"));
+    CHECK(report.contains("verify failed: 1"));
+    // All four were asked of the cache, and only the one HIT counts as served: 25%.
+    CHECK(report.contains("25.0% of 4 cacheable"));
+    CHECK_FALSE(report.contains("unavailable"));
+
+    auto const html = FormatHtmlReport("");
+    CHECK(html.contains("stale hits"));
+    CHECK(html.contains("unstored"));
+    CHECK(html.contains("verify failed"));
 }
 
 TEST_CASE("FormatReport counts a compile an edit raced and names its source", "[stats][1650]")

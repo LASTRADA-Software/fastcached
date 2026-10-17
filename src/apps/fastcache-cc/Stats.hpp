@@ -48,6 +48,16 @@ enum class Outcome : std::uint8_t
     /// the path is on the `FASTCACHE_VERBOSE` line.
     /// An input that could not be OBSERVED at all is `Uncacheable`, not this.
     InputsMoved,
+    /// Compiled, and the STORE did not land (refused, or the exchange failed) -- so the next
+    /// build misses again. Its own outcome because `Miss` claims compiled AND stored (#1707).
+    Unstored,
+    /// A hit refused as STALE -- a dependency it replays is missing here, or it carries no
+    /// dependency record the build names -- and compiled for real. Its own outcome because a
+    /// key that is stale every time reads as a cold cache under `Miss` (#1707).
+    Stale,
+    /// A sampled hit whose fresh compile FAILED: the cache served an object for a source this
+    /// compiler does not compile. Never a `Hit`, for `VerifyMismatch`'s reason (#1707).
+    VerifyFailed,
 };
 
 /// @param outcome The outcome to name.

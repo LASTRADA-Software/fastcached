@@ -557,6 +557,15 @@ not support. It undercounts, which is the honest direction.
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
 
+- **[#1690](https://github.com/LASTRADA-Software/fastcached/issues/1690)** — `flush_all` is undone by a restart: the live generation starts at 1 on every open and is never
+  persisted, so purged values come back. Persisting it is a format change (a reserved record), which
+  is why it was not folded into the fix batch that filed it.
+- **[#1702](https://github.com/LASTRADA-Software/fastcached/issues/1702)** — a failed batched flush can leave the failed write's meta pending, so shutdown writes a tree
+  whose pages are already on the free list.
+- **[#1703](https://github.com/LASTRADA-Software/fastcached/issues/1703)** — CAS tokens restart at 1 on reopen while stored records keep theirs.
+- **[#1704](https://github.com/LASTRADA-Software/fastcached/issues/1704)** — TTLs are stored on the boot-relative `steady_clock`, so a reboot extends every stored TTL.
+- **[#1705](https://github.com/LASTRADA-Software/fastcached/issues/1705)** — `LayeredStorage::MirrorL2WriteResult` leaves L1 serving the old value when the re-read of a
+  successful L2 write fails.
 - **[#1633](https://github.com/LASTRADA-Software/fastcached/issues/1633)** — under Fsync, a
   meta that `CommitMetaLocked` has written whose fsync then FAILS leaves `_lastDurableSlot`
   where it was, and `CowTree::AbortTxn` returns that transaction's pages to `_freeList`. The

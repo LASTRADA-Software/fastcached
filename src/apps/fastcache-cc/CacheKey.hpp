@@ -180,6 +180,18 @@ using ResponseFileReader = std::function<std::optional<std::string>(std::string_
                                                                                         PathCanon::Layout const& layout,
                                                                                         ResponseFileReader const& read);
 
+/// What `-march=native` (and its siblings) resolved to, read off the driver's `-###` listing
+/// of the same command line, as one key item -- or nothing when the listing names no target.
+///
+/// The argument names no CPU, so two machines passing it compile for different instruction
+/// sets under one key, and one is served the other's object (#1688). Only the target-shaping
+/// tokens are kept, so the item carries no path: every `-m...` token (gcc expands `native`
+/// into `-march=<cpu>` and the feature switches), and the value after `--param` (cache
+/// sizes), `-target-cpu`, `-tune-cpu` and `-target-feature` (clang).
+/// @param listing The driver's `-###` output (stderr).
+/// @return The key item, or nullopt when nothing target-shaping was listed.
+[[nodiscard]] std::optional<std::string> HostCpuKeyItem(std::string_view listing);
+
 /// The preprocessed text the key hashes: the probe's output with every line marker's PATH
 /// removed and its line number and flags kept.
 ///

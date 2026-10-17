@@ -76,6 +76,28 @@ and comment lines, so a comment inserted above a function kept the key while
 `std::source_location`, `__builtin_LINE` and the `-g` line tables moved, and the
 edited file was served the object built before the edit.
 
+A compile that writes a file beside its object -- `-gsplit-dwarf` (`.dwo`),
+`--coverage` / `-ftest-coverage` (`.gcno`), `-ftime-trace`, `-fstack-usage`,
+`-save-temps`, `-fdump-*`, `-fsave-optimization-record`, `-fcallgraph-info`,
+`-aux-info` -- is not cached: a hit restores only the object and the depfile, so
+the side file would be missing or left over from another build.
+
+Nor is a compile that reads a file the key cannot see: a profile
+(`-fprofile-use`, `-fprofile-sample-use`, `-fauto-profile`, clang's
+`-fprofile-instr-use`), a plugin (`-fplugin`, `-fpass-plugin`), a specs file
+(`-specs=`), or a `-B` tool directory. None of them reaches the preprocessed text
+or the depfile, so a changed profile would otherwise be answered with the object
+built from the old one.
+
+A depfile asked for without naming it -- `-MD`/`-MMD` alone, which make the
+driver write `<object without its extension>.d`, or Kbuild's `-Wp,-MMD,<file>` --
+is restored by a hit exactly as one named with `-MF` is.
+
+`-march=native` (and `-mcpu=`/`-mtune=native`) is keyed by the CPU the compiler
+resolves it to on the machine that compiles, read from its `-###` listing, so a
+shared cache never hands one CPU's object to another. Such a compile is never
+dispatched, since a worker would resolve `native` to its own CPU.
+
 A response file (`@flags.rsp`) is keyed by what it SAYS, not by its name: the
 driver expands it itself, so the key has to read it too, or two builds differing
 only inside the file would share an object. Its bytes are keyed with the source
@@ -717,6 +739,14 @@ than being read by position and misread. The report counts failed compiles only 
 records that carry an exit code, which is what tells a compiler killed from outside
 apart from a cache that broke the build.
 
+Three outcomes say what a plain `MISS` or `HIT` used to hide. `STALE` is a hit the
+launcher refused -- a dependency it replays is missing here -- and compiled for real; a key
+that is stale on every build is a defect worth chasing, not a cold cache. `UNSTORED` is a
+compile whose STORE did not land (refused, or the exchange failed), so the next build misses
+again; `detail` says which. `VERIFY-FAILED` is a hit `FASTCACHE_VERIFY` sampled whose fresh
+compile FAILED: a source that does not compile has no object of its own, so the one served
+for it is suspect -- the build keeps it, and a line on stderr says so.
+
 `INPUTS-MOVED` is a compile one of whose inputs changed while the key was taken or during
 the compile — an editor's save, a `git checkout` in another terminal — so the launcher did
 not store its object (a direct-mode manifest built from the content the key was taken over
@@ -766,7 +796,8 @@ never cached (1 translation units)
 ```
 
 The hit rate is computed over **cacheable** compiles — hits, misses, wrong objects
-(hits `FASTCACHE_VERIFY` rejected) and compiles an input moved during (`INPUTS-MOVED`),
+(hits `FASTCACHE_VERIFY` rejected), compiles an input moved during (`INPUTS-MOVED`), and
+`STALE`, `UNSTORED` and `VERIFY-FAILED`,
 every compile the cache was asked for — not all invocations, so an unreachable daemon does not silently look like a low hit
 rate — it is reported separately as `CACHE NOT REACHED`.
 

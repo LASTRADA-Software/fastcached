@@ -511,6 +511,9 @@ namespace
             case Outcome::Miss:
             case Outcome::VerifyMismatch:
             case Outcome::InputsMoved:
+            case Outcome::Unstored:
+            case Outcome::Stale:
+            case Outcome::VerifyFailed:
                 return true;
             case Outcome::Uncacheable:
             case Outcome::Unavailable:
@@ -532,6 +535,12 @@ namespace
         std::uint64_t verifyMismatches {};
         /// Compiles an input changed during; see `Outcome::InputsMoved`.
         std::uint64_t inputsMoved {};
+        /// Compiles whose store did not land; see `Outcome::Unstored`.
+        std::uint64_t unstored {};
+        /// Hits refused as stale and compiled for real; see `Outcome::Stale`.
+        std::uint64_t stale {};
+        /// Sampled hits whose fresh compile failed; see `Outcome::VerifyFailed`.
+        std::uint64_t verifyFailed {};
         /// Records `CountsAsServable` admits; read through `Servable()`.
         std::uint64_t servableCount {};
 
@@ -571,7 +580,8 @@ namespace
 
         [[nodiscard]] std::uint64_t Total() const noexcept
         {
-            return hits + misses + uncacheable + unavailable + verifyMismatches + inputsMoved;
+            return hits + misses + uncacheable + unavailable + verifyMismatches + inputsMoved + unstored + stale
+                   + verifyFailed;
         }
 
         /// The compiles the cache was ASKED for, which is what a hit rate is rated against;
@@ -666,6 +676,12 @@ namespace
             return Outcome::VerifyMismatch;
         if (token == "INPUTS-MOVED")
             return Outcome::InputsMoved;
+        if (token == "UNSTORED")
+            return Outcome::Unstored;
+        if (token == "STALE")
+            return Outcome::Stale;
+        if (token == "VERIFY-FAILED")
+            return Outcome::VerifyFailed;
         return Outcome::Unavailable;
     }
 
@@ -1099,6 +1115,15 @@ namespace
         if (tally.inputsMoved > 0)
             out << "  inputs moved : " << Colorize(std::to_string(tally.inputsMoved), palette.neutral, palette.reset)
                 << "  (an input changed while the key was taken or during the compile; object not stored)\n";
+        if (tally.stale > 0)
+            out << "  stale hits   : " << Colorize(std::to_string(tally.stale), palette.bad, palette.reset)
+                << "  (served entries refused as stale here and compiled again)\n";
+        if (tally.unstored > 0)
+            out << "  unstored     : " << Colorize(std::to_string(tally.unstored), palette.bad, palette.reset)
+                << "  (compiled, but the STORE did not land -- the next build misses again)\n";
+        if (tally.verifyFailed > 0)
+            out << "  verify failed: " << Colorize(std::to_string(tally.verifyFailed), palette.bad, palette.reset)
+                << "  (a served hit whose fresh compile FAILED -- the cached entry may be stale)\n";
         if (tally.unavailable > 0)
             out << "  unavailable  : " << Colorize(std::to_string(tally.unavailable), palette.bad, palette.reset) << "  ("
                 << Percent(tally.unavailable, tally.Total()) << " of all compiles -- "
@@ -1157,6 +1182,12 @@ std::string_view ToStringView(Outcome outcome) noexcept
             return "VERIFY-MISMATCH";
         case Outcome::InputsMoved:
             return "INPUTS-MOVED";
+        case Outcome::Unstored:
+            return "UNSTORED";
+        case Outcome::Stale:
+            return "STALE";
+        case Outcome::VerifyFailed:
+            return "VERIFY-FAILED";
         case Outcome::Unavailable:
             break;
     }
@@ -1169,6 +1200,8 @@ Outcome OutcomeOfServedHit(HitVerdict verdict) noexcept
     {
         case HitVerdict::Mismatched:
             return Outcome::VerifyMismatch;
+        case HitVerdict::FreshCompileFailed:
+            return Outcome::VerifyFailed;
         case HitVerdict::NotChecked:
         case HitVerdict::Matched:
         case HitVerdict::Inconclusive:
@@ -1394,6 +1427,17 @@ namespace
                         break;
                     case Outcome::InputsMoved:
                         ++tally->inputsMoved;
+                        break;
+                    case Outcome::Unstored:
+                        ++tally->unstored;
+                        tally->missMs.push_back(record.elapsedMs);
+                        break;
+                    case Outcome::Stale:
+                        ++tally->stale;
+                        tally->missMs.push_back(record.elapsedMs);
+                        break;
+                    case Outcome::VerifyFailed:
+                        ++tally->verifyFailed;
                         break;
                 }
                 if (CountsAsServable(record.outcome))
@@ -1926,6 +1970,12 @@ std::string FormatHtmlReport(std::string_view groupFilter)
     // Conditional for the same reason: most dashboards have no editor racing a build.
     if (overall.inputsMoved > 0)
         AppendTallyCard(out, "inputs moved", overall.inputsMoved, "uncache");
+    if (overall.stale > 0)
+        AppendTallyCard(out, "stale hits", overall.stale, "bad");
+    if (overall.unstored > 0)
+        AppendTallyCard(out, "unstored", overall.unstored, "bad");
+    if (overall.verifyFailed > 0)
+        AppendTallyCard(out, "verify failed", overall.verifyFailed, "bad");
     out << "</div>";
 
     out << R"(<div class="panel"><div class="panel-title">hit rate over time</div>)" << RenderTrendSvg(records) << "</div>";
