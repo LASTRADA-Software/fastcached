@@ -177,7 +177,7 @@ namespace
     /// exceeds Clang's 256-deep expression nesting limit and fails to compile. A
     /// stated extent only diagnoses rows being ADDED, so the `static_assert` below
     /// the table closes the other direction.
-    constexpr std::array<AllowedArg, 343> AllowedArgs {
+    constexpr std::array<AllowedArg, 346> AllowedArgs {
         // -- optimization ------------------------------------------------------
         AllowedArg { .spelling = "O", .families = DriverFamily::Any },
         AllowedArg { .spelling = "O0", .families = DriverFamily::Any },
@@ -304,6 +304,32 @@ namespace
         AllowedArg { .spelling = "gpubnames", .families = DriverFamily::Any },
         AllowedArg { .spelling = "ggnu-pubnames", .families = DriverFamily::Any },
         AllowedArg { .spelling = "gcodeview", .families = DriverFamily::Any },
+        // What a clang object RECORDS about where it was built (#1681: Lastrada's clang-cl line
+        // carries all three). Each value is recorded, never opened, and each row is `.`-shaped
+        // (`NoPathSeparator`): a directory the line names would be the client's, not the worker's.
+        // Measured with clang 22.1.8, one TU compiled by the client from its build directory
+        // (relative `/Fo`, absolute source) against the worker's compile of the client's `/E` text
+        // from its own directory into `scratch/job-N` (`/TP /Fo<scratch>/tu.o`):
+        //
+        //   clang-cl `/Z7`, no flag              LF_BUILDINFO cwd and `-cc1` line differ (two cwd tokens)
+        //   `-fdebug-compilation-dir=.`          cwd `.` on BOTH; one `-cc1` token left
+        //   `-fcoverage-compilation-dir=.`       only the recorded `-cc1` line moves; `.text`/`.debug$S` identical
+        //   `-gno-codeview-command-line`         the `-cc1` line and build tool are gone on BOTH
+        //   clang++ `-g` (ELF), no flag          `DW_AT_comp_dir` differs
+        //   `-fdebug-compilation-dir=.`          `DW_AT_comp_dir` `.` on BOTH; the CU name is the client's
+        //   the other two on ELF                 objects byte-identical to the no-flag pair
+        //
+        // So each brings the worker's object closer to the client's and none moves it further;
+        // `S_OBJNAME` and the scratch source name differ with or without them, the COFF cost the
+        // rulebook already accepts. A client that maps its build directory gets with the flag what
+        // it got without: the worker's directory rules do not match `.`. gcc has none of the three
+        // and refuses each, on a client and a worker alike. `-fcoverage-mapping` stays a `Deny` row,
+        // so the coverage directory is inert on any compile this worker runs.
+        AllowedArg {
+            .spelling = "fdebug-compilation-dir=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "fcoverage-compilation-dir=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "gno-codeview-command-line", .families = DriverFamily::Any },
         AllowedArg { .spelling = "p", .families = DriverFamily::Any },
         AllowedArg { .spelling = "pg", .families = DriverFamily::Any },
 

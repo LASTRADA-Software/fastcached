@@ -1275,6 +1275,80 @@ TEST_CASE("A clang-cl unit with a SYSTEM include directory is dispatched, and th
     CHECK_FALSE(IsAcceptableJobArgument("/imsvcdeps", clangCl, { std::vector<std::string> { "/imsvcdeps" } }));
 }
 
+TEST_CASE("What a clang object records about where it was built travels, and nothing it could open does",
+          "[compile-job][msvc][clang-cl][refused-arguments]")
+{
+    // #1681. Lastrada's clang-cl line carries all three, and each was refused -- so every unit of
+    // that build compiled on its client. Each value is RECORDED and never opened, and the
+    // measurement on the rows says what each does to the worker's object: brings it closer to the
+    // client's, never further.
+    for (auto const* flag: { "-fdebug-compilation-dir=.", "-fcoverage-compilation-dir=.", "-gno-codeview-command-line" })
+    {
+        INFO("flag " << flag);
+        CHECK(IsAcceptableJobArgument(flag, DriverOf(Flavor::ClangCl)));
+        CHECK(IsAcceptableJobArgument(flag, DriverOf(Flavor::Clang)));
+    }
+
+    // A directory the line names is the CLIENT's, so the rows admit `.`-shaped values and the
+    // shape rule refuses one carrying a path -- through an operator entry as well.
+    for (auto const* pathValued: { "-fdebug-compilation-dir=/home/ci/build", R"(-fcoverage-compilation-dir=C:\build)" })
+    {
+        INFO("argument " << pathValued);
+        std::vector<std::string> const naming { std::string { pathValued } };
+        CHECK_FALSE(IsAcceptableJobArgument(pathValued, DriverOf(Flavor::ClangCl), naming));
+    }
+
+    // The coverage family's other members are still refused by ROW: an operator naming them
+    // admits nothing, so narrowing `fcoverage` to its members re-opened none of them.
+    for (auto const* hostile: { "-fcoverage-mapping", "-fcoverage-mcdc", "-fcoverage-prefix-map=a=b" })
+    {
+        INFO("argument " << hostile);
+        std::vector<std::string> const naming { std::string { hostile } };
+        CHECK_FALSE(IsAcceptableJobArgument(hostile, DriverOf(Flavor::Clang), naming));
+    }
+
+    // And the line end to end: the launcher keeps the three, and a clang-cl worker runs it.
+    std::vector<std::string> const argv {
+        R"(C:\LLVM\bin\clang-cl.exe)",
+        "/nologo",
+        "-TP",
+        "/DWIN32",
+        "/EHsc",
+        "/Od",
+        "-MDd",
+        "-Z7",
+        "-fdebug-compilation-dir=.",
+        "-fcoverage-compilation-dir=.",
+        "-gno-codeview-command-line",
+        "/W4",
+        "/WX",
+        R"(/Fosrc\a.cpp.obj)",
+        R"(/Fdsrc\a.pdb)",
+        "-c",
+        "--",
+        R"(C:\src\a.cpp)",
+    };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+    auto const remote = RemoteCompileArgs(cmd, argv, {});
+    INFO("the launcher refused: " << remote.error_or(""));
+    REQUIRE(remote.has_value());
+
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "clang-cl", argv.front() } }, ToolchainSurvey::Completed() };
+    auto job = Job(*remote);
+    job.fingerprint = "clang-cl";
+    auto const outcome = jobs.Run(job);
+    INFO("the worker refused: " << (outcome.has_value() ? std::string {} : outcome.error().detail));
+    REQUIRE(outcome.has_value());
+    for (auto const* flag: { "-fdebug-compilation-dir=.", "-fcoverage-compilation-dir=.", "-gno-codeview-command-line" })
+    {
+        INFO("flag " << flag);
+        CHECK(std::ranges::contains(runner.Argv(), flag));
+    }
+}
+
 TEST_CASE("Of the external-header family, what decides warnings travels and the directories never do", "[compile-job][msvc]")
 {
     // The rows are drawn from a measurement (see the `external:W` row): the level and

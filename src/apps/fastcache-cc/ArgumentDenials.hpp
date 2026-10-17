@@ -135,7 +135,14 @@ inline constexpr std::array DeniedArguments {
     // `.gcda` and `-fprofile-use=` reads one, both at paths the driver derives
     // rather than at anything on the command line.
     DeniedArgument { .spelling = "fprofile", .families = DriverFamily::Any },
-    DeniedArgument { .spelling = "fcoverage", .families = DriverFamily::Any },
+    // The coverage family by MEMBER rather than by `fcoverage`, because one member is not of it:
+    // `-fcoverage-compilation-dir=` only records a directory, and is allowed for Lastrada's
+    // clang-cl line (#1681). `clang --help-hidden` (22.1.8) lists four `-fcoverage-*` options, and
+    // these are the other three -- the mapping, its MC/DC extension and the path-valued prefix map;
+    // gcc 16 lists none. A member a later clang adds is refused by absence, as every unlisted `-f`.
+    DeniedArgument { .spelling = "fcoverage-mapping", .families = DriverFamily::Any },
+    DeniedArgument { .spelling = "fcoverage-mcdc", .families = DriverFamily::Any },
+    DeniedArgument { .spelling = "fcoverage-prefix-map", .families = DriverFamily::Any },
     DeniedArgument { .spelling = "ftest-coverage", .families = DriverFamily::Any },
     // MSVC's separate-PDB debug formats. `/Z7` is allowed above and is the whole
     // reason these two are not: it puts the debug information IN the object, which
