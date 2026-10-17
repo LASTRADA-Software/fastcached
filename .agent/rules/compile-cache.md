@@ -2933,6 +2933,25 @@ nobody can account for.
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
 
+- **[#1693](https://github.com/LASTRADA-Software/fastcached/issues/1693)** — environment variables that add compiler arguments (`CL`, `_CL_`, `CCC_OVERRIDE_OPTIONS`,
+  `COMPILER_PATH`, `GCC_EXEC_PREFIX`) are not keyed, so builds differing only there share an object.
+- **[#1694](https://github.com/LASTRADA-Software/fastcached/issues/1694)** — direct mode drops every toolchain-classified header from the manifest, so a library header
+  upgrade (system, vcpkg, SDK) is answered with objects compiled against the old one.
+- **[#1695](https://github.com/LASTRADA-Software/fastcached/issues/1695)** — `__DATE__`/`__TIME__` are detected only in the main source, so one used from a header gets a
+  stale direct-mode hit.
+- **[#1696](https://github.com/LASTRADA-Software/fastcached/issues/1696)** — a dispatched compile's synthesised depfile ignores `-MT`/`-MQ`/`-MP` and is stored for every
+  later hit.
+- **[#1697](https://github.com/LASTRADA-Software/fastcached/issues/1697)** — a `-x` after the source makes a worker compile another language than the local compile, and
+  the result is stored under the local key.
+- **[#1698](https://github.com/LASTRADA-Software/fastcached/issues/1698)** — a failed `--version` probe keys every compiler of one name alike.
+- **[#1699](https://github.com/LASTRADA-Software/fastcached/issues/1699)** — `PathCanon`'s comparison case-folds on POSIX layouts, and a prefix-map head's trailing separator
+  is lost in the key.
+- **[#1700](https://github.com/LASTRADA-Software/fastcached/issues/1700)** — gcc's implicit `.gch` is used for the object but is not in the key.
+- **[#1707](https://github.com/LASTRADA-Software/fastcached/issues/1707)** — the verifier compares only the object, not the depfile or the replayed streams, and the servers
+  count hits on values the launcher then rejects (the store, stale and failed-verify outcomes landed).
+- **[#1708](https://github.com/LASTRADA-Software/fastcached/issues/1708)** — lower-severity robustness: atomic temp names that can collide across PID namespaces, an object
+  stored without checking this run wrote it, `flush_all <delay>` ignored, an in-memory decompression
+  failure answered as an empty value.
 - **[#1653](https://github.com/LASTRADA-Software/fastcached/issues/1653)** — a header
   replaced during the key's preprocess by a copy that keeps an older change time is not seen by
   the input witness. On NTFS `CopyFileW` copies the SOURCE's change time onto the destination
