@@ -177,7 +177,7 @@ namespace
     /// exceeds Clang's 256-deep expression nesting limit and fails to compile. A
     /// stated extent only diagnoses rows being ADDED, so the `static_assert` below
     /// the table closes the other direction.
-    constexpr std::array<AllowedArg, 346> AllowedArgs {
+    constexpr std::array<AllowedArg, 353> AllowedArgs {
         // -- optimization ------------------------------------------------------
         AllowedArg { .spelling = "O", .families = DriverFamily::Any },
         AllowedArg { .spelling = "O0", .families = DriverFamily::Any },
@@ -509,6 +509,21 @@ namespace
             .spelling = "fno-sanitize-recover=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fsanitize-trap=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fno-sanitize-trap=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        // AddressSanitizer's instrumentation switches, which clang's driver writes beside
+        // `-fsanitize=address` (`-fsanitize-address-use-after-scope` on every unit of an ASan
+        // build, #1677). They change only the code the instrumentation emits: no path, no
+        // file, no program. Spellings checked against clang 22's `--help-hidden` rather
+        // than inferred; the use-after-return MODE (`runtime`, `always`, `never`) is the one
+        // value, and the shape rule keeps it a word.
+        AllowedArg { .spelling = "fsanitize-address-use-after-scope", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-sanitize-address-use-after-scope", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fsanitize-address-use-after-return=",
+                     .families = DriverFamily::Any,
+                     .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fsanitize-address-globals-dead-stripping", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-sanitize-address-globals-dead-stripping", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fsanitize-address-use-odr-indicator", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-sanitize-address-use-odr-indicator", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fexcess-precision=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fabi-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fabi-compat-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },

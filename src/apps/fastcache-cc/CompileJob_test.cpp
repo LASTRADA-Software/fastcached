@@ -1349,6 +1349,51 @@ TEST_CASE("What a clang object records about where it was built travels, and not
     }
 }
 
+TEST_CASE("An ASan build's line passes a worker whole", "[compile-job]")
+{
+    // #1677: clang's driver line for `-fsanitize=address` carries
+    // `-fsanitize-address-use-after-scope`, and the worker refused every such unit.
+    std::vector<std::string> const argv { "clang++",
+                                          "-O1",
+                                          "-g",
+                                          "-fsanitize=address,undefined",
+                                          "-fsanitize-address-use-after-scope",
+                                          "-fno-omit-frame-pointer",
+                                          "-c",
+                                          "a.cpp",
+                                          "-o",
+                                          "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+    auto const remote = RemoteCompileArgs(cmd, argv, "x86_64-pc-linux-gnu");
+    REQUIRE(remote.has_value());
+    REQUIRE(std::ranges::contains(*remote, "-fsanitize-address-use-after-scope"));
+    auto const& clang = DriverOf(Flavor::Clang);
+    for (auto const& argument: *remote)
+    {
+        INFO("argument " << argument);
+        CHECK(IsAcceptableJobArgument(argument, clang));
+    }
+
+    // The rest of the family, as clang 22 spells it.
+    for (auto const* flag: { "-fno-sanitize-address-use-after-scope",
+                             "-fsanitize-address-use-after-return=runtime",
+                             "-fsanitize-address-use-after-return=never",
+                             "-fsanitize-address-globals-dead-stripping",
+                             "-fno-sanitize-address-globals-dead-stripping",
+                             "-fsanitize-address-use-odr-indicator",
+                             "-fno-sanitize-address-use-odr-indicator" })
+    {
+        INFO("flag " << flag);
+        CHECK(IsAcceptableJobArgument(flag, clang));
+    }
+
+    // Enumerated, never a `-fsanitize-address-` prefix: an unlisted member is refused, and
+    // the one valued member takes a word, not a path.
+    CHECK_FALSE(IsAcceptableJobArgument("-fsanitize-address-foo", clang));
+    CHECK_FALSE(IsAcceptableJobArgument("-fsanitize-address-use-after-return=/tmp/x", clang));
+}
+
 // --- clang-cl's `-clang:<arg>` pass-through (#1672) ---------------------------
 
 TEST_CASE("A clang-cl pass-through is admitted by the argument it passes", "[compile-job][clang-cl]")
