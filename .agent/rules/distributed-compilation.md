@@ -106,6 +106,18 @@ is the reproducible lesson, since no unit test can reach either:
     character away -- `cl` has `/u` and `/utf-8`, which this repository passes to every MSVC
     compile, so a matcher folding case would swallow them. The first census written for that
     comment folded case by accident and reported all three as collisions.
+  - **A pass-through carrying one IS one** (`-clang:-DFOO=2`, `/clang:-UBAR`, #1680), and
+    leaving it on the line is the defect in its WORST form, because a clang-cl worker compiles
+    under `/TP` and that preprocesses the text AGAIN. Measured with clang-cl 22.1.8 at `/O2`:
+    over `#undef x` and `int f() { int x = 1; { int y = 5; return x; } }`, `-clang:-Dx=y` on the
+    dispatched line made the worker's `f()` return **5** where the client's returns **1** -- exit
+    0, so the object was accepted and cached. It went live the day a worker learned to admit
+    `-clang:<arg>` (#1672), while the drop still matched only the bare spellings.
+    **A SEPARATED one is not dispatched at all**: clang-cl hands the clang driver its
+    pass-throughs IN ORDER, so the value of `-clang:-D` is the next `-clang:` argument ANYWHERE
+    on the line (measured, `-clang:-D /O2 t.cpp -clang:FOO=3` defines `FOO=3`), and no drop by
+    position is right -- "the next argument" there was `/O2`. The key and a local compile read
+    the whole line, so it is still cached.
 
 - **The worker's argument filter is an ALLOWLIST, not a shape-based denylist**
   (`IsAcceptableJobArgument`, `CompileJob.cpp`). The client's arguments are spliced
@@ -201,6 +213,12 @@ is the reproducible lesson, since no unit test can reach either:
     grammar that parses it, by the WHOLE built-in set** — side artefacts, `Deny` rows and the
     allowlist alike — and a refused inner argument STAYS refused above `--allow-compile-arg`,
     which is why the verdict is three-valued (`BuiltInVerdict`) rather than a `bool` (#1672).
+    **And the LAUNCHER unwraps it through the same seam** (`MatchPassThrough`, `CmdLine.hpp`),
+    asked INSIDE its side-artefact, denial and macro-switch checks rather than beside them, so
+    no call site can forget it (#1680). Deliberately not unwrapped: `PathValueFlags()` (its
+    `-clang:-MF` rows are `joinedOnly`, a separated value being a second pass-through), and the
+    language selectors, where a `-clang:` spelling is one the worker refuses -- a local compile,
+    never a wrong object.
   - **A flag that decides what a compile of PREPROCESSED text reports is forwarded, never
     dropped — under `/WX` a dropped warning switch is a failed compile the client passed.**
     MSVC's `/external:` family is the case that forced it: CMake writes `-external:I<dir>

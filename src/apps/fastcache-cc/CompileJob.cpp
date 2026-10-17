@@ -695,40 +695,6 @@ namespace
         return !body.contains('/') && !body.contains('\\');
     }
 
-    /// An option whose fused remainder is ONE argument for a different driver grammar.
-    ///
-    /// clang-cl's `/clang:<arg>` (and `-clang:<arg>`) hands `<arg>` to the clang driver
-    /// underneath it, which parses it with clang's OWN option table rather than clang-cl's.
-    /// CMake writes the C++ standard that way for clang-cl, which has no `/std:c++23`
-    /// (`-clang:-std=c++23`, on every unit of a C++23 build), so refusing the prefix by
-    /// absence made every such build distribute nothing (#1672).
-    ///
-    /// **The inner argument is judged as if it stood alone, under the grammar it is parsed
-    /// by** -- the side-artefact table, every `DeniedArguments` row and the allowlist, in
-    /// that order -- so the prefix admits nothing that argument standing alone would not:
-    /// `-clang:-fplugin=x` is refused by the `fplugin` row exactly as `-fplugin=x` is.
-    /// The grammar is the GNU clang driver's (`Flavor::Clang`) because that is the table
-    /// clang parses `<arg>` with: GNU spellings only, `-` the only introducer, so
-    /// `-clang:/O2` names a FILE to that driver and is refused, and an MSVC-only row never
-    /// reaches an inner argument. Every GNU-spelled row is `Any` already (see `AllowedArg`),
-    /// so `-clang:-std=c++23` is admitted exactly when `-std=c++23` is.
-    ///
-    /// The row is scoped to the family that spells the prefix, as the `-clang:-MF` rows of
-    /// `PathValueFlags()` are. `DriverFamily` cannot tell `cl` from clang-cl; `cl` does not
-    /// implement the prefix, and a line it ignores is one the client's own `cl` ignored, by
-    /// the fingerprint argument the `Any` rows rest on.
-    struct PassThroughPrefix
-    {
-        std::string_view spelling;                    ///< The prefix, without its leading `-` or `/`.
-        DriverFamily families { DriverFamily::None }; ///< Which driver families spell it.
-        Flavor innerGrammar { Flavor::Unknown };      ///< The driver whose rules judge the inner argument.
-    };
-
-    /// Every pass-through prefix a worker unwraps before judging an argument.
-    constexpr std::array PassThroughPrefixes {
-        PassThroughPrefix { .spelling = "clang:", .families = DriverFamily::Msvc, .innerGrammar = Flavor::Clang },
-    };
-
     /// What the built-in rules say about one argument, before an operator's list is asked.
     ///
     /// Private to this file: never transmitted and never persisted. THREE answers rather
@@ -741,20 +707,6 @@ namespace
         Refused,      ///< A built-in rule refuses it; no operator entry can re-admit it.
         Unrecognised, ///< No built-in rule speaks for it; only an operator entry can admit it.
     };
-
-    /// The pass-through row @p body begins with for a driver of @p family, if any.
-    /// @param body The argument with one introducer stripped.
-    /// @param family The worker's driver family.
-    /// @return The row, or null.
-    [[nodiscard]] PassThroughPrefix const* MatchPassThrough(std::string_view body, DriverFamily family)
-    {
-        // A loop rather than a named `find_if` iterator, for the reason `FindDeniedArgument`
-        // gives: no single spelling of the iterator's type satisfies clang-tidy everywhere.
-        for (PassThroughPrefix const& row: PassThroughPrefixes)
-            if (Overlaps(row.families, family) && body.starts_with(row.spelling))
-                return &row;
-        return nullptr;
-    }
 
     /// The built-in rules' answer for one argument, in the order that makes them safe.
     /// @param arg One argument, as the driver would receive it.
@@ -814,13 +766,12 @@ namespace
         // BEFORE the allowlist, and that order is the structure rather than a convention: an
         // `AllowedArgs` row that happened to prefix the pass-through's spelling would
         // otherwise admit `-clang:<anything>` without the inner argument ever being judged.
-        if (auto const* passThrough = MatchPassThrough(body, driver.family))
+        if (auto const passed = MatchPassThrough(arg, driver.family); passed.has_value())
         {
-            auto const inner = body.substr(passThrough->spelling.size());
-            auto const& innerDriver = DriverOf(passThrough->innerGrammar);
-            if (inner.empty() || !IntroducersOf(innerDriver.family).contains(inner.front()))
+            auto const& innerDriver = DriverOf(passed->into);
+            if (passed->inner.empty() || !IntroducersOf(innerDriver.family).contains(passed->inner.front()))
                 return BuiltInVerdict::Refused;
-            return JudgeBuiltIn(inner, innerDriver);
+            return JudgeBuiltIn(passed->inner, innerDriver);
         }
 
         if (std::ranges::any_of(AllowedArgs, [&](AllowedArg const& row) { return ArgRowMatches(row, body, driver.family); }))

@@ -186,11 +186,19 @@ static_assert(std::ranges::none_of(DeniedArguments, [](DeniedArgument const& row
 /// One introducer is stripped before the rows are asked, exactly as the allowlist strips it, so a
 /// row covers `/link` and `-link` alike. An argument that introduces no option is a bare word --
 /// an input file on a compiler's command line -- and no row speaks for it.
+///
+/// A pass-through (`-clang:-fplugin=x`) is asked as the argument it carries, of the family of the
+/// driver it is handed to (`MatchPassThrough`), so the launcher refuses before the lease exactly
+/// what the worker refuses after it, rather than spending a lease, a round trip and the whole
+/// preprocessed translation unit to learn it (#1680).
 /// @param arg One argument, as it would be passed to the compiler.
 /// @param family The driver family that would receive it.
 /// @return The refusing row, or nullptr when no row refuses it.
 [[nodiscard]] inline DeniedArgument const* FindDeniedArgument(std::string_view arg, DriverFamily family) noexcept
 {
+    if (auto const passed = MatchPassThrough(arg, family); passed.has_value())
+        return FindDeniedArgument(passed->inner, DriverOf(passed->into).family);
+
     auto const introducers = IntroducersOf(family);
     if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
         return nullptr;

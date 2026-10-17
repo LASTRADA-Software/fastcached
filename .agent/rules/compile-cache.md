@@ -100,7 +100,10 @@ collapse or a mis-serve and is now covered by regression tests:
   "no source file found" and was passed through *in silence*, which reads exactly
   like a broken cache; and the obvious "add .ixx so modules are supported" change
   would have turned that accident into a silent wrong build. The refusal now says
-  so under `FASTCACHE_VERBOSE`.
+  so under `FASTCACHE_VERBOSE`. **The flag half holds through clang-cl's pass-through
+  too** (`/clang:-fmodule-output=x.pcm`, #1680): `ProducesSideArtefact` judges the
+  argument a pass-through carries, by the driver it is handed to, where it used to read
+  the whole spelling, match no row, and cache a compile whose hit came back without its BMI.
 
   **`cl /Yu` is refused as well although it writes nothing**: its object is
   tied to the one `pch.obj` it was compiled against, and the key sees neither tie.

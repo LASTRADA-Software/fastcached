@@ -2,6 +2,7 @@
 #include "ArgumentDenials.hpp"
 #include "CacheKey.hpp"
 #include "CmdLine.hpp"
+#include "IProcessRunner.hpp"
 
 #include <FastCache/Platform/EnvironmentTestUtils.hpp>
 
@@ -11,6 +12,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <iterator>
 #include <optional>
 #include <ranges>
@@ -2177,4 +2179,151 @@ TEST_CASE("CompilerWorkingDirectory keeps the symlinked spelling a driver report
 #endif
 
     std::filesystem::remove_all(base);
+}
+
+// --- clang-cl's pass-through, read by the launcher's own checks (#1680) -----------------
+
+TEST_CASE("A module output spelled through clang-cl's pass-through is not cached (#1680)", "[launcher][cmdline][msvc]")
+{
+    // clang-cl hands `/clang:-fmodule-output=x.pcm` to the clang driver, which writes the module
+    // file beside the object. Judged by its whole spelling it matched no side-artefact row, so the
+    // compile was cached and a hit restored the object without the BMI the build named.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    for (auto const* wrapped: { "/clang:-fmodule-output=x.pcm", "-clang:-fmodule-output=x.pcm" })
+    {
+        INFO("argument " << wrapped);
+        CHECK(ProducesSideArtefact(wrapped, clangCl));
+        auto const cmd = Parse({ "clang-cl.exe", "/c", wrapped, "/Foa.obj", "a.cpp" });
+        CHECK(cmd.sideArtefact);
+        CHECK_FALSE(cmd.parsedOk);
+    }
+
+    // The control: a pass-through that writes nothing else stays cacheable, so the refusal above
+    // is the inner argument's and not the prefix's.
+    CHECK_FALSE(ProducesSideArtefact("-clang:-std=c++23", clangCl));
+    auto const plain = Parse({ "clang-cl.exe", "/c", "-clang:-std=c++23", "/Foa.obj", "a.cpp" });
+    CHECK(plain.parsedOk);
+    CHECK_FALSE(plain.sideArtefact);
+
+    // And a GNU driver has no such prefix: there `-clang:` is not unwrapped at all.
+    CHECK_FALSE(ProducesSideArtefact("-clang:-fmodule-output=x.pcm", DriverOf(Flavor::Clang)));
+}
+
+TEST_CASE("A macro switch spelled through clang-cl's pass-through leaves only the worker's line (#1680)",
+          "[launcher][cmdline][msvc]")
+{
+    // #1481's rule, through the pass-through spelling. A clang-cl worker compiles its text under
+    // `/TP`, which preprocesses it AGAIN, so a definition reaching it re-expands identifiers the
+    // client's source had `#undef`ed -- measured as a silent miscompile (see `MatchMacroFlag`).
+    std::vector<std::string> const argv { "clang-cl.exe",      "/c",  "-clang:-DFOO=2", "/clang:-UBAR",
+                                          "-clang:-std=c++23", "/O2", "/Foa.obj",       "a.cpp" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    for (auto const* gone: { "-clang:-DFOO=2", "/clang:-UBAR" })
+    {
+        INFO("macro switch " << gone);
+        CHECK_FALSE(std::ranges::contains(remote, gone));
+    }
+    // The pass-throughs that decide generated code survive -- a fix that dropped every
+    // `-clang:` argument satisfies the assertions above and fails these.
+    for (auto const* kept: { "-clang:-std=c++23", "/O2" })
+    {
+        INFO("flag " << kept);
+        CHECK(std::ranges::contains(remote, kept));
+    }
+
+    // And both PREPROCESS lines keep them: the key's, and the one producing the text the worker
+    // is handed. Dropping one there compiles a different program under this program's key.
+    for (auto const& line: { PreprocessCommand(cmd, argv), DispatchPreprocessCommand(cmd, argv) })
+        for (auto const* macro: { "-clang:-DFOO=2", "/clang:-UBAR" })
+        {
+            INFO("macro switch " << macro);
+            CHECK(std::ranges::contains(line, macro));
+        }
+}
+
+TEST_CASE("A pass-through macro switch with a separated value is not dispatched, and still cached (#1680)",
+          "[launcher][cmdline][msvc]")
+{
+    // clang-cl hands the clang driver its pass-throughs IN ORDER, so the value of `-clang:-D` is the
+    // next `-clang:` argument ANYWHERE on the line -- measured, this line defines FOO=3. Dropping
+    // "the next argument" would have taken `/O2` off the worker's line and left `-clang:FOO=3` on it.
+    std::vector<std::string> const argv { "clang-cl.exe", "/c", "-clang:-D", "/O2", "a.cpp", "-clang:FOO=3", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+    // Cacheable: the key and a local compile read the whole line, as the driver does.
+    REQUIRE(cmd.parsedOk);
+    CHECK_FALSE(cmd.separatedPassThrough);
+
+    auto const remote = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+    REQUIRE_FALSE(remote.has_value());
+    CHECK(remote.error().contains("-clang:-D"));
+
+    // The fused form beside it is dispatched, which is the control that the refusal is the shape's.
+    std::vector<std::string> const fused { "clang-cl.exe", "/c", "-clang:-DFOO=3", "/O2", "a.cpp", "/Foa.obj" };
+    CHECK(RemoteCompileArgs(ParseCommand(fused), fused, /*targetTriple=*/ {}).has_value());
+}
+
+TEST_CASE("A real clang-cl worker re-expands no definition the client's source had undefined (#1680)",
+          "[launcher][cmdline][msvc]")
+{
+    // The defect end to end, on the driver it lives in. The client preprocesses with its own
+    // dispatch line; the worker's compile under `/TP` preprocesses that text AGAIN, with the line
+    // `RemoteCompileArgs` hands it. A definition left on that line re-expands an identifier the
+    // source had `#undef`ed: `return x` becomes `return y`, which compiles -- measured at /O2, the
+    // worker's `f()` returned 5 where the client's returned 1, and the object was accepted.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-cc-pass-through-macro" };
+    auto const runner = MakeProcessRunner();
+    auto const source = scratch.Path() / "tu.cpp";
+    std::ofstream { source } << "#undef x\nint f() { int x = 1; { int y = 5; return x; } }\n";
+
+    std::optional<std::string> driver;
+    for (auto const* candidate: { "clang-cl.exe", "clang-cl" })
+        if (runner->RunCaptureSplit(std::vector<std::string> { candidate, "/nologo", "/E", source.string() }).exitCode == 0)
+        {
+            driver = candidate;
+            break;
+        }
+    if (!driver.has_value())
+        SKIP("no clang-cl on this host can preprocess");
+    REQUIRE(driver.has_value());
+    auto const& clangCl = Unwrap(driver);
+
+    // Relative to this process's working directory, because a POSIX absolute path begins with `/`,
+    // which an MSVC-family driver line reads as an option: the parse would find no source.
+    auto const sourceArg = std::filesystem::proximate(source).string();
+    std::vector<std::string> const argv { clangCl, "/c", "/O2", "-clang:-Dx=y", "/Fotu.obj", sourceArg };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const clientText = runner->RunCaptureSplit(DispatchPreprocessCommand(cmd, argv));
+    REQUIRE(clientText.exitCode == 0);
+    REQUIRE(clientText.out.contains("return x"));
+
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+    REQUIRE(parsed.has_value());
+    auto const text = scratch.Path() / "job.cpp";
+    std::ofstream { text, std::ios::binary } << clientText.out;
+
+    // The worker's own preprocess of that text, under exactly the dispatched line.
+    auto const workerPreprocess = [&](std::vector<std::string> extra) {
+        std::vector<std::string> line { clangCl, "/nologo", "/E" };
+        line.insert(line.end(), Unwrap(parsed).begin(), Unwrap(parsed).end());
+        line.insert(line.end(), extra.begin(), extra.end());
+        line.push_back(std::filesystem::proximate(text).string());
+        return runner->RunCaptureSplit(line);
+    };
+    auto const worker = workerPreprocess({});
+    REQUIRE(worker.exitCode == 0);
+    CHECK(worker.out.contains("return x"));
+    CHECK_FALSE(worker.out.contains("return y"));
+
+    // The positive control: the same probe DOES see a re-expansion when the definition rides the
+    // worker's line, so the green above is this line's and not a probe that cannot fail.
+    auto const control = workerPreprocess({ "-clang:-Dx=y" });
+    REQUIRE(control.exitCode == 0);
+    CHECK(control.out.contains("return y"));
 }
