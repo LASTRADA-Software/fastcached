@@ -45,6 +45,47 @@ namespace FastCache::Node
 
 namespace
 {
+    /// How deep a framed surface's kernel accept queue is (#1668).
+    ///
+    /// The listener took core-cpp's default of 128, and the scheduler on it is the door every
+    /// launcher of the fleet leases through -- a `-j 60` build per client, several exchanges per
+    /// unit, all against the leader. Measured on Windows 11 26200, 32 logical cores, a Debug node
+    /// on loopback answering LEASE, with no CPU load: bursts of N simultaneous connects from ONE
+    /// host's Python client, five rounds per cell:
+    ///
+    ///   backlog                    N = 100      N = 300                N = 600
+    ///   128 (default)              max 24 ms    p99 520, max 1,036 ms  --
+    ///   SOMAXCONN (INT_MAX)        max 12 ms    p99 517, max 528 ms    p50 510, max 1,025 ms
+    ///   SOMAXCONN_HINT(4096)       max 3 ms     p99 10, max 23 ms      p99 20, max 25 ms
+    ///
+    /// connect latency; every reply that started took at most 90 ms in all of them. The stalls
+    /// are SYN retransmits off a full queue -- INFERRED from where they land, on the 0.5 s and 1 s
+    /// steps a retransmitted SYN waits, not observed on the wire -- and past the launcher's 1 s
+    /// connect bound they are `Unreached`, the half #1668 could not name. CPU saturation alone
+    /// (32 burners on 32 cores, sequential LEASEs) never passed 3.6 ms connect nor 46 ms reply.
+    ///
+    /// Windows caps a plain backlog, `SOMAXCONN` included -- inferred from the middle row, which
+    /// overflows between 100 and 300 -- and takes a deeper one only as `SOMAXCONN_HINT(n)`, spelled `-n`; written out
+    /// because the macro is in a header this file must not include. Elsewhere the kernel clamps any value to
+    /// `net.core.somaxconn` (Linux) or `kern.ipc.somaxconn` (BSD), so the plain figure asks for
+    /// the same depth -- and changes nothing where that clamp is 128: macOS's default, and Linux's
+    /// before 5.4. **A socket-activated node does not reach this constant**: it adopts a listener
+    /// systemd already made, whose depth is the unit's `Backlog=`
+    /// (`packaging/linux/fastcache-compile-node.socket`, 4096 for this reason).
+    ///
+    /// Here rather than in core-cpp, whose default stays 128 until
+    /// [core-cpp#74](https://github.com/contour-terminal/core-cpp/issues/74) settles it there; the
+    /// daemon's and the consensus listeners still take that default, which is
+    /// [#1679](https://github.com/LASTRADA-Software/fastcached/issues/1679).
+#if defined(_WIN32)
+    constexpr int FrameSurfaceListenBacklog = -4096; // SOMAXCONN_HINT(4096)
+#else
+    constexpr int FrameSurfaceListenBacklog = 4096;
+#endif
+} // namespace
+
+namespace
+{
     namespace Wire = CompileCacheWire;
 
     /// Write every byte, or report failure.
@@ -2910,8 +2951,9 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
     auto const& endpoint = *resolved;
     auto const& row = RowFor(surface);
 
-    auto listened =
-        core::net::listen(io.Reactor(), core::net::ListenOptions { .host = endpoint.host, .port = endpoint.port });
+    auto listened = core::net::listen(
+        io.Reactor(),
+        core::net::ListenOptions { .host = endpoint.host, .port = endpoint.port, .backlog = FrameSurfaceListenBacklog });
     if (!listened.has_value())
         return std::unexpected { std::format(
             "cannot bind {}:{} ({})", endpoint.host, endpoint.port, listened.error().toString()) };

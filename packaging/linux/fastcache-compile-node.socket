@@ -69,5 +69,11 @@ ListenStream=6674
 # spawn a process per connection and make the advertised slot count meaningless.
 Accept=no
 
+# The accept queue every launcher of the fleet leases through, at the depth the node's
+# own listener asks for rather than systemd's SOMAXCONN default: a burst that overflows
+# it stalls connects the launcher reads as an unreachable scheduler (#1668, measured on
+# Windows; the kernel still clamps this to net.core.somaxconn).
+Backlog=4096
+
 [Install]
 WantedBy=sockets.target
