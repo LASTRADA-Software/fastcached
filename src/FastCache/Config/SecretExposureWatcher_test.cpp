@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/CheckoutPaths.hpp>
 #include <tests/ScratchPath.hpp>
 
 #if !defined(_WIN32)
@@ -436,7 +437,8 @@ TEST_CASE("SecretExposureWatcher: the daemon attaches it, and that is asserted",
     // A source scan because `main.cpp` is in no test target. Comments are stripped
     // first: a COMMENT is not a call site, and this file's own subject is exactly the
     // kind of thing that gets discussed in a comment near where it is not called.
-    std::ifstream source { std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcached" / "main.cpp" };
+    std::ifstream source { std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps" / "fastcached"
+                           / "main.cpp" };
     REQUIRE(source.is_open());
 
     std::string code;

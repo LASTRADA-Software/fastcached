@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <core/Ranges.hpp>
+#include <tests/CheckoutPaths.hpp>
 
 using namespace FastCache;
 
@@ -393,7 +394,7 @@ constexpr std::array UnrowedCalls {
 
 TEST_CASE("Every call that names a command-line field by hand is a row saying why it is about no row", "[cli][options]")
 {
-    auto const root = std::filesystem::path { FASTCACHED_SOURCE_DIR };
+    auto const root = std::filesystem::path { FastCache::Testing::CheckoutSourceDir };
     auto filesRead = std::size_t { 0 };
     auto hits = std::vector<std::pair<std::string, std::size_t>> {};
     for (auto const& entry: std::filesystem::recursive_directory_iterator { root / "src" })

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <core/Ranges.hpp>
+#include <tests/CheckoutPaths.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -141,7 +142,7 @@ struct SignCallCensus
 /// @return What was found.
 [[nodiscard]] SignCallCensus TakeSignCallCensus()
 {
-    auto const root = std::filesystem::path { FASTCACHED_SOURCE_DIR };
+    auto const root = std::filesystem::path { FastCache::Testing::CheckoutSourceDir };
     auto census = SignCallCensus {};
     for (auto const* const tree: { "src/FastCache", "src/apps" })
     {

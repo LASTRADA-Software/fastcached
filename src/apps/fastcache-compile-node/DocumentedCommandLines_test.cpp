@@ -30,6 +30,7 @@
 #include <vector>
 
 #include <core/Ranges.hpp>
+#include <tests/CheckoutPaths.hpp>
 #include <tests/FirewallFakes.hpp>
 #include <tests/HostNamingFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
@@ -458,7 +459,7 @@ struct FoundCommand
 
 TEST_CASE("Every documented command line is one the node would start on", "[node][docs][config]")
 {
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
 
     auto const pages = DocumentationPages(root);
     // A tree with no documentation is this check examining nothing while agreeing
@@ -685,7 +686,7 @@ TEST_CASE("The MSI's node registration installs with no property, never with a t
     // literal an earlier package remembered vetoed the dial hint for good on a roaming laptop. And
     // the MSI names no `--cluster-dir`, so the registration owns the machine-wide state directory and
     // secludes it (`PathPrivacy::Private`) rather than baking a path that outranks the file.
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
     auto const command = MsiNodeInstallCommand(root);
     CHECK_FALSE(command.contains("--cluster-dir"));
     CHECK_FALSE(command.contains("--scheduler"));
@@ -1199,7 +1200,7 @@ TEST_CASE("An MSI fleet pin the node's parser refuses fails the transaction befo
     // remember write; `check-wix-service-table` pins that), running the node's own parser over them.
     // Here: the check's command, formatted as Windows Installer formats it, is refused -- WHICH
     // refusal, the flag's -- and a value it accepts parses as the check and nothing else.
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
     auto const text = MsiFragmentText(root);
     auto const checkOf = [&](std::map<std::string, std::string> const& properties) {
         auto const command = MsiFormattedCommand(text, "FastCacheNodeCheckArguments", properties);
@@ -1259,7 +1260,7 @@ TEST_CASE(
     // MSI did not remember would be dropped by the next repair: the firewall scope widened to any
     // address, which fails OPEN, and the advertised endpoint lost. The fragment's own rows are read
     // and run as Windows Installer runs them, across install, repair, upgrade and repair again.
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
     auto const text = MsiFragmentText(root);
     auto const rows = ReadMsiRememberRows(text);
     INFO(std::format("{} save(s), {} search(es), {} restore(s), {} write(s)",
@@ -1435,7 +1436,7 @@ TEST_CASE("A failed MSI transaction puts back the remembered values and the node
     // "fails" after it remembered them, and runs every rollback write: what the registry holds must be
     // exactly what it held before, and the registration the rollback makes again must be the one the
     // values it found describe.
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
     auto const text = MsiFragmentText(root);
     auto const rows = ReadMsiRememberRows(text);
     auto const rollback = ReadMsiRollbackWrites(text);
@@ -1545,7 +1546,7 @@ TEST_CASE("An upgrade that deselects a feature removes that feature's firewall g
     // group too, is no longer installed. So the fragment removes the group itself, and the name it
     // spells must be the one the binary files every rule under (`FirewallGroupFor` of the service's
     // default name): a typo there removes nothing and leaves the rules open, silently.
-    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    std::filesystem::path const root { FastCache::Testing::CheckoutSourceDir };
     auto const text = MsiFragmentText(root);
     struct Leftover
     {

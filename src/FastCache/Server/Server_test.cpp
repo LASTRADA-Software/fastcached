@@ -12,6 +12,7 @@
 #include <core/net/testing/InMemorySocket.hpp>
 #include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/CheckoutPaths.hpp>
 #include <tests/HalfClose.hpp>
 #if defined(FC_TLS_ENABLED)
     #include <core/net/Tls.hpp>
@@ -627,8 +628,8 @@ TEST_CASE("Server: ConnectionsTotalTls / ConnectionsAdmissionRejectedTls bumped 
     // the metric is bumped BEFORE the wrap; the connection itself just
     // drops a few bytes into the void and exits when the client
     // ShutdownWrite-closes.
-    auto const certPath = std::string { FASTCACHED_TESTDATA_DIR } + "/tls/server.crt";
-    auto const keyPath = std::string { FASTCACHED_TESTDATA_DIR } + "/tls/server.key";
+    auto const certPath = std::string { FastCache::Testing::CheckoutTestDataDir } + "/tls/server.crt";
+    auto const keyPath = std::string { FastCache::Testing::CheckoutTestDataDir } + "/tls/server.key";
     auto tlsContextResult = core::net::makeTlsServerContextFromFiles(certPath, keyPath);
     REQUIRE(tlsContextResult.has_value());
     auto tlsContext = std::move(*tlsContextResult);

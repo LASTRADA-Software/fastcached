@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/CheckoutPaths.hpp>
 #include <tests/Unwrap.hpp>
 
 using FastCache::CliOutcome;
@@ -99,7 +100,8 @@ TEST_CASE("fastcached's main asks the serving rules through the gate and nowhere
 {
     // `main` is in no test target, so what holds it to the gate is its text: one call, and none of
     // the three rules asked beside it, where an outcome the gate excuses would meet them anyway.
-    auto const path = std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcached" / "main.cpp";
+    auto const path =
+        std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps" / "fastcached" / "main.cpp";
     REQUIRE(std::filesystem::exists(path));
     // Through the stream buffer, for `PosixDaemonHost_test`'s measured reason.
     std::ifstream in { path, std::ios::binary };

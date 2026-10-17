@@ -53,6 +53,7 @@
 
 #include <core/Ranges.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/CheckoutPaths.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
@@ -1102,7 +1103,7 @@ TEST_CASE("The node lends ONE SchedulerReachability to both announce loops", "[n
     // scan reads includes such a header (`TestSupportIncludeOf`, self-tested above). Its reach is this
     // directory, where the headers live.
     std::filesystem::path const nodeDir =
-        std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node";
+        std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps" / "fastcache-compile-node";
     REQUIRE(std::filesystem::is_directory(nodeDir));
 
     std::regex const mention { R"(\bSchedulerReachability\b)" };

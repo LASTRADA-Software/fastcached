@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/CheckoutPaths.hpp>
 #include <tests/DaemonHostFakes.hpp>
 
 using namespace FastCache;
@@ -195,7 +196,7 @@ TEST_CASE("No daemonizing main refuses a start without telling its service host"
     for (auto const& region: Regions)
     {
         INFO(region.file);
-        auto const path = std::filesystem::path { FASTCACHED_SOURCE_DIR } / region.file;
+        auto const path = std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / region.file;
         REQUIRE(std::filesystem::exists(path));
         // Through the stream buffer, for `PosixDaemonHost_test`'s measured reason.
         std::ifstream in { path, std::ios::binary };
@@ -264,7 +265,7 @@ TEST_CASE("Every daemonizing main asks its service host to wait for serving and 
     for (auto const& wiring: Wirings)
     {
         INFO(wiring.file);
-        auto const path = std::filesystem::path { FASTCACHED_SOURCE_DIR } / wiring.file;
+        auto const path = std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / wiring.file;
         REQUIRE(std::filesystem::exists(path));
         std::ifstream in { path, std::ios::binary };
         REQUIRE(in);

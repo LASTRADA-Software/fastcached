@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/CheckoutPaths.hpp>
 #include <tests/Unwrap.hpp>
 
 /// @file CounterAttribution_test.cpp
@@ -259,7 +260,7 @@ constexpr std::array<DeclaredAheadOfItsWriter, 0> DeclaredAheadOfItsWriterTable 
 /// @return The root path.
 [[nodiscard]] std::filesystem::path RepositoryRoot()
 {
-    return std::filesystem::path { FASTCACHED_SOURCE_DIR };
+    return std::filesystem::path { FastCache::Testing::CheckoutSourceDir };
 }
 
 /// @p path relative to the repository root, with forward slashes.

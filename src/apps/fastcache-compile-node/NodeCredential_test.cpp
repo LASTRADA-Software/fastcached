@@ -40,6 +40,7 @@
 #include <core/net/IAsyncAddressResolver.hpp>
 #include <core/net/IConnector.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/CheckoutPaths.hpp>
 #include <tests/LocalityFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
@@ -639,7 +640,7 @@ struct NodeSource
 [[nodiscard]] std::vector<NodeSource> NodeSourcesWithoutComments()
 {
     std::filesystem::path const nodeDir =
-        std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node";
+        std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps" / "fastcache-compile-node";
     REQUIRE(std::filesystem::is_directory(nodeDir));
 
     // A COMMENT is not a call site, and several files here discuss `Cc::Credential`

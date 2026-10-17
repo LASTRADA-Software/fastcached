@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <core/Ranges.hpp>
+#include <tests/CheckoutPaths.hpp>
 
 using FastCache::ProcessExit;
 using FastCache::StartStage;
@@ -82,7 +83,7 @@ constexpr auto StageVerdicts = std::to_array<StageVerdict>({
 /// @return Its bytes; the case has failed when it cannot be read.
 [[nodiscard]] std::string SourceText(std::filesystem::path const& relative)
 {
-    auto const path = std::filesystem::path { FASTCACHED_SOURCE_DIR } / relative;
+    auto const path = std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / relative;
     REQUIRE(std::filesystem::exists(path));
     // Through the stream buffer, for `PosixDaemonHost_test`'s measured reason.
     std::ifstream in { path, std::ios::binary };

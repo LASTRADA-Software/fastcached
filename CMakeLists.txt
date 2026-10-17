@@ -717,6 +717,22 @@ configure_file(
     @ONLY
 )
 
+# The checkout's paths, for the test cases that read a file out of it -- generated
+# here, before src/apps, because fastcache-compile-node-tests needs it as much as
+# FastCacheTest does. A header and never a compile definition: the header says why.
+#
+# PROJECT_SOURCE_DIR rather than CMAKE_SOURCE_DIR: the two differ the moment this tree
+# is consumed with add_subdirectory(), and a documentation check would then iterate a
+# `docs/` belonging to somebody else -- or, far more likely, throw a filesystem_error
+# for a directory that is not there.
+if(FASTCACHED_BUILD_TESTS)
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tests/CheckoutPaths.hpp.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/tests/CheckoutPaths.hpp"
+        @ONLY
+    )
+endif()
+
 if(WIN32)
     # iphlpapi: GetAdaptersAddresses, behind Platform/LocalAddresses. PUBLIC for the
     # same reason ws2_32 is -- every executable that links FastCache asks the cache

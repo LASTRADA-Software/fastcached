@@ -58,6 +58,7 @@
 #include <core/net/testing/SocketDecorator.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/CheckoutPaths.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ReactorHomeFakes.hpp>
@@ -381,7 +382,7 @@ TEST_CASE("The shared-cache upstream holds no credential source by construction"
     // The FILES are derived, not listed: every non-test `SharedCache*` source, so a file added to
     // this leg later is scanned without anybody remembering to add it.
     std::filesystem::path const nodeDir =
-        std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node";
+        std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps" / "fastcache-compile-node";
     std::regex const seam { R"(\bICredentialSource\b|\bConfiguredCredential\b|\bCc::Credential\b)" };
 
     // The one reader both the scan and its control go through: the code lines that name the seam,

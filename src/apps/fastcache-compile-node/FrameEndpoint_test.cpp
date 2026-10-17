@@ -93,6 +93,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/CheckoutPaths.hpp>
 #include <tests/CompileReplyFakes.hpp>
 #include <tests/ConsensusStandingFakes.hpp>
 #include <tests/ExactAudience.hpp>
@@ -3527,8 +3528,8 @@ namespace
 /// is the remedy this repository has had to write down more than once.
 [[nodiscard]] std::string EndpointCodeWithoutComments()
 {
-    auto const path =
-        std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node" / "FrameEndpoint.cpp";
+    auto const path = std::filesystem::path { FastCache::Testing::CheckoutSourceDir } / "src" / "apps"
+                      / "fastcache-compile-node" / "FrameEndpoint.cpp";
     std::ifstream in { path, std::ios::binary };
     std::ostringstream contents;
     // Via the stream buffer rather than `istreambuf_iterator`, for the reason
