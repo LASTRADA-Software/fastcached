@@ -70,7 +70,6 @@ class ScriptedDialer final: public Node::IEndpointDialer
                  << _dialed.size() << " time(s) against a script of " << _replies.size()
                  << ". That is this fixture running out, NOT a dial failure -- read it as the loop "
                     "going further than this case anticipated");
-            return nullptr;
         }
 
         auto const& frame = _replies[_next++];

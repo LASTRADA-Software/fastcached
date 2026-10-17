@@ -1343,7 +1343,6 @@ class UnreachableAnnouncement final: public IAnnouncement
     [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& /*client*/, std::string_view /*endpoint*/) override
     {
         FAIL("a held round reached its announcement");
-        return {};
     }
 };
 

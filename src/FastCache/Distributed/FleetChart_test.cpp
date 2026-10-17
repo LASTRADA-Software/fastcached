@@ -55,7 +55,6 @@ constexpr std::int64_t DaySeconds = 300;
         if (row.key == key)
             return row;
     FAIL("no series named " << key);
-    return FleetSeriesTable[0];
 }
 
 [[nodiscard]] FleetChartRow const& ChartByKey(std::string_view key)
@@ -64,7 +63,6 @@ constexpr std::int64_t DaySeconds = 300;
         if (row.key == key)
             return row;
     FAIL("no chart named " << key);
-    return FleetChartTable[0];
 }
 
 /// The offset of the first `<` sitting inside an attribute value, if there is one.

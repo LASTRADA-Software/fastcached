@@ -4093,7 +4093,6 @@ class HandshakeCaller
         if (!_sealer.has_value())
         {
             FAIL("a frame was sealed before the proof agreed a key");
-            return {};
         }
         auto const tag = _sealer->Seal(frame.first(Wire::RequestHeaderSize), frame.subspan(Wire::RequestHeaderSize));
         auto bytes = std::vector<std::byte> { frame.begin(), frame.end() };
