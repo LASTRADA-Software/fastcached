@@ -145,8 +145,9 @@ class EffectiveConfig
 /// The endpoints a daemon with @p config serves: the `--listen` / `--listen-tls` list when any
 /// was named, else the single `--bind` / `--port` / `--tls` endpoint.
 ///
-/// One derivation, asked by the startup rules and by the daemon body alike, so the endpoints a
-/// start is judged by are the endpoints it binds.
+/// One derivation, asked by the startup rules, by the daemon body and by the service
+/// registration's firewall rules alike, so the endpoints a start is judged by -- and the ports
+/// an install opens -- are the endpoints it binds.
 /// @param config The effective configuration.
 /// @return The endpoints, in the order they are bound.
 [[nodiscard]] std::vector<BindConfig> EffectiveBinds(Config const& config);

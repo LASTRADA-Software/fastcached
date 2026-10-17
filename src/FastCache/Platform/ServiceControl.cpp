@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cli/Duration.hpp>
+#include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -1280,12 +1281,12 @@ std::vector<FirewallRule> DaemonFirewallRules(Config const& cfg,
                                               std::filesystem::path const& program,
                                               std::vector<std::string> const& allow)
 {
-    // The endpoints the daemon binds: its listener list, or the single bind it collapses to
-    // when there is none -- the collapse `main.cpp` makes before it serves.
-    auto const listeners =
-        cfg.binds.empty()
-            ? std::vector<BindConfig> { BindConfig { .address = cfg.bindAddress, .port = cfg.port, .tls = cfg.tlsEnabled } }
-            : cfg.binds;
+    // The endpoints the daemon binds, asked of the one derivation the daemon serves from rather
+    // than restated: a copy here would open the firewall for a listener set the daemon no
+    // longer binds the day that rule changes. The restatement was also a conditional over two
+    // vectors, one built from a braced list, and GCC 16 reported that list's backing array as a
+    // dangling pointer at this function's end -- the same misreading `main.cpp`'s banner met.
+    auto const listeners = EffectiveBinds(cfg);
 
     /// One endpoint the daemon would open, and what a rule name calls it.
     struct Opening
