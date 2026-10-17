@@ -29,6 +29,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Transport/ListenQueue.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -66,10 +67,12 @@
 #include <core/async/Task.hpp>
 #include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
+#include <core/net/Sockets.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/FormationFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/ListenQueueLimit.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/PreviousClusterState.hpp>
@@ -1231,6 +1234,55 @@ TEST_CASE("A leader counts its sends to a learner with no endpoint as a learner 
     CHECK(tier->Status().configuration.learners == std::vector<Consensus::NodeId> { "laptop" });
     CHECK(metrics.Read(IMetricsSink::Counter::RaftSendsDroppedNoSession) > 0);
     CHECK(metrics.Read(IMetricsSink::Counter::RaftSendsDroppedUnknownPeer) == 0);
+}
+
+TEST_CASE("The consensus listener a tier binds itself has the deep accept queue, as the kernel records it",
+          "[node][consensus][backlog]")
+{
+    // The third listener #1679 names, read back from the KERNEL rather than from the options a
+    // helper returns: a tier that bound with a bare `ListenOptions` would leave core-cpp's 128.
+    auto const ceiling = FastCache::Testing::KernelListenCeiling();
+    if (!ceiling.has_value())
+        SKIP("this platform cannot report a listening socket's queue limit");
+    if (*ceiling <= core::net::ListenOptions {}.backlog)
+        SKIP(std::format("net.core.somaxconn is {}, which cannot tell a deep queue from the default", *ceiling));
+
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->boundPort();
+    probe.reset();
+
+    Testing::ScratchDirectory const scratch { "consensus-listen-queue" };
+
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    cfg.nodeId = "n1";
+    cfg.raftListen = std::format("127.0.0.1:{}", port);
+    cfg.raftSelf = "127.0.0.1";
+    cfg.clusterDir = scratch / "state";
+
+    // No listener handed over, so the tier binds the port itself -- the production path.
+    auto started = ConsensusTier::Start(
+        cfg,
+        TestAdvertised(),
+        TestRaftAdvertised(),
+        Testing::TestKeyPair("n1"),
+        [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+        [](Cluster::ClusterState const&) {},
+        ConsensusTier::LeaderContactObserver {},
+        metrics,
+        logger,
+        nullptr,
+        FormationHooks {});
+    INFO("start refused: " << RefusalOf(started));
+    REQUIRE(started.has_value());
+
+    auto const limits = FastCache::Testing::ListenQueueLimitsOnPort(port);
+    REQUIRE(limits.has_value());
+    CHECK(Unwrap(limits) == std::vector { std::min(ListenQueueDepth, *ceiling) });
 }
 
 TEST_CASE("The peers that dial in are read from the record and from the configuration consensus holds",

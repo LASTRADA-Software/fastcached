@@ -979,17 +979,74 @@ namespace
         return arg == flag || IsJoinedValue(arg, flag);
     }
 
+    /// An option whose fused remainder is ONE argument for a different driver grammar.
+    ///
+    /// clang-cl's `/clang:<arg>` (and `-clang:<arg>`) hands `<arg>` to the clang driver
+    /// underneath it, which parses it with clang's OWN option table rather than clang-cl's.
+    /// CMake writes the C++ standard that way for clang-cl, which has no `/std:c++23`
+    /// (`-clang:-std=c++23`, on every unit of a C++23 build), so refusing the prefix by
+    /// absence made every such build distribute nothing (#1672).
+    ///
+    /// **The inner argument is judged as if it stood alone, under the grammar it is parsed
+    /// by** -- by the worker's side-artefact table, every `DeniedArguments` row and the
+    /// allowlist, in that order, and by the launcher's side-artefact, denial and macro-switch
+    /// checks (#1680) -- so the prefix admits nothing that argument standing alone would not:
+    /// `-clang:-fplugin=x` is refused by the `fplugin` row exactly as `-fplugin=x` is. The
+    /// grammar is the GNU clang driver's (`Flavor::Clang`) because that is the table clang
+    /// parses `<arg>` with: GNU spellings only, `-` the only introducer, so `-clang:/O2` names
+    /// a FILE to that driver and is refused, and an MSVC-only row never reaches an inner
+    /// argument. Every GNU-spelled allowlist row is `Any`, so `-clang:-std=c++23` is admitted
+    /// exactly when `-std=c++23` is.
+    ///
+    /// The row is scoped to the family that spells the prefix, as the `-clang:-MF` rows of
+    /// `PathValueFlags()` are. `DriverFamily` cannot tell `cl` from clang-cl; `cl` does not
+    /// implement the prefix, and a line it ignores is one the client's own `cl` ignored, by
+    /// the fingerprint argument the `Any` rows rest on.
+    struct PassThroughPrefix
+    {
+        std::string_view spelling;                    ///< The prefix, without its leading `-` or `/`.
+        DriverFamily families { DriverFamily::None }; ///< Which driver families spell it.
+        Flavor innerGrammar { Flavor::Unknown };      ///< The driver whose rules judge the inner argument.
+    };
+
+    /// Every pass-through prefix an argument classifier unwraps before judging an argument.
+    constexpr std::array PassThroughPrefixes {
+        PassThroughPrefix { .spelling = "clang:", .families = DriverFamily::Msvc, .innerGrammar = Flavor::Clang },
+    };
+
     /// Is `arg` a macro switch this context spells, and where is its value?
     ///
+    /// A pass-through carrying one (`-clang:-DFOO=2`) IS one, and leaves the dispatched line
+    /// the way `/D` does (#1680). A clang-cl worker compiles its text under `/TP`, which
+    /// preprocesses it AGAIN, so a definition reaching it re-expands identifiers the client's
+    /// source had `#undef`ed. Measured with clang-cl 22.1.8 at `/O2`: over `#undef x` and
+    /// `int f() { int x = 1; { int y = 5; return x; } }`, `-clang:-Dx=y` left on the line made
+    /// the worker's `f()` return 5 where the client's returns 1 -- with exit 0, so the object
+    /// was accepted and cached. That is #1481's defect, reopened through the pass-through
+    /// spelling once a worker admitted `-clang:<arg>`.
+    ///
+    /// A pass-through's value is NEVER said to be the next argument. clang-cl hands the clang
+    /// driver its pass-throughs IN ORDER, so a separated value is the next pass-through
+    /// ANYWHERE on the line: measured, `-clang:-D /O2 t.cpp -clang:FOO=3` defines `FOO=3`, and
+    /// eating the successor would have dropped `/O2`. `RemoteCompileArgs` refuses that shape
+    /// before asking this (`IsSeparatedPassThroughMacro`).
     /// @param arg         The argument as it appeared on the command line.
     /// @param introducers Which characters start an option here.
     /// @param families    Which family spellings may match.
     /// @return Nullopt when it is not a macro switch; true when its value is the NEXT
-    ///         argument, false when the value is fused on.
+    ///         argument, false when the value is fused on (or rides a pass-through).
     [[nodiscard]] std::optional<bool> MatchMacroFlag(std::string_view arg,
                                                      std::string_view introducers,
                                                      DriverFamily families)
     {
+        if (auto const passed = MatchPassThrough(arg, families); passed.has_value())
+        {
+            auto const into = DriverOf(passed->into).family;
+            if (!MatchMacroFlag(passed->inner, IntroducersOf(into), into).has_value())
+                return std::nullopt;
+            return false;
+        }
+
         if (arg.empty() || !introducers.contains(arg.front()))
             return std::nullopt;
         for (MacroFlag const& row: MacroFlags)
@@ -1001,6 +1058,21 @@ namespace
             return arg.size() == row.spelling.size();
         }
         return std::nullopt;
+    }
+
+    /// Whether @p arg is a pass-through macro switch whose value is a SEPARATE pass-through
+    /// (`-clang:-D -clang:FOO`), which no position-based drop can take off a worker's line.
+    /// @param arg    The argument as it appeared on the command line.
+    /// @param family The family of the driver that receives it.
+    /// @return True for exactly that shape.
+    [[nodiscard]] bool IsSeparatedPassThroughMacro(std::string_view arg, DriverFamily family)
+    {
+        auto const passed = MatchPassThrough(arg, family);
+        if (!passed.has_value())
+            return false;
+        auto const into = DriverOf(passed->into).family;
+        auto const valueIsNext = MatchMacroFlag(passed->inner, IntroducersOf(into), into);
+        return valueIsNext.has_value() && *valueIsNext;
     }
 
     /// Whether `arg` states the input language explicitly.
@@ -1214,8 +1286,29 @@ std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::stri
     return std::nullopt;
 }
 
+std::optional<PassThroughMatch> MatchPassThrough(std::string_view arg, DriverFamily family) noexcept
+{
+    auto const introducers = IntroducersOf(family);
+    if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
+        return std::nullopt;
+    auto const body = arg.substr(1);
+    // A loop rather than a named `find_if` iterator, for the reason `FindDeniedArgument`
+    // gives: no single spelling of the iterator's type satisfies clang-tidy everywhere.
+    for (PassThroughPrefix const& row: PassThroughPrefixes)
+        if (Overlaps(row.families, family) && body.starts_with(row.spelling))
+            return PassThroughMatch { .inner = body.substr(row.spelling.size()), .into = row.innerGrammar };
+    return std::nullopt;
+}
+
 bool ProducesSideArtefact(std::string_view arg, DriverSpec const& driver)
 {
+    // Judged as what a pass-through carries, by the driver it is handed to (#1680): clang-cl
+    // hands `/clang:-fmodule-output=x.pcm` to the clang driver, which writes the module file,
+    // while the whole spelling matches no row -- so the compile was cached, and a hit restored
+    // the object without the BMI the build named.
+    if (auto const passed = MatchPassThrough(arg, driver.family); passed.has_value())
+        return ProducesSideArtefact(passed->inner, DriverOf(passed->into));
+
     auto const introducers = IntroducersOf(driver.family);
     if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
         return false;
@@ -1498,51 +1591,76 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     return body.contains('/') || body.contains('\\');
 }
 
+namespace
+{
+    /// The language a dispatched compile states for its input, or why it can state none.
+    ///
+    /// The extension, overridden by a driver that compiles everything as C++, overridden in turn
+    /// by the build's own selector. Out of `RemoteCompileArgs` so that function reads as the
+    /// per-argument walk it is: the two changes that met in it (#1680's pass-through refusal,
+    /// #1686's forwarded prefix map) took it past the cognitive-complexity budget together.
+    /// @param cmd The parsed command.
+    /// @param argv The full command line.
+    /// @param driver The driver's spec.
+    /// @return The language, or the reason the job cannot be dispatched.
+    [[nodiscard]] std::expected<SourceLanguage, std::string> DispatchedLanguage(ParsedCommand const& cmd,
+                                                                                std::span<std::string const> argv,
+                                                                                DriverSpec const& driver)
+    {
+        // Asked FIRST, before a single argument is examined: what this decides is
+        // whether the job can be dispatched at all, and a refusal that costs nothing is
+        // worth reaching before one that costs a scan.
+        auto language = LanguageOfSource(cmd.source);
+        if (!language.has_value())
+            return std::unexpected(std::format("no language is named unambiguously by the extension of {}", cmd.source));
+        if (auto const because = UncacheableBecause(*language); !because.empty())
+            return std::unexpected(std::format("{} is never dispatched: {}", DescribeLanguage(*language), because));
+
+        // The DRIVER overrides the extension where it has a default of its own: `g++
+        // -c a.c` compiles C++, so telling a worker `-x cpp-output` would have it
+        // compile as C what this machine compiles as C++, and store that under the key.
+        // Only the C row moves -- a driver that always compiles C++ says nothing about
+        // an Objective-C source, whose own driver default is unchanged.
+        if (*language == SourceLanguage::C && CompilesEverythingAsCxx(cmd.compiler))
+            language = SourceLanguage::Cxx;
+
+        // And the BUILD's own selector outranks both, which is the order the comment on
+        // `LanguageSelectors` describes and nothing implemented: `/TP` on a `.c` file
+        // means C++, whatever the extension or the driver would have said. Resolved
+        // here, before the language is used, so the flags appended below state what the
+        // build asked for rather than overriding it.
+        //
+        // A selector that cannot be reduced to a language -- one naming a FILE, or an
+        // `-x` value with no exact `SourceLanguage` -- is still refused. Refusing costs
+        // one local compile; guessing hands back an object nobody asked for.
+        for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))
+        {
+            auto const* row = MatchLanguageSelector(argv[i], driver.family);
+            if (row == nullptr)
+                continue;
+            auto const named = LanguageNamedBy(*row, argv[i], i + 1 < argv.size() ? argv[i + 1] : std::string_view {});
+            if (!named.has_value())
+                return std::unexpected(
+                    std::format("the command line names the input language itself ({}) in a form this launcher cannot "
+                                "restate to a worker",
+                                argv[i]));
+            language = named;
+        }
+        return *language;
+    }
+} // namespace
+
 std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCommand const& cmd,
                                                                        std::span<std::string const> argv,
                                                                        std::string_view targetTriple)
 {
     auto const& driver = DriverOf(cmd.flavor);
 
-    // Asked FIRST, before a single argument is examined: what this decides is
-    // whether the job can be dispatched at all, and a refusal that costs nothing is
-    // worth reaching before one that costs a scan.
-    auto language = LanguageOfSource(cmd.source);
+    // Asked FIRST, before a single argument is examined: whether the job can be dispatched at
+    // all, and in which language (`DispatchedLanguage`).
+    auto const language = DispatchedLanguage(cmd, argv, driver);
     if (!language.has_value())
-        return std::unexpected(std::format("no language is named unambiguously by the extension of {}", cmd.source));
-    if (auto const because = UncacheableBecause(*language); !because.empty())
-        return std::unexpected(std::format("{} is never dispatched: {}", DescribeLanguage(*language), because));
-
-    // The DRIVER overrides the extension where it has a default of its own: `g++
-    // -c a.c` compiles C++, so telling a worker `-x cpp-output` would have it
-    // compile as C what this machine compiles as C++, and store that under the key.
-    // Only the C row moves -- a driver that always compiles C++ says nothing about
-    // an Objective-C source, whose own driver default is unchanged.
-    if (*language == SourceLanguage::C && CompilesEverythingAsCxx(cmd.compiler))
-        language = SourceLanguage::Cxx;
-
-    // And the BUILD's own selector outranks both, which is the order the comment on
-    // `LanguageSelectors` describes and nothing implemented: `/TP` on a `.c` file
-    // means C++, whatever the extension or the driver would have said. Resolved
-    // here, before the language is used, so the flags appended below state what the
-    // build asked for rather than overriding it.
-    //
-    // A selector that cannot be reduced to a language -- one naming a FILE, or an
-    // `-x` value with no exact `SourceLanguage` -- is still refused. Refusing costs
-    // one local compile; guessing hands back an object nobody asked for.
-    for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))
-    {
-        auto const* row = MatchLanguageSelector(argv[i], driver.family);
-        if (row == nullptr)
-            continue;
-        auto const named = LanguageNamedBy(*row, argv[i], i + 1 < argv.size() ? argv[i + 1] : std::string_view {});
-        if (!named.has_value())
-            return std::unexpected(
-                std::format("the command line names the input language itself ({}) in a form this launcher cannot "
-                            "restate to a worker",
-                            argv[i]));
-        language = named;
-    }
+        return std::unexpected(language.error());
 
     // A shared PDB is a second artefact, and only the object comes back. Refused
     // before anything is sent, on the same reasoning as a module interface unit.
@@ -1658,9 +1776,20 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
             continue;
         }
 
+        // A pass-through macro switch whose value is a separate pass-through cannot be taken off
+        // this line by position: clang-cl pairs it with the next `-clang:` argument ANYWHERE
+        // (`MatchMacroFlag` measures it), and leaving either half here is a definition a worker
+        // re-preprocessing under `/TP` applies a second time (#1481). Not dispatched, then --
+        // the key and a local compile see the whole line, so it is still cached (#1680).
+        if (IsSeparatedPassThroughMacro(a, driver.family))
+            return std::unexpected(std::format("{} carries its value in a separate pass-through argument, which "
+                                               "this launcher cannot pair with it to keep off a worker's line",
+                                               a));
+
         // Every macro definition, and only here -- the preprocess line and the key keep
         // them (#1481). ABOVE the positive check below, which is what used to refuse a
-        // path-valued one and with it every other argument on the line.
+        // path-valued one and with it every other argument on the line. A pass-through
+        // carrying one is one (#1680), and `MatchMacroFlag` says so itself.
         if (auto const valueIsNext = MatchMacroFlag(a, IntroducersOf(driver.family), driver.family))
         {
             // Only a bare occurrence owns the successor. Eating it after a fused form

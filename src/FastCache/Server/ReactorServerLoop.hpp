@@ -42,8 +42,8 @@ struct ReactorServerOptions
 {
     /// Every listener endpoint to bring up. Must be non-empty.
     std::vector<BindConfig> binds {};
-    std::size_t maxConnections { 0 }; ///< 0 = unlimited.
-    int listenBacklog { 511 };        ///< ::listen() backlog depth.
+    std::size_t maxConnections { 0 };       ///< 0 = unlimited.
+    int listenBacklog { ListenQueueDepth }; ///< Accept-queue depth, spelled per platform where it binds.
 
     /// Number of independent reactors to run, each single-threaded with its
     /// own connections (no coroutine migration). 1 is the classic single-loop

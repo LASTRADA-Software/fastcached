@@ -2503,3 +2503,61 @@ TEST_CASE("A lease never carries a label a scheduler would refuse it for", "[dis
         CHECK(Wire::AsStringView(Unwrap(lease).toolchainLabel) == sent);
     }
 }
+
+TEST_CASE("A denied argument spelled through clang-cl's pass-through is refused before a lease (#1680)",
+          "[dispatch][decline][denied]")
+{
+    // The worker judges `-clang:<arg>` as `<arg>` (#1672) and refuses `-clang:-fplugin=x` by the
+    // `fplugin` row. The launcher read the whole spelling, which no row names, so it spent a lease,
+    // a round trip and the translation unit to be told what the same table says.
+    for (auto const* wrapped: { "-clang:-fplugin=x.dll", "/clang:-Xclang" })
+    {
+        INFO("argument " << wrapped);
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+        fleet.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::WorkerRejectedArgument, {}));
+        std::vector<std::string> const args { "/O2", wrapped };
+        auto request = Request(args);
+        request.family = DriverFamily::Msvc;
+        auto const result = Dispatch(fleet, request);
+        CHECK(result.status == DispatchStatus::DeniedHere);
+        CHECK(fleet.Dialled().empty());
+        CHECK(result.refusal.contains(wrapped));
+    }
+
+    // The control: a pass-through no row denies still asks the fleet.
+    ScriptedFleet asking;
+    asking.Serve(std::string { Scheduler }, GrantReply());
+    asking.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::WorkerRejectedArgument, {}));
+    std::vector<std::string> const allowed { "/O2", "-clang:-std=c++23" };
+    auto request = Request(allowed);
+    request.family = DriverFamily::Msvc;
+    CHECK(Dispatch(asking, request).status != DispatchStatus::DeniedHere);
+    CHECK_FALSE(asking.Dialled().empty());
+}
+
+TEST_CASE("The launcher refuses a pass-through exactly where the worker refuses what it carries (#1680)",
+          "[dispatch][denied]")
+{
+    // One table, read by both ends, THROUGH the pass-through too: every row of the clang driver's
+    // family behind both spellings of clang-cl's prefix is refused by the launcher's table and by a
+    // clang-cl worker -- with an operator entry naming it, which is what makes a row a row.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    std::size_t asked = 0;
+    for (auto const& row: DeniedArguments)
+    {
+        if (!Overlaps(row.families, DriverFamily::Gnu))
+            continue;
+        for (auto const* prefix: { "-clang:-", "/clang:-" })
+        {
+            auto const arg = std::string { prefix } + std::string { row.spelling } + "x";
+            INFO("argument " << arg);
+            CHECK(FindDeniedArgument(arg, DriverFamily::Msvc) != nullptr);
+            std::vector<std::string> const operatorAllowed { arg };
+            CHECK_FALSE(IsAcceptableJobArgument(arg, clangCl, operatorAllowed));
+            ++asked;
+        }
+    }
+    // Zero rows would be a vacuous pass, not a verdict.
+    CHECK(asked > 0);
+}

@@ -5,6 +5,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
+#include <FastCache/Transport/ListenQueue.hpp>
 
 #include <array>
 #include <chrono>
@@ -357,13 +358,17 @@ struct Config
     /// configuration file through the same appliers from `listen:` / `listen_tls:`.
     std::vector<BindConfig> binds {};
 
-    /// ::listen() backlog — the depth of the kernel's queue of accepted-
-    /// but-not-yet-handed-off connections. Bursts of parallel clients (a
-    /// `make -jN` driving sccache opens many sockets at once) overflow a
-    /// small backlog and get ECONNREFUSED / timeouts at the OS layer before
-    /// the daemon ever sees them. Defaults to 511 (the value redis uses);
-    /// the kernel silently clamps to its own SOMAXCONN ceiling.
-    int listenBacklog { 511 };
+    /// The depth of the kernel's queue of accepted-but-not-yet-handed-off
+    /// connections. Bursts of parallel clients (a `make -jN` driving the
+    /// launcher opens many sockets at once) overflow a small queue and get
+    /// connect timeouts at the OS layer before the daemon ever sees them.
+    ///
+    /// A DEPTH, spelled for the platform where it binds (`ListenBacklogArgument`):
+    /// a plain number asks Windows for at most about 200, whatever it says
+    /// (#1679). Defaults to `ListenQueueDepth`, the figure every listener in
+    /// this project asks for; POSIX clamps it to `somaxconn`, Windows to
+    /// [200, 65535].
+    int listenBacklog { ListenQueueDepth };
 
     /// Log threshold.
     LogLevel logLevel { LogLevel::Info };

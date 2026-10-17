@@ -46,6 +46,7 @@
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/SealedFrameSocket.hpp>
+#include <FastCache/Transport/ListenQueue.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -100,6 +101,7 @@
 #include <tests/FormationFakes.hpp>
 #include <tests/HalfClose.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/ListenQueueLimit.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/RelabelledPeerListener.hpp>
@@ -598,6 +600,31 @@ TEST_CASE("A frame endpoint that cannot bind reports why", "[node][scheduler]")
 
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains(unreachable));
+}
+
+TEST_CASE("A framed surface binds with the deep accept queue, as the kernel records it", "[node][frame][backlog]")
+{
+    // A `-j 60` build's launchers dial this machine's node in bursts, and a connect that finds the
+    // accept queue full is not refused but retransmitted past a launcher's connect bound -- a node
+    // that is up, reported unreachable (#1668). So the queue the opener ASKED for is read back from
+    // the kernel, not from a helper's return value: an opener that bound with a bare
+    // `ListenOptions` would leave core-cpp's 128 here (#1679).
+    auto const ceiling = FastCache::Testing::KernelListenCeiling();
+    if (!ceiling.has_value())
+        SKIP("this platform cannot report a listening socket's queue limit");
+    if (*ceiling <= core::net::ListenOptions {}.backlog)
+        SKIP(std::format("net.core.somaxconn is {}, which cannot tell a deep queue from the default", *ceiling));
+
+    Fleet fleet;
+    auto const port = FreePort();
+    auto started = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.metrics, fleet.logger);
+    REQUIRE(started.has_value());
+    fleet.Serve();
+
+    auto const limits = FastCache::Testing::ListenQueueLimitsOnPort(port);
+    REQUIRE(limits.has_value());
+    CHECK(Unwrap(limits) == std::vector { std::min(ListenQueueDepth, *ceiling) });
 }
 
 TEST_CASE("Destroying the frame endpoint stops it, with nothing to remember", "[node][scheduler]")

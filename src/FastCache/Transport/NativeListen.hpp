@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Transport/ListenQueue.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -40,23 +42,36 @@ namespace FastCache
 /// `SO_REUSEADDR` would let a second process take a port already being served, and `SO_REUSEADDR`
 /// on POSIX, where it only steps over a dead socket's TIME_WAIT. A port several loops share is
 /// `core::net::PortSharing::Shared`, which only `core::net::listen` binds.
+///
+/// **Every listener here states a queue DEPTH** (`ListenQueue.hpp`), and the two places this file
+/// hands a backlog on -- `ListenOptions::backlog` and `::listen` -- spell it for the platform, since
+/// a plain number asks Windows for at most about 200 whatever it says (#1679).
 
 /// The kernel send and receive buffers every client connection asks for, so a reply of up to this
 /// size leaves in one write. A request: the kernel caps it at its own maximum.
 inline constexpr std::size_t ClientSocketBufferBytes = std::size_t { 1 } << 20;
+
+/// How a listener a loop drives binds when it asks for nothing of its own: @p host and @p port,
+/// with an accept queue `ListenQueueDepth` deep, spelled for this platform. The node's framed
+/// surfaces and its consensus listener bind through it, so neither takes core-cpp's default.
+/// @param host The address to bind.
+/// @param port The port; 0 lets the OS choose.
+/// @return The options to hand `core::net::listen`.
+[[nodiscard]] core::net::ListenOptions LoopListenOptions(std::string_view host, std::uint16_t port) noexcept;
 
 /// How the daemon binds a client listener on a loop, on every path: @p sharing decides whether
 /// other loops' listeners may bind the same port, and every connection it accepts asks for
 /// `ClientSocketBufferBytes` each way.
 /// @param host The address to bind.
 /// @param port The port; 0 lets the OS choose.
-/// @param backlog The listen backlog.
+/// @param queueDepth The accept-queue depth -- `--listen-backlog` -- spelled for this platform
+///        here (`ListenBacklogArgument`); on Windows the stack holds it to [200, 65535].
 /// @param sharing `Shared` for the POSIX multi-reactor's one listener per loop, `Exclusive`
 ///        otherwise. Windows refuses `Shared` (`core::net::NetErrorCode::Unsupported`).
 /// @return The options to hand `core::net::listen`.
 [[nodiscard]] core::net::ListenOptions ClientListenOptions(std::string_view host,
                                                            std::uint16_t port,
-                                                           int backlog,
+                                                           int queueDepth,
                                                            core::net::PortSharing sharing) noexcept;
 
 /// A socket this file bound and set listening.
@@ -71,12 +86,12 @@ struct BoundSocket
 /// @param resolver Resolves @p host (a literal or a name) to candidate addresses.
 /// @param host The address to bind; `0.0.0.0`, `::` and names all work.
 /// @param port The port; 0 lets the OS choose.
-/// @param backlog The listen backlog.
+/// @param queueDepth The accept-queue depth, spelled for this platform here (`ListenBacklogArgument`).
 /// @return The listening socket, owned by the caller, or why no candidate could be bound.
 [[nodiscard]] std::expected<BoundSocket, std::string> BindAndListen(core::net::IAddressResolver& resolver,
                                                                     std::string_view host,
                                                                     std::uint16_t port,
-                                                                    int backlog);
+                                                                    int queueDepth);
 
 /// @return The port @p socket is bound to, or 0 when it cannot be asked.
 [[nodiscard]] std::uint16_t BoundPortOf(core::platform::NativeHandle socket) noexcept;
@@ -197,13 +212,13 @@ class BlockingListener final: public core::net::IListener
     /// Bind and listen.
     /// @param bindAddress The address to bind.
     /// @param port The port; 0 lets the OS choose.
-    /// @param backlog The listen backlog.
+    /// @param queueDepth The accept-queue depth; see `BindAndListen`.
     /// @param resolver Resolves @p bindAddress.
     /// @return A listener; `IsBound()` says whether the bind succeeded and `BindError()` why not.
     [[nodiscard]] static std::unique_ptr<BlockingListener> Bind(
         std::string_view bindAddress,
         std::uint16_t port,
-        int backlog = 511,
+        int queueDepth = ListenQueueDepth,
         core::net::IAddressResolver& resolver = core::net::defaultAddressResolver());
 
     /// Take over a listening socket this process did not bind -- one inherited through socket

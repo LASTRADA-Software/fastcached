@@ -704,6 +704,30 @@ struct DriverSpec
     std::span<std::string_view const> versionFlags;
 };
 
+/// One argument a pass-through hands to a different driver grammar: what it carries, and
+/// which driver parses it.
+struct PassThroughMatch
+{
+    std::string_view inner;          ///< The argument carried, as the driver it is handed to receives it.
+    Flavor into { Flavor::Unknown }; ///< The driver whose grammar parses @ref inner.
+};
+
+/// Whether @p arg is a pass-through for a driver of @p family, and what it carries.
+///
+/// clang-cl's `/clang:<arg>` and `-clang:<arg>` hand `<arg>` to the clang driver underneath,
+/// which parses it with clang's OWN option table. **The one unwrap every argument classifier
+/// asks** -- the worker's allowlist and, through this, the launcher's side-artefact, denial and
+/// macro-switch checks -- so the launcher judges a pass-through exactly as the worker does
+/// (#1680). Each classifier asks it INSIDE itself and recurses on @ref PassThroughMatch::inner
+/// under the inner driver, so no call site can forget it.
+///
+/// The match is the prefix alone: an empty or bare inner argument still matches, and what that
+/// means is each caller's to say (the worker refuses one).
+/// @param arg    The argument as it appeared on the command line, introducer included.
+/// @param family The family of the driver that receives @p arg.
+/// @return What it carries, or nullopt when it is no pass-through for that family.
+[[nodiscard]] std::optional<PassThroughMatch> MatchPassThrough(std::string_view arg, DriverFamily family) noexcept;
+
 /// Whether `arg` makes a compile write something BESIDES its object file.
 ///
 /// A cache hit reproduces the object and the dependency record and nothing else, so
@@ -721,6 +745,11 @@ struct DriverSpec
 /// replay fails to link in another checkout, or links without the translation unit's
 /// debug info after the PCH was rebuilt. clang-cl's `/Yu` object carries neither and
 /// stays cacheable.
+///
+/// A pass-through (`/clang:-fmodule-output=x.pcm`) is judged as the argument it carries, by
+/// the driver it is handed to (`MatchPassThrough`): its whole spelling matches no row, so it
+/// used to cache a compile that writes a module file, and a hit restored the object
+/// without it (#1680).
 ///
 /// @param arg    The argument as it appeared on the command line.
 /// @param driver The driver whose spellings and flavor apply.

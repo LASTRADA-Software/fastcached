@@ -374,15 +374,24 @@ void ApplyHotSocketOptions(core::platform::NativeHandle handle) noexcept
     SetOption(socket, SOL_SOCKET, SO_RCVBUF, SocketBufferBytes);
 }
 
+core::net::ListenOptions LoopListenOptions(std::string_view host, std::uint16_t port) noexcept
+{
+    return core::net::ListenOptions {
+        .host = host,
+        .port = port,
+        .backlog = ListenBacklogArgument(ListenQueueDepth, ThisPlatformBacklogSpelling),
+    };
+}
+
 core::net::ListenOptions ClientListenOptions(std::string_view host,
                                              std::uint16_t port,
-                                             int backlog,
+                                             int queueDepth,
                                              core::net::PortSharing sharing) noexcept
 {
     return core::net::ListenOptions {
         .host = host,
         .port = port,
-        .backlog = backlog,
+        .backlog = ListenBacklogArgument(queueDepth, ThisPlatformBacklogSpelling),
         .sharing = sharing,
         .buffers = { .send = ClientSocketBufferBytes, .receive = ClientSocketBufferBytes },
     };
@@ -391,7 +400,7 @@ core::net::ListenOptions ClientListenOptions(std::string_view host,
 std::expected<BoundSocket, std::string> BindAndListen(core::net::IAddressResolver& resolver,
                                                       std::string_view host,
                                                       std::uint16_t port,
-                                                      int backlog)
+                                                      int queueDepth)
 {
     core::platform::ensureWinsockInitialized();
 
@@ -435,7 +444,7 @@ std::expected<BoundSocket, std::string> BindAndListen(core::net::IAddressResolve
             CloseNativeSocket(owned);
             continue;
         }
-        if (::listen(sock, backlog) != 0)
+        if (::listen(sock, ListenBacklogArgument(queueDepth, ThisPlatformBacklogSpelling)) != 0)
         {
             lastError = std::format("listen({}:{}) failed: {}", host, port, LastSocketError());
             CloseNativeSocket(owned);
@@ -589,11 +598,11 @@ std::expected<AcceptedSocket, core::net::NetError> AcceptRaw(core::platform::Nat
 
 std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAddress,
                                                          std::uint16_t port,
-                                                         int backlog,
+                                                         int queueDepth,
                                                          core::net::IAddressResolver& resolver)
 {
     auto listener = std::unique_ptr<BlockingListener> { new BlockingListener {} };
-    auto bound = BindAndListen(resolver, bindAddress, port, backlog);
+    auto bound = BindAndListen(resolver, bindAddress, port, queueDepth);
     if (bound.has_value())
         listener->_handle = bound->handle;
     else

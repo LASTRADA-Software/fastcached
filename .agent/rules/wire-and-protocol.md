@@ -978,6 +978,23 @@ Every rule below has already been a bug.
     duplicate stays a POSIX socket-activation device (`Node::ActivationHold`), and
     must never be extended to Windows.
 
+- **A listener asks for an accept-queue DEPTH, and a plain number does not say one on
+  Windows.** A connect that finds the queue of completed handshakes full is not refused:
+  Linux drops the SYN and Windows answers late, and the client's kernel retransmits after a
+  second -- so a launcher with a short connect bound reads a node that is UP as unreachable,
+  on the machine whose own build is largest (#1668). #1668 gave the node's framed surfaces a
+  deep queue; the consensus listener still bound a bare `core::net::ListenOptions` (core-cpp's
+  default of 128), and the daemon's `--listen-backlog` of 511 reached a Windows `::listen`
+  that holds any plain number to about 200 -- deeper takes `SOMAXCONN_HINT(n)`, which is
+  `-(n)` (#1679). So there is ONE depth, `ListenQueueDepth` (`Transport/ListenQueue.hpp`,
+  where #1668's measured Windows table now lives), every listener states it -- the daemon's
+  default and `BlockingListener::Bind`'s included -- and `ListenBacklogArgument` spells it at
+  the two places this tree hands a backlog on, `ListenOptions::backlog` and `::listen`, the
+  operator's value too; `LoopListenOptions` is a loop listener's. **Asserted against the
+  KERNEL** (`src/tests/ListenQueueLimit.hpp`, `TCP_INFO` on Linux): a helper's return value
+  says nothing about what reached `::listen`. When core-cpp#74 gives `ListenOptions` a depth
+  of its own, `ListenBacklogArgument` is what goes.
+
 - **A platform socket error is classified in one place.** `Detail::TranslateError`
   in `BlockingSocket.cpp` mapped ten conditions onto `NetErrorCode`;
   `BlockingConnector` then grew a three-condition copy of it, so `EACCES` — a
