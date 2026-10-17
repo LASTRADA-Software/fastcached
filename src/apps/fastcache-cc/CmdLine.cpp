@@ -1498,11 +1498,25 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     return body.contains('/') || body.contains('\\');
 }
 
+bool NamesHostCpu(std::string_view arg) noexcept
+{
+    // The GNU spellings that take a CPU; `native` is the one value that names none.
+    constexpr std::array<std::string_view, 3> CpuFlags { "-march=", "-mcpu=", "-mtune=" };
+    return std::ranges::any_of(
+        CpuFlags, [arg](std::string_view flag) { return arg.starts_with(flag) && arg.substr(flag.size()) == "native"; });
+}
+
 std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCommand const& cmd,
                                                                        std::span<std::string const> argv,
                                                                        std::string_view targetTriple)
 {
     auto const& driver = DriverOf(cmd.flavor);
+
+    // A worker resolves `native` to ITS CPU and the client would store that object under a
+    // key folding the CLIENT's (#1688), so such a line compiles here.
+    if (auto const host = std::ranges::find_if(argv, NamesHostCpu); host != argv.end())
+        return std::unexpected(
+            std::format("argument {} names this machine's CPU, which a worker would resolve to its own", *host));
 
     // Asked FIRST, before a single argument is examined: what this decides is
     // whether the job can be dispatched at all, and a refusal that costs nothing is

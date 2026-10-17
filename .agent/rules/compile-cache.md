@@ -39,6 +39,12 @@ collapse or a mis-serve and is now covered by regression tests:
     three roots tokenized, so no tokenizer here can disagree with the driver's. A file that
     cannot be read, names another response file, or carries an output or dependency-file
     flag (which the launcher must read off the command line) keeps the compile uncached.
+  - **`-march=native` is keyed by the CPU the driver RESOLVES it to** (`HostCpuKeyItem`, #1688):
+    the argument names no CPU, so two machines passing it shared an object built for one of
+    them. The unit's own line plus `-###` lists the expanded target (gcc's `-march=<cpu>`,
+    feature switches and `--param` cache sizes; clang's `-target-cpu`/`-target-feature`), and
+    only those tokens are keyed, never the listing's paths. An unresolvable listing is not
+    cached, and a line naming `native` is never dispatched (a worker resolves it to ITS CPU).
   - On MSVC never `/P` beside it: `/P` preprocesses to a `<base>.i` file rather than
     stdout, and `/EP /P` left the launcher hashing an empty stdout, so a Windows key
     carried nothing from the source and an edited file was answered with the object

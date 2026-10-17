@@ -373,6 +373,49 @@ std::expected<std::vector<std::string>, std::string> ResponseFileKeyItems(std::s
     return items;
 }
 
+std::optional<std::string> HostCpuKeyItem(std::string_view listing)
+{
+    // Both drivers print every argument of every command they would run, each one quoted.
+    std::vector<std::string_view> tokens;
+    auto rest = listing;
+    while (true)
+    {
+        auto const open = rest.find('"');
+        if (open == std::string_view::npos)
+            break;
+        auto close = open + 1;
+        while (close < rest.size() && rest[close] != '"')
+            close += rest[close] == '\\' ? 2 : 1;
+        if (close >= rest.size())
+            break;
+        tokens.push_back(rest.substr(open + 1, close - open - 1));
+        rest.remove_prefix(close + 1);
+    }
+
+    // A token kept on its own, and the switches whose VALUE is kept with them.
+    constexpr std::string_view KeptPrefix = "-m";
+    constexpr std::array<std::string_view, 4> ValuedSwitches { "--param", "-target-cpu", "-tune-cpu", "-target-feature" };
+    std::string kept;
+    auto at = std::size_t { 0 };
+    while (at < tokens.size())
+    {
+        auto const token = tokens[at];
+        if (std::ranges::contains(ValuedSwitches, token) && at + 1 < tokens.size())
+        {
+            kept.append(std::format("{} {}\n", token, tokens[at + 1]));
+            at += 2;
+            continue;
+        }
+        if (token.starts_with(KeptPrefix))
+            kept.append(std::format("{}\n", token));
+        ++at;
+    }
+    if (kept.empty())
+        return std::nullopt;
+    // A leading NUL is a byte no argument can carry, so the item cannot be mistaken for one.
+    return std::format("{}host-cpu\n{}", '\0', kept);
+}
+
 std::string KeyedPreprocessedText(std::string_view text)
 {
     std::string out;

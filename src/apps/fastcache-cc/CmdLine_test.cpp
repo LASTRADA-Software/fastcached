@@ -271,6 +271,32 @@ TEST_CASE("A source prefix map stays on the preprocess line; the macro map trave
     }
 }
 
+TEST_CASE("A line naming the host CPU is never dispatched, and nothing else is mistaken for one")
+{
+    // #1688: a worker resolves `native` to its OWN CPU, and the client would store that object
+    // under a key folding the client's.
+    for (std::string_view const flag: { "-march=native", "-mcpu=native", "-mtune=native" })
+    {
+        INFO(flag);
+        CHECK(NamesHostCpu(flag));
+        std::vector<std::string> const argv { "g++", std::string { flag }, "-O2", "-c", "a.cpp", "-o", "a.o" };
+        auto const remote = RemoteCompileArgs(Parse(argv), argv, {});
+        REQUIRE_FALSE(remote.has_value());
+        CHECK(remote.error().contains(flag));
+        CHECK(remote.error().contains("worker would resolve to its own"));
+    }
+    // Controls: a named CPU, and a word that merely ends in `native`, are not the host's.
+    for (std::string_view const other: { "-march=znver4", "-mtune=generic", "-march=nativeish", "-fnative", "native" })
+    {
+        INFO(other);
+        CHECK_FALSE(NamesHostCpu(other));
+    }
+    std::vector<std::string> const named { "g++", "-march=znver4", "-O2", "-c", "a.cpp", "-o", "a.o" };
+    auto const remote = RemoteCompileArgs(Parse(named), named, {});
+    INFO("refused: " << remote.error_or(""));
+    CHECK(remote.has_value());
+}
+
 TEST_CASE("The end-of-options marker stays with the source, which never travels")
 {
     // CMake's clang-cl rule ends `-c -- $in`. The launcher dropped the source and forwarded

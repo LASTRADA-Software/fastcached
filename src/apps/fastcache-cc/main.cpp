@@ -2943,6 +2943,21 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
         return Decline(record, "a response file's arguments cannot be keyed; not caching");
     }
     relativizedArgs.insert(relativizedArgs.end(), responseFiles->begin(), responseFiles->end());
+
+    // What `-march=native` names on THIS machine, asked of the driver itself (#1688): the
+    // argument names no CPU, so without this two machines share an object built for one of
+    // them. The unit's own line with `-###` appended, because that runs nothing, writes
+    // nothing, and resolves `native` against everything else the line says (`--target`, `-m32`).
+    if (std::ranges::any_of(argv.subspan(1), Cc::NamesHostCpu))
+    {
+        std::vector<std::string> listing { argv.begin(), argv.end() };
+        listing.emplace_back("-###");
+        auto const run = ProcessRunner().RunCaptureSplit(listing);
+        auto const hostCpu = run.exitCode == 0 ? Cc::HostCpuKeyItem(run.err) : std::nullopt;
+        if (!hostCpu.has_value())
+            return Decline(record, "the CPU -march=native names could not be resolved; not caching");
+        relativizedArgs.push_back(*hostCpu);
+    }
     // ONE probe for two questions where the driver allows it (#1237). The banner
     // and the target triple both come out of a clang driver's `-###`, and this is
     // a process per translation unit, so a second spawn here is a second spawn per
