@@ -230,6 +230,7 @@ if(FASTCACHED_BUILD_TESTS)
         FleetTickets_test.cpp
         FleetLeaseRouting_test.cpp
         FleetExclusion_test.cpp
+        FleetCompileBudget_test.cpp
         FleetDialHint_test.cpp
         FleetVoterMove_test.cpp
         NodeConfig_test.cpp
