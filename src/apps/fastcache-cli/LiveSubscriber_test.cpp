@@ -164,7 +164,7 @@ TEST_CASE("A reading is decoded in its subject's grammar into the model /metrics
     SECTION("a reading whose own digest is another build's is refused, whatever the grant said")
     {
         auto foreign = encoded;
-        foreign.front() ^= std::byte { 0x01 };
+        foreign.at(0) ^= std::byte { 0x01 };
         auto const frame = ReadLiveFrame(Wire::LiveSubject::Cache, Snapshot(foreign));
         REQUIRE(frame.kind == LiveFrameKind::Unreadable);
         CHECK(frame.note.contains("a cache reading is laid out by a build other than this client's"));

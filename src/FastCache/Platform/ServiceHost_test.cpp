@@ -182,15 +182,18 @@ TEST_CASE("A serving start reports starting and running before its body and its 
     REQUIRE(service.manager->Reports().size() == 3);
     CHECK(service.manager->Reports()[1].acceptsStop);
     CHECK(service.manager->Reports()[1].acceptsReload);
-    CHECK(service.manager->Reports().back().exit
+    auto const newest = service.manager->NewestReport();
+    REQUIRE(newest.has_value());
+    CHECK(Testing::Unwrap(newest).exit
           == ServiceExit { .win32ExitCode = ServiceSpecificError, .serviceSpecificExitCode = 3 });
 
     SECTION("and a clean stop reads as one, so no restart policy fires")
     {
         ScriptedService clean { ServiceManagerPresence::Present };
         CHECK(clean.host->Run([] { return 0; }) == 0);
-        REQUIRE_FALSE(clean.manager->Reports().empty());
-        CHECK(clean.manager->Reports().back().exit == ServiceExit { .win32ExitCode = 0, .serviceSpecificExitCode = 0 });
+        auto const cleanNewest = clean.manager->NewestReport();
+        REQUIRE(cleanNewest.has_value());
+        CHECK(Testing::Unwrap(cleanNewest).exit == ServiceExit { .win32ExitCode = 0, .serviceSpecificExitCode = 0 });
     }
 }
 
@@ -264,7 +267,9 @@ TEST_CASE("A start told to wait whose body returns before serving is reported st
 
     CHECK(service.manager->Violations().empty());
     CHECK(Collapsed(service.manager->States()) == std::vector { ServiceState::StartPending, ServiceState::Stopped });
-    CHECK(service.manager->Reports().back().exit
+    auto const newest = service.manager->NewestReport();
+    REQUIRE(newest.has_value());
+    CHECK(Testing::Unwrap(newest).exit
           == ServiceExit { .win32ExitCode = ServiceSpecificError, .serviceSpecificExitCode = 78 });
 }
 
@@ -343,7 +348,9 @@ TEST_CASE("A start told to wait accepts a stop, and the service ends stopped wit
     CHECK(service.manager->Violations().empty());
     CHECK(Collapsed(service.manager->States())
           == std::vector { ServiceState::StartPending, ServiceState::StopPending, ServiceState::Stopped });
-    CHECK(service.manager->Reports().back().exit == ServiceExit { .win32ExitCode = 0, .serviceSpecificExitCode = 0 });
+    auto const newest = service.manager->NewestReport();
+    REQUIRE(newest.has_value());
+    CHECK(Testing::Unwrap(newest).exit == ServiceExit { .win32ExitCode = 0, .serviceSpecificExitCode = 0 });
 }
 
 TEST_CASE("A stop accepted while starting is never followed by RUNNING, even from a body that serves at that moment",

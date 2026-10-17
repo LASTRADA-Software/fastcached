@@ -300,6 +300,20 @@ class ScriptedServiceControlManager final: public IServiceControlManager
         return _reports;
     }
 
+    /// The newest status reported, for a case to `REQUIRE` and `Unwrap` -- never `.back()` on
+    /// `Reports()`, which on a case that already failed reads an empty vector: undefined behaviour
+    /// where a failure belongs, and a null dereference GCC 16 refuses at `-O2`. Not the private
+    /// `LastReport`, whose answer before any report is the SCM's own default -- the model's
+    /// business, and a value an assertion would read as a report that never came.
+    /// @return The newest report, or nullopt before the first.
+    [[nodiscard]] std::optional<ServiceStatusReport> NewestReport() const
+    {
+        std::scoped_lock const lock { _mutex };
+        if (_reports.empty())
+            return std::nullopt;
+        return _reports.back();
+    }
+
     /// @return The states reported, in order.
     [[nodiscard]] std::vector<ServiceState> States() const
     {
