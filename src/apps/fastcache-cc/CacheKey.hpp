@@ -3,6 +3,8 @@
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
+#include <expected>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -147,6 +149,55 @@ struct KeyInputs
                                                       std::string_view sourceRoot,
                                                       std::string_view buildTree,
                                                       PathCanon::PathTransform const& resolve = {});
+
+/// Reads one response file's bytes, or answers nothing when it cannot. The path is as the
+/// command line spelled it; resolving it against the compile's working directory is the
+/// reader's business.
+using ResponseFileReader = std::function<std::optional<std::string>(std::string_view path)>;
+
+/// The key material a command line's response files (`@file`) carry, or why the compile
+/// must not be cached.
+///
+/// A driver expands `@file` itself, so the arguments inside it never reached the key: the
+/// key hashed the NAME. Two builds differing only in what the file says (`-O0` against
+/// `-O2`, a define, `/arch:`) shared one entry -- measured: changing `-O0` to `-O2` inside
+/// the file was answered with the `-O0` object, a direct-mode HIT, because the manifest key
+/// sees the arguments and not the text the file expands to.
+///
+/// Each file's BYTES are keyed, so no tokenizer of this launcher's can disagree with the
+/// driver's about what they say; the three roots are first replaced by their tokens, so two
+/// checkouts still share where the file names them in the build's own spelling (any other
+/// spelling is a miss, never a wrong hit). Refused, rather than keyed, when a file:
+/// - cannot be read -- there is nothing to key;
+/// - names another response file -- its bytes would be outside the key again;
+/// - carries an output or dependency-file flag -- the launcher reads those off the command
+///   line to restore what a hit writes, and one hidden in a file would be written by nobody.
+/// @param args   The compile arguments (excluding the compiler).
+/// @param layout The roots to tokenize within each file.
+/// @param read   Reads a response file.
+/// @return One key item per response file, in order; or the refusal's reason.
+[[nodiscard]] std::expected<std::vector<std::string>, std::string> ResponseFileKeyItems(std::span<std::string const> args,
+                                                                                        PathCanon::Layout const& layout,
+                                                                                        ResponseFileReader const& read);
+
+/// The preprocessed text the key hashes: the probe's output with every line marker's PATH
+/// removed and its line number and flags kept.
+///
+/// The probe keeps its markers (`-E`, `/E`) because they carry the line structure: without
+/// them a comment inserted above a function left the text byte-identical while
+/// `std::source_location`, `__builtin_LINE` and every `-g` line table moved, so the edited
+/// file was served the object built before the edit. The marker's path is what made it
+/// unportable -- it is the checkout's absolute path -- and nothing in the object depends on
+/// it that a key could see: `__FILE__` is already expanded in the text, and a file name the
+/// compiler records after preprocessing (`source_location::file_name`, debug records) is
+/// root binding's and the prefix maps' to answer.
+///
+/// Both spellings are recognised: GNU's `# <line> "<path>" <flags>` and MSVC's
+/// `#line <line> "<path>"`. A line that is not a marker of either shape -- a `#pragma`, an
+/// assembler comment -- is kept verbatim, as is every other byte.
+/// @param text The probe's stdout.
+/// @return The text with each marker reduced to its line number and flags.
+[[nodiscard]] std::string KeyedPreprocessedText(std::string_view text);
 
 /// `RelativizeArgs` over a whole layout, its dependency root included: a path under
 /// `layout.dependencyRoot` becomes a `<DEPROOT>` token, so an include directory into a

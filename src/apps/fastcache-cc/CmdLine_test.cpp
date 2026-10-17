@@ -333,18 +333,22 @@ TEST_CASE("PreprocessCommand asks a GNU driver for preprocessed text on stdout")
     CHECK_FALSE(std::ranges::contains(pp, "build/a.o"));
 }
 
-TEST_CASE("PreprocessCommand suppresses line markers on every driver")
+TEST_CASE("PreprocessCommand keeps line markers on every driver, for the key to reduce")
 {
-    // Regression guard. `# 1 "/abs/path/t.cpp"` line markers embed the absolute
-    // source path, so preprocessed text from two checkouts of identical content
-    // at different paths would differ — and the cache keys with it, silently
-    // destroying cross-machine sharing, which is this launcher's whole point.
-    // MSVC's /EP suppresses them; GNU needs an explicit -P.
+    // Regression guard, and the direction moved. Suppressing the markers (`-P`, `/EP`) kept
+    // the checkout path out of the key and threw the LINE STRUCTURE away with it: `-P`
+    // collapses blank and comment lines, so a comment inserted above a function kept the key
+    // while `source_location` and every `-g` line table moved. The markers stay, and
+    // `KeyedPreprocessedText` removes only their paths.
     std::vector<std::string> const gnu { "g++", "-c", "a.cpp", "-o", "a.o" };
-    CHECK(std::ranges::contains(PreprocessCommand(Parse(gnu), gnu), "-P"));
+    auto const gnuLine = PreprocessCommand(Parse(gnu), gnu);
+    CHECK(std::ranges::contains(gnuLine, "-E"));
+    CHECK_FALSE(std::ranges::contains(gnuLine, "-P"));
 
     std::vector<std::string> const msvc { "cl.exe", "/c", "a.cpp" };
-    CHECK(std::ranges::contains(PreprocessCommand(Parse(msvc), msvc), "/EP"));
+    auto const msvcLine = PreprocessCommand(Parse(msvc), msvc);
+    CHECK(std::ranges::contains(msvcLine, "/E"));
+    CHECK_FALSE(std::ranges::contains(msvcLine, "/EP"));
 }
 
 TEST_CASE("PreprocessCommand drops dependency flags together with their values")
@@ -365,7 +369,7 @@ TEST_CASE("PreprocessCommand uses the MSVC spelling for MSVC drivers")
     std::vector<std::string> const argv { "cl.exe", "/c", "/showIncludes", "/Foout.obj", "a.cpp" };
     auto const pp = PreprocessCommand(Parse(argv), argv);
 
-    CHECK(std::ranges::contains(pp, "/EP"));
+    CHECK(std::ranges::contains(pp, "/E"));
     CHECK_FALSE(std::ranges::contains(pp, "/c"));
     CHECK_FALSE(std::ranges::contains(pp, "/showIncludes"));
     CHECK_FALSE(std::ranges::contains(pp, "/Foout.obj"));
@@ -385,7 +389,7 @@ TEST_CASE("PreprocessCommand drops the GNU spelling of compile-only on clang-cl"
     std::vector<std::string> const argv { R"(C:\llvm\bin\clang-cl.exe)", "-c", "/showIncludes", "/Foout.obj", "a.cpp" };
     auto const pp = PreprocessCommand(Parse(argv), argv);
 
-    CHECK(std::ranges::contains(pp, "/EP"));
+    CHECK(std::ranges::contains(pp, "/E"));
     CHECK_FALSE(std::ranges::contains(pp, "-c"));
     CHECK_FALSE(std::ranges::contains(pp, "/showIncludes"));
     CHECK_FALSE(std::ranges::contains(pp, "/Foout.obj"));
@@ -412,7 +416,7 @@ TEST_CASE("PreprocessCommand drops warnings-as-errors from the probe line")
         std::vector<std::string> const argv { R"(C:\VC\bin\cl.exe)", "/WX", "/c", "/Foout.obj", "a.cpp" };
         auto const pp = PreprocessCommand(Parse(argv), argv);
 
-        CHECK(std::ranges::contains(pp, "/EP"));
+        CHECK(std::ranges::contains(pp, "/E"));
         CHECK_FALSE(std::ranges::contains(pp, "/WX"));
         CHECK(std::ranges::contains(pp, "a.cpp"));
     }
@@ -663,7 +667,8 @@ TEST_CASE("PreprocessCommand sends MSVC preprocessed text to stdout, never to a 
         std::vector<std::string> const argv { compiler, "/c", "/Foout.obj", "a.cpp" };
         auto const pp = PreprocessCommand(Parse(argv), argv);
 
-        CHECK(std::ranges::contains(pp, "/EP"));
+        CHECK(std::ranges::contains(pp, "/E"));
+        CHECK_FALSE(std::ranges::contains(pp, "/EP"));
         CHECK_FALSE(std::ranges::contains(pp, "/P"));
     }
 }
@@ -1307,11 +1312,11 @@ TEST_CASE("RemoteCompileArgs drops the MSVC spellings too")
 
 // --- preprocessing for a remote compile --------------------------------------
 
-TEST_CASE("The dispatch preprocess keeps line markers that the key's suppresses")
+TEST_CASE("The dispatch preprocess keeps line markers, as the key's now does")
 {
-    // The two runs answer different questions. The key's text must carry no path,
-    // so it suppresses markers; a worker's must carry them, because they are what
-    // tells the compiler which lines came from a system header.
+    // Both runs keep them now: a worker's because they tell the compiler which lines came
+    // from a system header, the key's because they carry the line structure -- which the
+    // key keeps while `KeyedPreprocessedText` drops the paths.
     std::vector<std::string> const argv { "g++", "-O2", "-c", "a.cpp", "-o", "a.o" };
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
@@ -1319,7 +1324,7 @@ TEST_CASE("The dispatch preprocess keeps line markers that the key's suppresses"
     auto const forKey = PreprocessCommand(cmd, argv);
     auto const forWorker = DispatchPreprocessCommand(cmd, argv);
 
-    CHECK(std::ranges::find(forKey, "-P") != forKey.end());
+    CHECK(std::ranges::find(forKey, "-P") == forKey.end());
     CHECK(std::ranges::find(forWorker, "-P") == forWorker.end());
     CHECK(std::ranges::find(forWorker, "-E") != forWorker.end());
     // The source still has to be there, or the run preprocesses nothing.

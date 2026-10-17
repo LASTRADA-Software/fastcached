@@ -70,6 +70,19 @@ preprocess-only run moves the notes (clang-cl puts them on stderr under `/EP`,
 so that they do not corrupt the preprocessed stdout), so the probe splits stdout
 unconditionally and reads notes from both streams rather than guessing.
 
+The probe keeps its line markers (`-E`, `/E`) and the key keeps their line numbers
+while dropping their paths. Suppressing the markers (`-E -P`, `/EP`) collapsed blank
+and comment lines, so a comment inserted above a function kept the key while
+`std::source_location`, `__builtin_LINE` and the `-g` line tables moved, and the
+edited file was served the object built before the edit.
+
+A response file (`@flags.rsp`) is keyed by what it SAYS, not by its name: the
+driver expands it itself, so the key has to read it too, or two builds differing
+only inside the file would share an object. Its bytes are keyed with the source
+root, build tree and dependency cache replaced by tokens, so checkouts still share.
+A response file that cannot be read, names another response file, or carries an
+output or dependency-file flag (`-o`, `-MF`, `/Fo`, `-MD`, ...) is not cached.
+
 Version-suffixed (`g++-14`, `clang-18`) and `.exe` forms are recognised. Any
 other `argv[0]` is treated as unknown and passed straight through uncached.
 

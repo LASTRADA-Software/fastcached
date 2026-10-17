@@ -7,6 +7,8 @@
 #include <FastCache/CompileCache/PathCanon.hpp>
 
 #include <algorithm>
+#include <array>
+#include <expected>
 #include <format>
 #include <optional>
 #include <span>
@@ -214,6 +216,187 @@ std::optional<std::string> UnkeyableArgument(std::span<std::string const> args, 
     return std::nullopt;
 }
 
+namespace
+{
+    /// The marker a line opens with, reduced to what the key keeps, or nothing when the
+    /// line is not a marker.
+    /// @param line One line without its terminator.
+    /// @return The line as written up to its line number, then what followed the quoted
+    ///         path, or nullopt.
+    [[nodiscard]] std::optional<std::string> ReducedMarker(std::string_view line)
+    {
+        auto rest = line;
+        if (!rest.starts_with('#'))
+            return std::nullopt;
+        rest.remove_prefix(1);
+        auto const skipBlanks = [&rest] {
+            while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t'))
+                rest.remove_prefix(1);
+        };
+        skipBlanks();
+        if (rest.starts_with("line") && rest.size() > 4 && (rest[4] == ' ' || rest[4] == '\t'))
+        {
+            rest.remove_prefix(4);
+            skipBlanks();
+        }
+        auto const digits = rest.substr(0, rest.find_first_not_of("0123456789"));
+        if (digits.empty())
+            return std::nullopt;
+        rest.remove_prefix(digits.size());
+        auto const throughLineNumber = line.substr(0, line.size() - rest.size());
+        skipBlanks();
+        if (!rest.starts_with('"'))
+            return std::nullopt;
+        // The path is a C string literal: a backslash escapes the next byte, so `\"` does not
+        // end it, and MSVC doubles every separator (`c:\\src\\a.cpp`).
+        auto at = std::size_t { 1 };
+        while (at < rest.size() && rest[at] != '"')
+            at += rest[at] == '\\' ? 2 : 1;
+        if (at >= rest.size())
+            return std::nullopt;
+        rest.remove_prefix(at + 1);
+        return std::format("{}{}", throughLineNumber, rest);
+    }
+} // namespace
+
+namespace
+{
+    /// Bare switches a response file may not carry, because the launcher reads them off the
+    /// command line: what is compiled, and which dependency record a hit must write. The
+    /// path-valued ones (`-o`, `-MF`, `/Fo`, ...) are asked of `PathValueFlags()` instead.
+    constexpr std::array<std::string_view, 15> CommandLineOnlySwitches {
+        "-c",
+        "/c",
+        "-S",
+        "-E",
+        "/E",
+        "/EP",
+        "/P",
+        "-M",
+        "-MM",
+        "-MD",
+        "-MMD",
+        "-MG",
+        "-MP",
+        "/showIncludes",
+        "-showIncludes",
+    };
+
+    /// Path-valued roles a response file may not carry: outputs and the dependency record.
+    constexpr std::array<PathValueRole, 4> CommandLineOnlyRoles {
+        PathValueRole::ObjectOutput, PathValueRole::DepFile, PathValueRole::DepTarget, PathValueRole::DebugOutput
+    };
+
+    /// Why a response file's text must keep the compile uncached, or nothing.
+    /// @param path The file as the command line named it.
+    /// @param text Its bytes.
+    /// @return The reason, or nullopt.
+    [[nodiscard]] std::optional<std::string> ResponseFileRefusal(std::string_view path, std::string_view text)
+    {
+        // Split on blanks and shed quotes: a REFUSAL may over-recognise (it costs a miss), so
+        // this need not be the driver's own grammar -- the key never reads these tokens.
+        auto rest = text;
+        while (!rest.empty())
+        {
+            auto const start = rest.find_first_not_of(" \t\r\n");
+            if (start == std::string_view::npos)
+                break;
+            rest.remove_prefix(start);
+            auto const end = rest.find_first_of(" \t\r\n");
+            auto token = rest.substr(0, end);
+            rest.remove_prefix(end == std::string_view::npos ? rest.size() : end);
+            auto const isQuote = [](char c) {
+                return c == '"' || c == '\'';
+            };
+            while (!token.empty() && isQuote(token.front()))
+                token.remove_prefix(1);
+            while (!token.empty() && isQuote(token.back()))
+                token.remove_suffix(1);
+
+            if (token.starts_with('@'))
+                return std::format(
+                    "response file {} names another response file ({}), whose text the key cannot see", path, token);
+            if (std::ranges::contains(CommandLineOnlySwitches, token))
+                return std::format(
+                    "response file {} carries {}, which the launcher must read off the command line", path, token);
+            if (auto const match = MatchPathValueFlag(token, "-/", DriverFamily::Any);
+                match.has_value() && std::ranges::contains(CommandLineOnlyRoles, match->flag.role))
+                return std::format("response file {} carries {}, which the launcher must read off the command line",
+                                   path,
+                                   match->flag.spelling);
+        }
+        return std::nullopt;
+    }
+} // namespace
+
+std::expected<std::vector<std::string>, std::string> ResponseFileKeyItems(std::span<std::string const> args,
+                                                                          PathCanon::Layout const& layout,
+                                                                          ResponseFileReader const& read)
+{
+    // The roots, longest first, so a build tree nested in the source root is replaced before
+    // the source root's own occurrences are -- `PathCanon`'s longest-match rule, as text.
+    std::vector<std::pair<std::string_view, std::string_view>> roots;
+    for (auto const& [root, token]:
+         { std::pair { std::string_view { layout.buildTree }, std::string_view { "<BUILDTREE>" } },
+           std::pair { std::string_view { layout.dependencyRoot }, std::string_view { "<DEPROOT>" } },
+           std::pair { std::string_view { layout.sourceRoot }, std::string_view { "<SRCROOT>" } } })
+        if (!root.empty())
+            roots.emplace_back(root, token);
+    std::ranges::stable_sort(roots, std::ranges::greater {}, [](auto const& row) { return row.first.size(); });
+
+    std::vector<std::string> items;
+    for (auto const& arg: args)
+    {
+        if (!arg.starts_with('@') || arg.size() == 1)
+            continue;
+        auto const path = std::string_view { arg }.substr(1);
+        auto text = read(path);
+        if (!text.has_value())
+            return std::unexpected(std::format("response file {} cannot be read, so its arguments cannot be keyed", path));
+        if (auto const refusal = ResponseFileRefusal(path, *text))
+            return std::unexpected(*refusal);
+
+        for (auto const& [root, token]: roots)
+        {
+            auto at = text->find(root);
+            while (at != std::string::npos)
+            {
+                text->replace(at, root.size(), token);
+                at = text->find(root, at + token.size());
+            }
+        }
+        // A leading NUL is a byte no argument can carry, so the item cannot be mistaken for one.
+        // The file's NAME is not repeated: the relativized arguments already carry it, and the
+        // raw spelling may be absolute.
+        items.push_back(std::format("{}response-file\n{}", '\0', *text));
+    }
+    return items;
+}
+
+std::string KeyedPreprocessedText(std::string_view text)
+{
+    std::string out;
+    out.reserve(text.size());
+    while (!text.empty())
+    {
+        auto const end = text.find('\n');
+        auto const length = end == std::string_view::npos ? text.size() : end + 1;
+        auto const line = text.substr(0, length);
+        // The terminator (`\n`, or `\r\n`) is kept as written, so only the marker's path moves.
+        auto const terminatorSize = line.ends_with("\r\n") ? 2U : (line.ends_with('\n') ? 1U : 0U);
+        auto const body = line.substr(0, line.size() - terminatorSize);
+        if (auto const reduced = ReducedMarker(body))
+        {
+            out.append(*reduced);
+            out.append(line.substr(body.size()));
+        }
+        else
+            out.append(line);
+        text.remove_prefix(length);
+    }
+    return out;
+}
+
 std::string CacheCompilerId(std::string_view banner, std::string_view targetTriple)
 {
     if (targetTriple.empty())
@@ -343,7 +526,15 @@ std::string ComputeKey(KeyInputs const& inputs)
     // `dependency-root`. Bumped so the two generations never exchange an entry rather than
     // relying on their keys differing, which they do only for units that read a
     // dependency. `manifest-v9` moves with it, in the lock-step ComputeManifestKey records.
-    KeyDigest digest { "objkey-v8" };
+    //
+    // v9 is the line structure. `preprocessed` was `-E -P` / `/EP` output, which collapses
+    // blank and comment lines, so a comment inserted above a function kept the key while
+    // `source_location`, `__builtin_LINE` and the `-g` line tables moved: the edited file was
+    // served the object from before the edit (measured end to end: a HIT whose function
+    // reported line 2 where the source said 5). It is now `KeyedPreprocessedText` over output
+    // that keeps its markers. Every key moves, so the tag moves with them rather than leaving
+    // a v8 cache whose entries no current key can reach to be explained later.
+    KeyDigest digest { "objkey-v9" };
     digest.Field(inputs.compilerId);
     digest.Field(inputs.preprocessed);
     for (auto const& arg: inputs.relativizedArgs)
