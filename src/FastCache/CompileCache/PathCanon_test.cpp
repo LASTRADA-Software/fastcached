@@ -36,23 +36,28 @@ TEST_CASE("Canonicalize prefers the longest (build-tree) root when nested under 
 
 TEST_CASE("A dependency root is a third token, localized on another machine's own root")
 {
+    // The fixture's homes are spelled so no machine running this suite has them: a real
+    // dependency root in an object's strings binds that object to the machine, so test data
+    // naming one is measured as a miss on exactly the machine it names.
+    //
     // CPM files a dependency under the commit it pinned, in a cache under the user's home:
     // the bytes are the same everywhere, the location is not. Without a root of its own a
     // header there kept the producing user's home in every key and every replayed depfile.
-    Layout const alice { .sourceRoot = "/home/alice/work/fc",
-                         .buildTree = "/home/alice/work/fc/out/build/r",
-                         .dependencyRoot = "/home/alice/.cache/fastcached/cpm" };
+    Layout const alice { .sourceRoot = "/fixture/user-a/work/fc",
+                         .buildTree = "/fixture/user-a/work/fc/out/build/r",
+                         .dependencyRoot = "/fixture/user-a/.cache/fastcached/cpm" };
     Layout const bob { .sourceRoot = "/srv/bob/fc",
                        .buildTree = "/srv/bob/fc/out/build/r",
-                       .dependencyRoot = "/home/bob/.cache/fastcached/cpm" };
+                       .dependencyRoot = "/fixture/user-b/.cache/fastcached/cpm" };
 
-    auto const token = PathCanon::Canonicalize("/home/alice/.cache/fastcached/cpm/core-cpp/22c6/src/core/Log.hpp", alice);
+    auto const token =
+        PathCanon::Canonicalize("/fixture/user-a/.cache/fastcached/cpm/core-cpp/22c6/src/core/Log.hpp", alice);
     CHECK(token == "<DEPROOT>/core-cpp/22c6/src/core/Log.hpp");
-    CHECK(PathCanon::Localize(token, bob) == "/home/bob/.cache/fastcached/cpm/core-cpp/22c6/src/core/Log.hpp");
+    CHECK(PathCanon::Localize(token, bob) == "/fixture/user-b/.cache/fastcached/cpm/core-cpp/22c6/src/core/Log.hpp");
 
     // The two roots it sits beside keep their tokens, and their order with each other.
-    CHECK(PathCanon::Canonicalize("/home/alice/work/fc/src/a.cpp", alice) == "<SRCROOT>/src/a.cpp");
-    CHECK(PathCanon::Canonicalize("/home/alice/work/fc/out/build/r/gen.hpp", alice) == "<BUILDTREE>/gen.hpp");
+    CHECK(PathCanon::Canonicalize("/fixture/user-a/work/fc/src/a.cpp", alice) == "<SRCROOT>/src/a.cpp");
+    CHECK(PathCanon::Canonicalize("/fixture/user-a/work/fc/out/build/r/gen.hpp", alice) == "<BUILDTREE>/gen.hpp");
 
     // The deepest root wins wherever it sits: a dependency cache kept INSIDE the checkout
     // still names its dependencies by the machine-independent token, and the checkout's own
@@ -62,14 +67,15 @@ TEST_CASE("A dependency root is a third token, localized on another machine's ow
     CHECK(PathCanon::Canonicalize("/w/fc/src/b.cpp", nested) == "<SRCROOT>/src/b.cpp");
 
     // It relates as a root does, so the launcher's classifier counts its headers as content.
-    CHECK(PathCanon::RelateToLayout("/home/alice/.cache/fastcached/cpm/x/1/a.h", alice) == PathCanon::RootRelation::Under);
+    CHECK(PathCanon::RelateToLayout("/fixture/user-a/.cache/fastcached/cpm/x/1/a.h", alice)
+          == PathCanon::RootRelation::Under);
 
     // A layout naming no dependency root is the layout every server builds from a STORE
     // frame, and it canonicalizes exactly as it did -- the token is unreachable from it, and
     // a span the launcher already tokenized lies under no root it knows.
     Layout const server { .sourceRoot = alice.sourceRoot, .buildTree = alice.buildTree };
-    CHECK(PathCanon::Canonicalize("/home/alice/.cache/fastcached/cpm/x/1/a.h", server)
-          == "/home/alice/.cache/fastcached/cpm/x/1/a.h");
+    CHECK(PathCanon::Canonicalize("/fixture/user-a/.cache/fastcached/cpm/x/1/a.h", server)
+          == "/fixture/user-a/.cache/fastcached/cpm/x/1/a.h");
     CHECK(PathCanon::Canonicalize("<DEPROOT>/x/1/a.h", server) == "<DEPROOT>/x/1/a.h");
     // And a consumer with no dependency root leaves the token standing rather than joining
     // it onto nothing, which `MissingReplayedDependency` then refuses.
@@ -80,11 +86,11 @@ TEST_CASE("A layout naming only the dependency root rewrites only its spans")
 {
     // The launcher's pre-pass before a STORE: it tokenizes the root no server knows and
     // leaves the checkout's paths for the server's own canonicalization.
-    Layout const dependencyOnly { .sourceRoot = {}, .buildTree = {}, .dependencyRoot = "/home/alice/.cache/cpm" };
-    std::string const depfile = "out.o: /home/alice/work/fc/src/a.cpp \\\n"
-                                " /home/alice/.cache/cpm/core-cpp/22c6/src/core/Log.hpp \\\n"
+    Layout const dependencyOnly { .sourceRoot = {}, .buildTree = {}, .dependencyRoot = "/fixture/user-a/.cache/cpm" };
+    std::string const depfile = "out.o: /fixture/user-a/work/fc/src/a.cpp \\\n"
+                                " /fixture/user-a/.cache/cpm/core-cpp/22c6/src/core/Log.hpp \\\n"
                                 " /usr/include/c++/16/vector\n";
-    std::string const expected = "out.o: /home/alice/work/fc/src/a.cpp \\\n"
+    std::string const expected = "out.o: /fixture/user-a/work/fc/src/a.cpp \\\n"
                                  " <DEPROOT>/core-cpp/22c6/src/core/Log.hpp \\\n"
                                  " /usr/include/c++/16/vector\n";
     CHECK(PathCanon::CanonicalizeRegion(depfile, Grammar::GccDepfile, dependencyOnly) == expected);
