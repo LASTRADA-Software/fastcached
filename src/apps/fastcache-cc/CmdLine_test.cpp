@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "ArgumentDenials.hpp"
 #include "CacheKey.hpp"
 #include "CmdLine.hpp"
 
@@ -13,6 +14,7 @@
 #include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -983,8 +985,10 @@ TEST_CASE("RemoteCompileArgs drops include directories in both spellings")
 
 TEST_CASE("RemoteCompileArgs refuses a command line it cannot fully account for")
 {
-    // PathValueFlags() does not know -isystem, --sysroot, -B, -specs= or -fplugin=,
+    // PathValueFlags() does not know -isysroot, --sysroot, -B, -specs= or -fplugin=,
     // and it should not have to: it exists to answer questions about the cache key.
+    // (`-isystem` used to head this list; it is a header-search directory the dispatch
+    // preprocess resolves, and is dropped from the worker's line since #1661.)
     // Several of those point a compiler at an EXECUTABLE. Dropping them silently
     // would change the generated code; sending them would hand a client the ability
     // to make a worker read or run a file of its choosing. Refusing costs one local
@@ -994,7 +998,8 @@ TEST_CASE("RemoteCompileArgs refuses a command line it cannot fully account for"
         return !RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {}).has_value();
     };
 
-    CHECK(refuses({ "g++", "-isystem", "/opt/sdk/include", "-c", "a.cpp", "-o", "a.o" }));
+    CHECK(refuses({ "g++", "-isysroot", "/opt/sdk", "-c", "a.cpp", "-o", "a.o" }));
+    CHECK(refuses({ "g++", "-B/opt/bin", "-c", "a.cpp", "-o", "a.o" }));
     CHECK(refuses({ "g++", "--sysroot=/opt/sysroot", "-c", "a.cpp", "-o", "a.o" }));
     CHECK(refuses({ "g++", "-fplugin=/tmp/evil.so", "-c", "a.cpp", "-o", "a.o" }));
     CHECK(refuses({ "g++", "-specs=/tmp/specs", "-c", "a.cpp", "-o", "a.o" }));
@@ -1020,10 +1025,179 @@ TEST_CASE("RemoteCompileArgs refuses a command line it cannot fully account for"
     // a `/`-led option that is genuinely unaccounted for: the introducer is skipped before
     // the separator is looked for, so an MSVC compile is not refused wholesale for spelling
     // its options with `/` -- but a separator inside an option nothing recognises still
-    // refuses. `/FI` names a forced include, is in neither table, and the worker would have
-    // to open it.
-    CHECK(refuses({ "cl", "/FIC:\\force\\prefix.h", "/c", "a.cpp", "/Foa.obj" }));
+    // refuses. `/AI` names a `#using` directory, is in neither table, and the worker would
+    // have to open it. (`/FI` was this case until #1666 made a forced include a row: the
+    // dispatch preprocess inlines it.)
+    CHECK(refuses({ "cl", "/AIC:\\meta", "/c", "a.cpp", "/Foa.obj" }));
     CHECK_FALSE(refuses({ "cl", "/std:c++20", "/O2", "/EHsc", "/c", "a.cpp", "/Foa.obj" }));
+}
+
+TEST_CASE("The GNU header-search flags leave the worker's line and stay on the preprocess lines", "[dispatch]")
+{
+    // #1661's acceptance. CMake writes `-isystem <dir>` for every SYSTEM include
+    // directory, and the line was refused on the directory. They decide where the
+    // PREPROCESSOR looks, and the dispatch preprocess has already looked.
+    std::vector<std::string> const argv {
+        "g++",
+        "-O2",
+        "-isystem",
+        "/deps/glaze/include",
+        "-isystem/deps/fmt/include",
+        "-iquote",
+        "quoted",
+        "-idirafter",
+        "/after",
+        "-isystem-after",
+        "/late",
+        "-Wall",
+        "-c",
+        "a.cpp",
+        "-o",
+        "a.o",
+    };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const remote = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+    INFO("refused: " << remote.error_or(""));
+    REQUIRE(remote.has_value());
+    for (auto const* gone: { "-isystem",
+                             "/deps/glaze/include",
+                             "-isystem/deps/fmt/include",
+                             "-iquote",
+                             "quoted",
+                             "-idirafter",
+                             "/after",
+                             "-isystem-after",
+                             "/late" })
+    {
+        INFO("argument " << gone);
+        CHECK_FALSE(std::ranges::contains(*remote, gone));
+    }
+    // The control: the code-generation flags around them travel.
+    CHECK(std::ranges::contains(*remote, "-O2"));
+    CHECK(std::ranges::contains(*remote, "-Wall"));
+
+    // And both preprocess lines keep every one, value included: the key and the
+    // dispatched text are still what these directories make them.
+    for (auto const& line: { PreprocessCommand(cmd, argv), DispatchPreprocessCommand(cmd, argv) })
+        for (auto const* kept: { "-isystem",
+                                 "/deps/glaze/include",
+                                 "-isystem/deps/fmt/include",
+                                 "-iquote",
+                                 "quoted",
+                                 "-idirafter",
+                                 "/after",
+                                 "-isystem-after",
+                                 "/late" })
+        {
+            INFO("argument " << kept);
+            CHECK(std::ranges::contains(line, kept));
+        }
+}
+
+TEST_CASE("A forced include leaves the worker's line and stays on the preprocess lines", "[dispatch]")
+{
+    // #1666's acceptance: Lastrada's DBUpd builds with `/FIpch.h` (PCH off), and every
+    // such unit was refused before the lease. The dispatch preprocess inlines the
+    // header, so the worker has nothing left to read.
+    struct Line
+    {
+        std::vector<std::string> argv;
+        std::vector<std::string_view> gone;
+    };
+    std::vector<Line> const lines {
+        { .argv = { "cl", "/FIpch.h", "/EHsc", "/c", "a.cpp", "/Foa.obj" }, .gone = { "/FIpch.h" } },
+        { .argv = { "cl", "/FI", "pch.h", "/EHsc", "/c", "a.cpp", "/Foa.obj" }, .gone = { "/FI", "pch.h" } },
+        { .argv = { "clang-cl", "-FIpch.h", "/EHsc", "/c", "a.cpp", "/Foa.obj" }, .gone = { "-FIpch.h" } },
+        { .argv = { "g++", "-include", "config.h", "-O2", "-c", "a.cpp", "-o", "a.o" }, .gone = { "-include", "config.h" } },
+        { .argv = { "g++", "-includeconfig.h", "-O2", "-c", "a.cpp", "-o", "a.o" }, .gone = { "-includeconfig.h" } },
+    };
+    for (auto const& [argv, gone]: lines)
+    {
+        INFO("line starting " << argv.front() << ' ' << argv[1]);
+        auto const cmd = ParseCommand(argv);
+        REQUIRE(cmd.parsedOk);
+        auto const remote = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+        INFO("refused: " << remote.error_or(""));
+        REQUIRE(remote.has_value());
+        for (auto const argument: gone)
+        {
+            INFO("argument " << argument);
+            CHECK_FALSE(std::ranges::contains(*remote, argument));
+            CHECK(std::ranges::contains(PreprocessCommand(cmd, argv), argument));
+            CHECK(std::ranges::contains(DispatchPreprocessCommand(cmd, argv), argument));
+        }
+        CHECK(std::ranges::contains(*remote, argv.front().starts_with("g++") ? "-O2" : "/EHsc"));
+    }
+}
+
+TEST_CASE("A precompiled header is still never dispatched beside a forced include", "[dispatch]")
+{
+    // The PCH rule is untouched by #1666. `-include-pch` is the reader, a longer
+    // spelling than `-include`, and it must not be read as a forced include named
+    // `-pch`: no preprocess inlines a precompiled header.
+    std::vector<std::string> const gnu { "clang++", "-include-pch", "pch.h.pch", "-c", "a.cpp", "-o", "a.o" };
+    auto const gnuCmd = ParseCommand(gnu);
+    REQUIRE(gnuCmd.parsedOk);
+    auto const refused = RemoteCompileArgs(gnuCmd, gnu, /*targetTriple=*/ {});
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains("-include-pch"));
+    CHECK(refused.error().contains("precompiled header"));
+    // It stays on the key's preprocess line, as it always did.
+    CHECK(std::ranges::contains(PreprocessCommand(gnuCmd, gnu), "-include-pch"));
+
+    // clang-cl's `/Yu` is cacheable, and with a forced include beside it the include
+    // leaves the line while `/Yu` stays on it -- where the launcher's pre-lease check
+    // refuses it by the `Y` row before anything is asked of the fleet.
+    std::vector<std::string> const clangCl { "clang-cl", "/FIpch.h", "/Yupch.h", "/c", "a.cpp", "/Foa.obj" };
+    auto const clangClCmd = ParseCommand(clangCl);
+    REQUIRE(clangClCmd.parsedOk);
+    auto const remote = RemoteCompileArgs(clangClCmd, clangCl, /*targetTriple=*/ {});
+    REQUIRE(remote.has_value());
+    CHECK_FALSE(std::ranges::contains(*remote, "/FIpch.h"));
+    REQUIRE(std::ranges::contains(*remote, "/Yupch.h"));
+    CHECK(FindDeniedArgument("/Yupch.h", DriverFamily::Msvc) != nullptr);
+    // `/Fp` likewise travels to that check and is refused by its row.
+    CHECK(FindDeniedArgument("/Fppch.pch", DriverFamily::Msvc) != nullptr);
+}
+
+TEST_CASE("The dispatch preprocess keeps warnings-as-errors, where the key probe drops it", "[dispatch][msvc]")
+{
+    // #1665's naive fix is refused on purpose, and this pins the refusal. A
+    // preprocessor-phase warning is resolved in the dispatch preprocess and never
+    // reaches the worker's text, so dropping `/WX` there would let an UNSILENCED one
+    // pass on the fleet where the local compile fails (measured; see the declaration).
+    std::vector<std::string> const argv { "cl", "/W4", "/WX", "/WX-", "/EHsc", "/c", "a.cpp", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+    auto const dispatch = DispatchPreprocessCommand(cmd, argv);
+    REQUIRE(std::ranges::contains(dispatch, "/WX"));
+    auto const remote = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+    REQUIRE(remote.has_value());
+    CHECK(std::ranges::contains(*remote, "/WX"));
+    // The control: the key probe drops it, and keeps `/WX-`, which is not a prefix match.
+    auto const probe = PreprocessCommand(cmd, argv);
+    CHECK_FALSE(std::ranges::contains(probe, "/WX"));
+    CHECK(std::ranges::contains(probe, "/WX-"));
+}
+
+TEST_CASE("A failed preprocess is described by its exit and its first error line", "[dispatch]")
+{
+    // `cl` echoes the source name first, which says nothing; the error line is the one
+    // that let #1665 be read without a manual re-run.
+    std::string_view const cl = "s.cpp\r\n"
+                                "s.cpp(3): error C2220: the following warning is treated as an error\r\n"
+                                "s.cpp(3): warning C4005: 'TRACE': macro redefinition\r\n";
+    REQUIRE(DescribeFailedPreprocess(2, cl)
+            == "exit 2: s.cpp(3): error C2220: the following warning is treated as an error");
+    CHECK(DescribeFailedPreprocess(1, "a.cpp:3:9: error: 'x.h' file not found\n")
+          == "exit 1: a.cpp:3:9: error: 'x.h' file not found");
+    // No error line at all: the first non-empty line, and with nothing written, the exit alone.
+    CHECK(DescribeFailedPreprocess(3, "\nsomething odd\n") == "exit 3: something odd");
+    CHECK(DescribeFailedPreprocess(4, "") == "exit 4");
+    // It is text a compiler wrote reaching a log, so it is reduced and capped.
+    CHECK(DescribeFailedPreprocess(2, std::string(500, 'x') + " error: y").size() < 120);
 }
 
 TEST_CASE("RemoteCompileArgs drops a separated flag together with its value")

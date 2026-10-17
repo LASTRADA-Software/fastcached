@@ -3390,7 +3390,7 @@ opposite:
 | Refusal | Counter | What to do |
 | --- | --- | --- |
 | `no-worker` | `fastcached_dispatch_leases_no_worker_total` | Nothing serves that toolchain — a fingerprint mismatch. |
-| `no-capacity` | `fastcached_dispatch_leases_no_capacity_total` | The fleet is full of your own build. Add machines. |
+| `no-capacity` | `fastcached_dispatch_leases_no_capacity_total` | The fleet is full of your own build. Add machines -- or, where a worker reads `limited-by: compile-budget`, its compiles hold its `--compile-inflight-max` instead: raise that on it. |
 | `withdrawn` | `fastcached_dispatch_leases_withdrawn_total` | The machines are there and unavailable — somebody is using them, or a disk is full. |
 | `all-excluded` | `fastcached_dispatch_leases_all_excluded_total` | The machines are there and the clients cannot reach them — a network problem. |
 
@@ -3485,7 +3485,7 @@ Every row says two things before anything else:
 | `unserved-toolchain` | live | warning | clients asked the leader for a toolchain no live worker serves, so those compiles ran on the clients' own machines; the detail names each by driver and version as the client reported it (`cl 19.44.35207`), with how many leases were refused. Decided by the leader; any other scheduler answers `not-evaluated`, and so does a leader that has led for less than fifteen minutes, since nothing another leader saw carries over | put that compiler version on a worker, or move the clients to one the fleet serves; clears once a worker serves it, or after fifteen minutes with nobody asking |
 | `mixed-node-versions` | live | warning | the leader sees more than one build serving one wire — nothing refuses that, so nothing else says so; the detail names each build and the machines on it. Decided by the leader; any other scheduler answers `not-evaluated`, and so does a leader that has led for less than ninety seconds, before every machine has announced to it | upgrade every node to one build ([Upgrading a fleet](../operations/upgrading-a-fleet.md)); clears once the odd machine is upgraded or has been gone ninety seconds |
 | `own-record-awaited` | live | warning | a consensus node that registers with a scheduler announces to nobody until its own cluster records its key, and it has waited longer than an election explains — or its cluster records its id under **another** key, its `node-key` replaced while the id survived, which is raised at once | bring back a majority of the cluster's voters, or admit a joining machine (`--enroll-approve`, or `--cluster-admit` with what `--print-identity` prints); for a replaced key, restore that `node-key` or `--cluster-forget=<id>` and admit the new one |
-| `refused-compile-arguments` | live | warning | the worker refused compiles over arguments it will not pass to its compiler; the detail counts them and names each argument -- every argument a compile was refused over, not the first, while a compile refused over several still counts once and stays counted until all of them are admitted -- and the log says each one once | builds stay correct, each refused compile running on its own client; admit an argument that runs no program and names no path with `--allow-compile-arg` and reload; the reload re-judges the row, each admitted argument leaving it, and the row clears only once every argument it names is admitted. The list never overrides the built-in rules, so an argument they refuse stays named |
+| `refused-compile-arguments` | live | warning | the worker refused compiles over arguments it will not pass to its compiler; the detail counts them and names each argument -- every argument a compile was refused over, not the first, while a compile refused over several still counts once and stays counted until all of them are admitted -- and the log says each one once | builds stay correct, each refused compile running on its own client; admit an argument that runs no program and names no path with `--allow-compile-arg` and reload; the reload re-judges the row, each admitted argument leaving it, and the row clears only once every argument it names is admitted. The list never overrides the built-in rules, so an argument they refuse stays named; clang-cl's `-clang:<argument>` is judged by the argument it passes |
 | `surface-not-accepting` | latched | alert | a serving surface's accept loop has ended while the node was not shutting down: its port still listens and the kernel refuses every client. The detail names each surface and what its last accept answered | restart the node, and report the reason with the node's version — only a closed or vanished listener is meant to end a loop. `/healthz` answers `503` while it is raised |
 | `surface-accept-degraded` | live | alert | a serving surface's accept loop has failed to accept for longer than any transient explains, on a failure this build does not classify, and backs off: it accepts little or nothing. The detail names each surface and what its last accept answered | check the host for exhausted file descriptors or memory, and report the reason with the node's version so the failure can be classified. The row clears by itself once an accept succeeds. `/healthz` answers `503` while it is raised |
 | `fleet-split-healing` | live | warning | this fleet and another established one are one fleet split in two, by a key this fleet already held: its speaker is a VOTER recorded here under that key, which heals by itself -- the detail names which side yields and why -- or its speaker is a LEARNER here, or a machine of this fleet once asked it and it lists that machine, which are first-use trust and wait on an operator -- the detail names the machine the evidence rests on. Not evaluated, as `foreign-fleet-visible` is, until discovery has heard enough to say there is none | where it heals by itself, nothing: the yielding fleet dissolves and rejoins by itself, and a machine the survivor did not record waits on its `--enroll-list`. Where an operator decides, nothing moves until one does: ask the named machine which fleet it belongs to and check the other fleet with `--cluster-status`; if it is yours, `--cluster-forget` each machine of the fleet that does not stay and approve it on the survivor's `--enroll-list`. It clears a few minutes after the other fleet stops being heard |
@@ -4117,11 +4117,13 @@ These distinctions cost real debugging time when they are collapsed:
   grain a fleet total is computed over; summing the Workers table reports a fleet
   twice the size of the one you own.
 - **`limited-by` is the whole diagnosis.** A node offering 2 of its 16 slots is
-  three different problems: `external-cpu` means somebody is using that machine,
-  `memory` and `scratch` mean it is out of something. Buying hardware fixes
-  exactly one of them.
+  four different problems: `external-cpu` means somebody is using that machine,
+  `memory` and `scratch` mean it is out of something, and `compile-budget` means the
+  compiles it is running hold nearly all of `--compile-inflight-max`, priced at its own
+  mean per job. Buying hardware fixes exactly one of them.
 - **Do not add the lease refusals together.** `no-worker` is a misconfiguration,
-  `no-capacity` says buy more machines, `withdrawn` says your machines are busy
+  `no-capacity` says buy more machines (or raise a `compile-budget`-limited worker's
+  `--compile-inflight-max`), `withdrawn` says your machines are busy
   with something else, `all-excluded` says your clients cannot reach them, and
   `duplicate` says it is already being built. A total hides all five.
 - **A worker that is never *picked* looks exactly like a healthy one.** It
@@ -4466,7 +4468,15 @@ fastcache-compile-node --cluster-dir=/var/lib/fastcache-node \
     --allow-compile-arg=/Qvec-report:2
 ```
 
-Four things are worth knowing before you use it.
+Five things are worth knowing before you use it.
+
+**clang-cl's pass-through is judged by what it passes.** `-clang:<arg>` and
+`/clang:<arg>` hand `<arg>` to the clang driver inside clang-cl, so a worker judges
+`<arg>` as if it stood alone, by the clang driver's own (GNU) spellings:
+`-clang:-std=c++23` is accepted because `-std=c++23` is, and `-clang:-fplugin=x` is
+refused because `-fplugin=x` is. A refusal still names the whole argument, and an
+entry here still matches the whole argument, so an unrecognised `-clang:-fsomething`
+is admitted with `--allow-compile-arg=-clang:-fsomething`.
 
 **It extends and can never shrink.** Entries are consulted only after the built-in
 table has failed to recognise an argument at all. Everything the table *refuses* —

@@ -1063,10 +1063,10 @@ namespace
     /// @param record Where the field is appended.
     /// @param name What to call it.
     /// @param value The fact, or nothing.
-    void AddOptionalNumber(std::vector<Field>& record, std::string_view name, std::optional<std::uint32_t> value)
+    void AddOptionalNumber(std::vector<Field>& record, std::string_view name, std::optional<std::uint64_t> value)
     {
         if (value.has_value())
-            record.push_back({ .name = std::string { name }, .value = NumberCell(static_cast<std::uint64_t>(*value)) });
+            record.push_back({ .name = std::string { name }, .value = NumberCell(*value) });
     }
 
     /// Turn a decoded node status into the reported record.
@@ -1130,6 +1130,10 @@ namespace
         // count with no in-flight figure invites the reading that the node is idle.
         AddOptionalNumber(record, "compile-slots", fields.runtime.compileSlots);
         AddOptionalNumber(record, "compiles-in-flight", fields.runtime.compilesInFlight);
+        // The worker's two byte ceilings beside its slots (#1667): a worker refusing
+        // `EndpointBusy` with slots to spare is out of BYTES, which only these say.
+        AddOptionalNumber(record, "compile-inflight-max", fields.runtime.compileInflightMaxBytes);
+        AddOptionalNumber(record, "compile-request-max", fields.runtime.compileRequestMaxBytes);
 
         // Whether an operator cordoned this worker, and whether it has drained (#1303) --
         // the field somebody waiting to reboot this machine polls. Absent on a node that

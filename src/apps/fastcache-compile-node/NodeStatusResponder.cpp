@@ -513,6 +513,10 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
         // node's own claim that stopping abandons nothing -- and a client that inferred it
         // from a zero would claim it for a worker nobody cordoned.
         fields.runtime.cordon = _sources.capacity->CordonState();
+        // The other ceiling a worker admits by (#1667), beside the slots it is easiest to
+        // misread without: a worker refusing `EndpointBusy` with idle slots ran out of BYTES.
+        fields.runtime.compileInflightMaxBytes = static_cast<std::uint64_t>(_sources.capacity->ByteBudget());
+        fields.runtime.compileRequestMaxBytes = _sources.compileRequestMaxBytes;
     }
 
     // The question `components` cannot answer: a leading scheduler and a following one

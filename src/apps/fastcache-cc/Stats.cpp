@@ -424,6 +424,42 @@ namespace
                                        [](DeclineReasonRow const& row) { return row.specifics == Specifics::ByCause; }),
                   "a decline's row decides its specifics itself; ByCause here would name no answer");
 
+    /// The tally reason for an UNREACHABLE fleet, by how the LEASE exchange ended (#1668).
+    ///
+    /// "Could not be reached" was one sentence for two opposite halves: a connect that never
+    /// completed and one that completed with no answer after it. Under a
+    /// saturated host those have different remedies -- a connect bound against a reply
+    /// bound, an accept loop against a busy reactor -- and the burst #1668 reports could
+    /// not say which it was. Each a fixed sentence, so the tally still counts by cause and
+    /// never by endpoint. `None` is a lease that COMPLETED: what was unreachable came after
+    /// it, and the sentence stays the general one.
+    ///
+    /// **A completed connect is not an accepted one**: the kernel completes the handshake into
+    /// the accept queue before the scheduler's loop takes it, so `Expired` names a connection,
+    /// never the scheduler's acceptance of it. `Unreached` covers a name that did not resolve as
+    /// well, since nothing was dialled then either.
+    struct UnreachableReasonRow
+    {
+        TransportFailure failure; ///< How the lease exchange ended.
+        std::string_view reason;  ///< What the tally records.
+    };
+
+    constexpr EnumTable<TransportFailure, UnreachableReasonRow> UnreachableReasonTable { {
+        UnreachableReasonRow { .failure = TransportFailure::None,
+                               .reason =
+                                   DispatchRecordingTable[static_cast<std::size_t>(DispatchStatus::Unavailable)].reason },
+        UnreachableReasonRow { .failure = TransportFailure::Unreached,
+                               .reason = "the scheduler made no connection: its name did not resolve, it refused, or "
+                                         "no connection completed within the connect bound" },
+        UnreachableReasonRow { .failure = TransportFailure::PeerLost,
+                               .reason = "the scheduler's connection broke before it answered" },
+        UnreachableReasonRow { .failure = TransportFailure::Expired,
+                               .reason = "the scheduler connected, and no answer arrived within the bound" },
+        UnreachableReasonRow { .failure = TransportFailure::Silent, .reason = "the scheduler stopped reporting progress" },
+    } };
+    static_assert(RowsInEnumeratorOrder(UnreachableReasonTable, &UnreachableReasonRow::failure),
+                  "UnreachableReasonTable must hold exactly one row per TransportFailure, in enumerator order");
+
     /// Widest label the distribution section can print.
     ///
     /// Over the rows that are actually printed: a `NoFleet` row never is, so folding
@@ -1164,6 +1200,13 @@ DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexce
                                    .outcome = row.outcome };
     return DispatchRecording { .reason = DeclineReasonTable[static_cast<std::size_t>(cause)].reason,
                                .outcome = row.outcome };
+}
+
+std::string_view UnreachableReasonFor(TransportFailure leaseTransport) noexcept
+{
+    auto const index = static_cast<std::size_t>(leaseTransport);
+    return index < EnumeratorCount<TransportFailure> ? UnreachableReasonTable[index].reason
+                                                     : UnreachableReasonTable[0].reason;
 }
 
 std::string SpecificsFor(DispatchResult const& result)

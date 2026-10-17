@@ -207,6 +207,9 @@ std::string RecordedReason(CacheOutcome const& outcome, std::optional<MintFailur
 DispatchRecording RecordedReason(DispatchResult const& result, RefusalRecord const& refusals) noexcept
 {
     auto recording = RecordingFor(result.status, result.decline);
+    // Which half of the scheduler's exchange was late, not merely that something was (#1668).
+    if (result.status == DispatchStatus::Unavailable)
+        recording.reason = UnreachableReasonFor(result.leaseTransport);
     if (result.status != DispatchStatus::Declined || !result.declinedAt.has_value())
         return recording;
     if (auto const why = MissingTicketExplains(refusals.MissingAt(*result.declinedAt), result.decline); why.has_value())

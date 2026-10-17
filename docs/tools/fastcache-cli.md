@@ -360,6 +360,8 @@ toolchains-served              0
 toolchains-discovered          3
 compile-slots                  8
 compiles-in-flight             0
+compile-inflight-max           536870912
+compile-request-max            268435456
 registrars-registered          0
 registrars-total               3
 last-registration-seconds-ago  -
@@ -404,6 +406,11 @@ Beside them, what that worker is offering and whether anyone knows about it:
   node offers and how many are running. Both or neither: a slot count with no in-flight
   figure invites the reading that the node is idle. A node running no worker tier
   reports neither, which is **not** the same as reporting none free.
+- **`compile-inflight-max`** and **`compile-request-max`** — the worker's other two
+  ceilings, in bytes, as resolved (`--compile-inflight-max`, `--compile-request-max`):
+  what every running compile may hold together, and what one request may cost. A
+  worker refusing compiles as busy while it has slots to spare is out of these, not of
+  slots. Absent with the slots, on a node running no worker.
 - **`registrars-registered`** and **`registrars-total`** — one registration per
   toolchain served, so read them as a pair. `2 of 3` is ordinary while a survey is
   still finishing and alarming an hour later.

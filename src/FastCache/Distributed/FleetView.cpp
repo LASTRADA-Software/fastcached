@@ -209,6 +209,7 @@ namespace
         { .limit = SlotLimit::ExternalCpu, .chipClass = "chip--cpu", .tone = CellTone::Limited },
         { .limit = SlotLimit::Memory, .chipClass = "chip--memory", .tone = CellTone::Limited },
         { .limit = SlotLimit::Scratch, .chipClass = "chip--scratch", .tone = CellTone::Alert },
+        { .limit = SlotLimit::CompileBudget, .chipClass = "chip--memory", .tone = CellTone::Limited },
         { .limit = SlotLimit::Cordoned, .chipClass = "chip--cordoned", .tone = CellTone::Limited },
     } };
 

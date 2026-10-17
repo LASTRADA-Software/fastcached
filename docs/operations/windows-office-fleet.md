@@ -240,8 +240,9 @@ cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER_LAUNCHER=fastcache-cc -DCMAKE_CX
 - **Precompiled headers off.** `/Yc` writes a second artefact a hit cannot carry, and a `cl`
   `/Yu` object names the PCH of the checkout that built it, so `cl` caches neither; set
   `-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON`.
-- **No `/FI`.** A forced include is a file the worker would have to open on its own disk, so a
-  compile naming one is never dispatched. It still builds and caches on this PC.
+- **`/FI` is fine.** A forced include is inlined by the preprocess the launcher runs before it
+  dispatches, so the worker's line goes without it. A forced include that is a precompiled
+  header (`/Yu`) is still never dispatched, for the reason above.
 
 A build of this repository through `cmake/portable/CompileCache.cmake` sets the source and
 build roots, `/Z7` and the PCH switch by itself, and reads `FASTCACHE_SCHEDULER` at **configure**

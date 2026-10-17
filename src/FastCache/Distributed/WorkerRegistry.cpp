@@ -271,10 +271,16 @@ std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view finge
         if (FreeSlots(entry.info) == 0)
         {
             // Which of the two refusals this becomes is decided here, per worker,
-            // because it is a per-worker fact: slots free on paper and none in
-            // practice is a machine doing something else, while none either way is
-            // a fleet full of this build's own work.
-            sawWithdrawn = sawWithdrawn || entry.info.inFlight < entry.info.slots;
+            // because it is a per-worker fact: slots free on paper and none in practice
+            // is a machine doing something else, while none either way is a fleet full of
+            // this build's own work. "Free on paper" is not enough on its own, though: a
+            // worker whose own compiles hold its byte budget has slots free on paper too,
+            // and is full of this fleet's work rather than withdrawn (#1667) -- so the
+            // BINDING limit's row has the last word.
+            auto const binding = SlotCeilingsFor(entry.info.capacity, entry.info.slots, entry.info.load).binding;
+            sawWithdrawn =
+                sawWithdrawn
+                || (entry.info.inFlight < entry.info.slots && TraitsFor(binding).refusal == SlotRefusal::Withdrawn);
             continue;
         }
         if (best == nullptr || PrefersFirst(entry.info, best->info))

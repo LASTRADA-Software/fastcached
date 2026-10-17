@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "ArgumentDenials.hpp"
 #include "CmdLine.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
@@ -427,7 +428,7 @@ namespace
     // the producing machine's object path into every Windows key and two checkouts
     // at different roots could never share an entry.
 
-    constexpr std::array<PathValueFlag, 21> PathValues { {
+    constexpr std::array<PathValueFlag, 29> PathValues { {
         // The prefix-map row first, being the longest spelling. GNU-only: `cl` has
         // no path-map switch at all, and clang-cl accepts `-ffile-prefix-map`
         // while ignoring it for the records that matter -- measured, an object
@@ -484,8 +485,57 @@ namespace
         { .spelling = "-MQ", .role = PathValueRole::DepTarget, .families = DriverFamily::Gnu },
         { .spelling = "/I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "-I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Any },
+        // The GNU header-search flags beside `-I` (#1661). CMake writes `-isystem <dir>` for
+        // every `SYSTEM` include directory, so every project with a fetched dependency
+        // carried one, and `CouldNameAFile` refused the whole line on the directory. They
+        // only decide where the PREPROCESSOR looks: the dispatch preprocess has inlined
+        // every header, and whether one was a system header travels in its line marker
+        // (`# 1 "<dir>/x.hpp" 1 3 4`), which is what silences its warnings on the worker --
+        // the argument that made `-imsvc` a row. The worker still DENIES each of them.
+        //
+        // `-isystem-after` (clang) BEFORE `-isystem`: the drivers resolve the longest
+        // spelling, and so must this table, or `-isystem-after` is read as `-isystem`
+        // with the value `-after`. The `static_assert` below the table holds the order.
+        { .spelling = "-isystem-after", .role = PathValueRole::IncludeDir, .families = DriverFamily::Gnu },
+        { .spelling = "-isystem", .role = PathValueRole::IncludeDir, .families = DriverFamily::Gnu },
+        { .spelling = "-iquote", .role = PathValueRole::IncludeDir, .families = DriverFamily::Gnu },
+        { .spelling = "-idirafter", .role = PathValueRole::IncludeDir, .families = DriverFamily::Gnu },
+        // Forced includes (#1666): the header is inlined by the dispatch preprocess like
+        // any other, so the worker's line loses the flag rather than the compile losing
+        // its distribution. `-include-pch` is the precompiled-header reader and is NOT a
+        // forced include; its row precedes `-include` for the longest-spelling reason
+        // above, and its role refuses the dispatch.
+        { .spelling = "-include-pch", .role = PathValueRole::PrecompiledHeaderInput, .families = DriverFamily::Gnu },
+        { .spelling = "-include", .role = PathValueRole::ForcedInclude, .families = DriverFamily::Gnu },
+        { .spelling = "/FI", .role = PathValueRole::ForcedInclude, .families = DriverFamily::Msvc },
+        { .spelling = "-FI", .role = PathValueRole::ForcedInclude, .families = DriverFamily::Msvc },
         { .spelling = "-o", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Any },
     } };
+
+    /// Whether row @p later could be shadowed by row @p earlier: one spelling a prefix of
+    /// the other, for a family both accept.
+    /// @param earlier The row matched first.
+    /// @param later The row matched after it.
+    /// @return True when @p earlier would match an argument meant for @p later.
+    [[nodiscard]] consteval bool Shadows(PathValueFlag const& earlier, PathValueFlag const& later)
+    {
+        return Overlaps(earlier.families, later.families) && earlier.spelling.size() < later.spelling.size()
+               && later.spelling.starts_with(earlier.spelling);
+    }
+
+    /// No row is shadowed by one before it: the FIRST match wins in `MatchPathValueFlag`,
+    /// and the drivers resolve the LONGEST spelling, so a shorter row ahead of a longer
+    /// one it prefixes reads the longer option as the shorter with a fused value.
+    [[nodiscard]] consteval bool LongerSpellingsComeFirst()
+    {
+        for (auto const later: std::views::iota(std::size_t { 0 }, PathValues.size()))
+            for (auto const earlier: std::views::iota(std::size_t { 0 }, later))
+                if (Shadows(PathValues[earlier], PathValues[later]))
+                    return false;
+        return true;
+    }
+    static_assert(LongerSpellingsComeFirst(),
+                  "a PathValues row is shadowed by a shorter spelling ahead of it; put the longer one first");
 
     // --- macro switches -----------------------------------------------------
     //
@@ -620,13 +670,54 @@ namespace
     /// True when a path-valued flag of this role must not reach the preprocess
     /// line. An object output would make the probe write an object instead of
     /// text on stdout, and a dependency flag would overwrite the build's own
-    /// depfile with the probe's; an include directory is exactly what the
-    /// preprocessor needs and stays.
+    /// depfile with the probe's; what decides which headers the text is made of --
+    /// an include directory, a forced include, a precompiled header -- is exactly
+    /// what the preprocessor needs and stays.
     /// @param role The role to test.
     /// @return True when the flag (and its value) is dropped.
     [[nodiscard]] constexpr bool DroppedFromPreprocess(PathValueRole role) noexcept
     {
-        return role != PathValueRole::IncludeDir;
+        switch (role)
+        {
+            case PathValueRole::IncludeDir:
+            case PathValueRole::ForcedInclude:
+            case PathValueRole::PrecompiledHeaderInput:
+                return false;
+            case PathValueRole::ObjectOutput:
+            case PathValueRole::DepFile:
+            case PathValueRole::DepTarget:
+            case PathValueRole::DebugOutput:
+            case PathValueRole::PrefixMap:
+                return true;
+        }
+        return true;
+    }
+
+    /// Why a path-valued flag of this role keeps the line from being dispatched at all,
+    /// or empty when it is merely dropped from the worker's line.
+    ///
+    /// Every other role names something the dispatch preprocess has already folded into
+    /// the text, or an output the worker writes under its own name. A precompiled header
+    /// is neither: it is compiler state, not text, so no preprocess inlines it, and the
+    /// file is on THIS machine.
+    /// @param role The role to test.
+    /// @return The reason, or empty.
+    [[nodiscard]] constexpr std::string_view UndispatchableBecause(PathValueRole role) noexcept
+    {
+        switch (role)
+        {
+            case PathValueRole::PrecompiledHeaderInput:
+                return "reads a precompiled header from this machine, which no preprocess can inline for a worker";
+            case PathValueRole::IncludeDir:
+            case PathValueRole::ForcedInclude:
+            case PathValueRole::ObjectOutput:
+            case PathValueRole::DepFile:
+            case PathValueRole::DepTarget:
+            case PathValueRole::DebugOutput:
+            case PathValueRole::PrefixMap:
+                return {};
+        }
+        return {};
     }
 
     /// Whether a driver reads its input's language off the file name, or compiles
@@ -961,6 +1052,8 @@ namespace
             case PathValueRole::DepFile:
                 return &ParsedCommand::depPath;
             case PathValueRole::IncludeDir:
+            case PathValueRole::ForcedInclude:
+            case PathValueRole::PrecompiledHeaderInput:
             case PathValueRole::DepTarget:
             // Nothing captures it: the launcher never reads or writes the PDB, it
             // only has to keep the path out of the key and off a worker's line.
@@ -1500,6 +1593,8 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
         // (the headers are already inlined, and the path names nothing there).
         if (auto const match = MatchPathValueFlag(a, IntroducersOf(driver.family), driver.family))
         {
+            if (auto const because = UndispatchableBecause(match->flag.role); !because.empty())
+                return std::unexpected(std::format("{} {}", match->flag.spelling, because));
             // Only a bare occurrence consumes the next argument; a fused one already
             // carries its value, and eating the successor would drop a real flag.
             if (match->value.empty() && i + 1 < argv.size())
@@ -1752,6 +1847,40 @@ std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
         out.emplace_back(a);
     }
     return out;
+}
+
+namespace
+{
+    /// How the drivers spell a line that reports an ERROR, as opposed to a note, a
+    /// warning or `cl`'s echo of the source name: `a.cpp(3): error C2220`,
+    /// `a.cpp(3): fatal error C1083`, `a.cpp:3:1: error: ...`.
+    constexpr std::array<std::string_view, 3> ErrorLineMarkers { ": error ", ": fatal error ", " error: " };
+} // namespace
+
+std::string DescribeFailedPreprocess(int exitCode, std::string_view diagnostics)
+{
+    std::string_view chosen;
+    std::string_view firstNonEmpty;
+    for (auto const lineRange: std::views::split(diagnostics, '\n'))
+    {
+        auto line = std::string_view { lineRange.begin(), lineRange.end() };
+        if (line.ends_with('\r'))
+            line.remove_suffix(1);
+        if (line.empty())
+            continue;
+        if (firstNonEmpty.empty())
+            firstNonEmpty = line;
+        if (std::ranges::any_of(ErrorLineMarkers, [line](std::string_view marker) { return line.contains(marker); }))
+        {
+            chosen = line;
+            break;
+        }
+    }
+    if (chosen.empty())
+        chosen = firstNonEmpty;
+    if (chosen.empty())
+        return std::format("exit {}", exitCode);
+    return std::format("exit {}: {}", exitCode, PrintableArgument(chosen));
 }
 
 } // namespace FastCache::Cc

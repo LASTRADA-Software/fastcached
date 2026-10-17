@@ -7,8 +7,11 @@
 #include <cstdint>
 #include <optional>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache::Distributed;
 using namespace FastCache::Distributed::Testing;
+using FastCache::Testing::Unwrap;
 
 TEST_CASE("A machine nobody classified is treated as somebody's desk", "[distributed][nodepolicy]")
 {
@@ -620,4 +623,77 @@ TEST_CASE("An explicit slot count is still a ceiling nothing raises or lowers", 
         .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .reservedMemoryBytes = 8 * Gib, .nodeClass = NodeClass::Dedicated
     };
     CHECK(OfferableSlots(capacity, std::optional<std::uint32_t> { 40 }) == 40U);
+}
+
+TEST_CASE("A spent compile byte budget is the ceiling a report names", "[distributed][nodepolicy][byte-budget]")
+{
+    // #1667. Priced at what a running compile holds HERE: ten jobs holding 250 MiB are
+    // 25 MiB each, and the 6 MiB left of a 256 MiB budget holds none more.
+    constexpr std::uint64_t MiB = 1ULL << 20;
+    auto const capacity = NodeCapacity { .logicalCores = 64, .nodeClass = NodeClass::Dedicated };
+    auto const spent =
+        NodeLoad { .inFlight = 10,
+                   .cpuBusyPermille = std::nullopt,
+                   .availableMemoryBytes = std::nullopt,
+                   .freeScratchBytes = std::nullopt,
+                   .compileBudget = CompileBudgetLoad { .budgetBytes = 256 * MiB, .inFlightBytes = 250 * MiB } };
+    auto const ceilings = SlotCeilingsFor(capacity, 30, spent);
+    REQUIRE(ceilings.byCompileBudget.has_value());
+    CHECK(Unwrap(ceilings.byCompileBudget) == 10);
+    CHECK(ceilings.available == 10);
+    CHECK(ceilings.binding == SlotLimit::CompileBudget);
+    CHECK(TraitsFor(ceilings.binding).name == "compile-budget");
+
+    // Room for fifteen more at 10 MiB each: the ceiling rises past the running ten.
+    auto const freed =
+        NodeLoad { .inFlight = 10,
+                   .cpuBusyPermille = std::nullopt,
+                   .availableMemoryBytes = std::nullopt,
+                   .freeScratchBytes = std::nullopt,
+                   .compileBudget = CompileBudgetLoad { .budgetBytes = 256 * MiB, .inFlightBytes = 100 * MiB } };
+    CHECK(SlotCeilingsFor(capacity, 30, freed).byCompileBudget == 25);
+
+    // Absent is not zero: no budget reported, or nothing running to price a job by, is no
+    // ceiling at all rather than one of zero.
+    CHECK_FALSE(SlotCeilingsFor(capacity,
+                                30,
+                                NodeLoad { .inFlight = 10,
+                                           .cpuBusyPermille = std::nullopt,
+                                           .availableMemoryBytes = std::nullopt,
+                                           .freeScratchBytes = std::nullopt })
+                    .byCompileBudget.has_value());
+    auto const idle = NodeLoad { .inFlight = 0,
+                                 .cpuBusyPermille = std::nullopt,
+                                 .availableMemoryBytes = std::nullopt,
+                                 .freeScratchBytes = std::nullopt,
+                                 .compileBudget = CompileBudgetLoad { .budgetBytes = 256 * MiB, .inFlightBytes = 0 } };
+    CHECK_FALSE(SlotCeilingsFor(capacity, 30, idle).byCompileBudget.has_value());
+    CHECK(SlotCeilingsFor(capacity, 30, idle).binding == SlotLimit::Registered);
+}
+
+TEST_CASE("A compile byte budget tied with scratch names scratch, and a cordon outranks both",
+          "[distributed][nodepolicy][byte-budget]")
+{
+    // The tie rule reaches the new ceiling as it reaches the others: the EARLIER limit in
+    // enumerator order is named, so the answer does not depend on how the comparison happened to
+    // be written -- and the cordon, applied last, is named on every tie (`SlotCeilingsFor`).
+    constexpr std::uint64_t MiB = 1ULL << 20;
+    auto const capacity = NodeCapacity { .logicalCores = 64, .nodeClass = NodeClass::Dedicated };
+    // One compile running. Scratch: 384 MiB free holds three more at 128 MiB each. Budget: the one
+    // compile holds 10 MiB, and the 30 MiB left of 40 holds three more at that size.
+    auto tied = NodeLoad { .inFlight = 1,
+                           .cpuBusyPermille = std::nullopt,
+                           .availableMemoryBytes = std::nullopt,
+                           .freeScratchBytes = 384 * MiB,
+                           .compileBudget = CompileBudgetLoad { .budgetBytes = 40 * MiB, .inFlightBytes = 10 * MiB } };
+    auto const ceilings = SlotCeilingsFor(capacity, 30, tied);
+    REQUIRE(ceilings.byScratch == 4U);
+    REQUIRE(ceilings.byCompileBudget == 4U);
+    CHECK(ceilings.available == 4);
+    CHECK(ceilings.binding == SlotLimit::Scratch);
+
+    tied.cordoned = true;
+    auto const cordoned = SlotCeilingsFor(capacity, 30, tied);
+    CHECK(cordoned.available == 0);
+    CHECK(cordoned.binding == SlotLimit::Cordoned);
 }

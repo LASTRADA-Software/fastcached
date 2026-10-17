@@ -1174,6 +1174,11 @@ struct RouteParts
                                                           &sharedCache.Host(),
                                                           announced };
 
+    // The worker's per-request ceiling as resolved, beside the budget `capacity` holds (#1667):
+    // absent exactly when there is no worker.
+    auto const workerRequestMax =
+        workerTier != nullptr ? std::optional<std::uint64_t> { Node::CompileRequestMaxOf(cfg) } : std::nullopt;
+
     Node::ConfiguredNodeStatus const nodeStatus {
         cfg,
         statusClock,
@@ -1201,6 +1206,7 @@ struct RouteParts
         // forever (#206).
         Node::NodeRuntimeSources { .runtime = workerTier != nullptr ? &workerTier->Runtime() : nullptr,
                                    .capacity = workerTier != nullptr ? &workerTier->Capacity() : nullptr,
+                                   .compileRequestMaxBytes = workerRequestMax,
                                    .scheduler = ServiceOrNull(schedulerTier.get()),
                                    .enrollment = AddressWhen(servesEnrollment, enrollmentWindow),
                                    // `RunsConsensus`, not `servesEnrollment`: a standing is a

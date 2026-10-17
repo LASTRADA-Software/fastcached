@@ -600,6 +600,37 @@ TEST_CASE("The recorded reason names a missing ticket only for a refusal a ticke
     }
 }
 
+TEST_CASE("An unreachable scheduler is recorded by which half of the lease was late", "[cc][stats][unreachable]")
+{
+    // #1668: 47 `UNREACHABLE` records from one saturated build could not say whether the local
+    // node never accepted the connection or accepted it and never answered.
+    auto unavailable = DispatchResult {};
+    unavailable.status = DispatchStatus::Unavailable;
+
+    unavailable.leaseTransport = TransportFailure::Unreached;
+    auto const unreached = RecordedReason(unavailable, RefusalRecord {});
+    REQUIRE(unreached.reason.contains("made no connection"));
+    CHECK(unreached.outcome == DispatchOutcome::Unreachable);
+
+    unavailable.leaseTransport = TransportFailure::Expired;
+    auto const expired = RecordedReason(unavailable, RefusalRecord {});
+    CHECK(expired.reason.contains("connected, and no answer arrived"));
+    CHECK(expired.reason != unreached.reason);
+
+    unavailable.leaseTransport = TransportFailure::PeerLost;
+    CHECK(RecordedReason(unavailable, RefusalRecord {}).reason.contains("broke"));
+
+    // A lease that COMPLETED says nothing about the scheduler: what failed came after it, and the
+    // general sentence stays -- the control that the rows key on the lease alone.
+    unavailable.leaseTransport = TransportFailure::None;
+    CHECK(RecordedReason(unavailable, RefusalRecord {}).reason
+          == RecordingFor(DispatchStatus::Unavailable, DeclineCause::Unrecognised).reason);
+    // A value past the table is no evidence of either half.
+    unavailable.leaseTransport = TransportFailure::Last;
+    CHECK(RecordedReason(unavailable, RefusalRecord {}).reason
+          == RecordingFor(DispatchStatus::Unavailable, DeclineCause::Unrecognised).reason);
+}
+
 TEST_CASE("The decorator files, per refused exchange site, whether that exchange presented a ticket", "[cc][ticket]")
 {
     Minting fix;

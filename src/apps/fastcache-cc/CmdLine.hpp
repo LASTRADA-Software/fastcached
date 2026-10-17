@@ -242,8 +242,10 @@ enum class FingerprintTree : std::uint8_t
 /// What a path-valued flag's value names.
 ///
 /// The role is what each consumer filters on, so a new flag never grows a
-/// branch: the preprocess line drops every role but IncludeDir, the parser
-/// captures ObjectOutput and DepFile, and the cache key relativizes them all.
+/// branch: the preprocess line drops every role but the three that decide which
+/// headers the text is made of (IncludeDir, ForcedInclude, PrecompiledHeaderInput --
+/// `DroppedFromPreprocess`), the parser captures ObjectOutput and DepFile, and the
+/// cache key relativizes them all.
 enum class PathValueRole : std::uint8_t
 {
     ObjectOutput, ///< The compiled object file (`/Fo`, `-o`).
@@ -274,6 +276,20 @@ enum class PathValueRole : std::uint8_t
     /// #203's "the mapping must be identical on every machine sharing the cache"
     /// rather than merely document it.
     PrefixMap,
+
+    /// A header the driver includes ahead of the source (`-include`, `/FI`). Like an
+    /// include directory it stays on the preprocess lines and never reaches a worker:
+    /// the dispatch preprocess inlines the header into the text the worker compiles,
+    /// so the worker has nothing left to read (#1666).
+    ForcedInclude,
+
+    /// A PRECOMPILED header the compile reads (`-include-pch`). It stays on the
+    /// preprocess lines as it always did, and the line is never dispatched: what it
+    /// names is a compiler's internal state rather than text, so no preprocess can
+    /// inline it, and it is a file on THIS machine. A row of its own, ahead of
+    /// `-include`, because the drivers resolve the longest spelling and so must this
+    /// table -- matched as `-include` with the value `-pch`, it would leave the line.
+    PrecompiledHeaderInput,
 };
 
 /// One spelling of a flag whose value is a filesystem path.
@@ -1054,10 +1070,31 @@ struct MappedCompileDir
 /// not have been dispatched at all if it were cheap. Reusing the key's text instead
 /// would save that and break every `-Werror` build, which is not a trade.
 ///
+/// **Warnings-as-errors STAYS on this line, unlike the key probe's** (#1665). `cl /E`
+/// ignores `#pragma warning(disable: …)`, so under `/WX` a warning the source silences
+/// fails this preprocess (C2220) and the unit compiles locally. Dropping `/WX` here is
+/// not the fix it looks like: a PREPROCESSOR-phase warning is resolved in this run and
+/// never reaches the worker's text, so an UNSILENCED one would then pass remotely where
+/// the local compile fails. Measured with cl 19.51, `/W4 /WX`, an unsilenced `#define`
+/// redefinition (C4005): the local compile exits 2, while `/E` without `/WX` exits 0 and
+/// its `.i` compiles under `/WX` with exit 0 -- a build that fails locally and passes
+/// on the fleet. The key probe may drop it because a miss still compiles locally.
+///
 /// @param cmd The parsed command.
 /// @param argv The original full invocation.
 /// @return The preprocess invocation, argv[0] being the compiler.
 [[nodiscard]] std::vector<std::string> DispatchPreprocessCommand(ParsedCommand const& cmd,
                                                                  std::span<std::string const> argv);
+
+/// What a failed preprocess says about itself, for the line that reports it.
+///
+/// The exit status and the first line of @p diagnostics that names an error, else its
+/// first non-empty line, reduced to printable text a log may carry. `cl` echoes the
+/// source's name as its first stderr line, which says nothing, so an error line is
+/// preferred over position.
+/// @param exitCode The preprocess's exit status.
+/// @param diagnostics What it wrote to stderr.
+/// @return For example `exit 2: a.cpp(3): error C2220: the following warning is treated as an error`.
+[[nodiscard]] std::string DescribeFailedPreprocess(int exitCode, std::string_view diagnostics);
 
 } // namespace FastCache::Cc

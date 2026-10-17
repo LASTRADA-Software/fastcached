@@ -1155,9 +1155,10 @@ same on both — the same defect with no MSVC anywhere near it.
   Which *introducers* may match is still decided by the **layout**, not the host and not
   the driver, for the reason recorded above: on POSIX a leading `/` starts an absolute
   path, and matching `/I` there splits a checkout rooted at `/Infra`. And the drop list no
-  longer spells `/Fo` or `-MF` itself — it drops every row whose role is not `IncludeDir`,
-  so a spelling added to the table is dropped by construction rather than by someone
-  remembering the fourth place.
+  longer spells `/Fo` or `-MF` itself — it drops every row whose role does not decide
+  which headers the text is made of (`IncludeDir`, `ForcedInclude` and
+  `PrecompiledHeaderInput` stay; `DroppedFromPreprocess`), so a spelling added to the
+  table is dropped by construction rather than by someone remembering the fourth place.
   - **This did not bump `objkey-*` / `manifest-*`, and that is the deliberate half.**
     (The tags now read `v4`, moved by issue #64's manifest half — a different change, for
     a reason this one does not reach; the re-key here rides along in that invalidation
@@ -1178,6 +1179,12 @@ same on both — the same defect with no MSVC anywhere near it.
     property whose *absence* is what forced the `manifest-v2`/`v3` bumps, and whose
     presence is why `manifest-v4` had to be argued from the manifest side rather than
     from this one.
+  - **The same argument covers #1661's and #1666's rows**, and is why they bumped nothing:
+    `-isystem`, `-iquote`, `-idirafter`, `-isystem-after`, `-include`, `/FI`, `-FI` and
+    `-include-pch` are table rows now, so a FUSED value (`-isystem/abs/dir`) is relativized
+    where it used to be hashed literally. That re-keys exactly the builds that fused an
+    absolute path into one of them — an input moving, never the construction — and their
+    manifest keys move in the same lock-step.
 ## The digest
 
 <!-- agent-tripwire: untriaged: #1567 the object key digest rule (MurmurHash3 x64_128, length-prefixed pieces, bit-identical everywhere) has no AGENT.md bullet -->

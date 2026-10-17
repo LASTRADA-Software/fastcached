@@ -349,7 +349,11 @@ Wire::LoadFields LoadToWire(NodeLoad const& load)
                               .cache = CacheLoadToWire(load.cache),
                               .history = {},
                               .cordoned = load.cordoned,
-                              .interfaceAddresses = {} };
+                              .interfaceAddresses = {},
+                              .compileBudget = load.compileBudget.transform([](CompileBudgetLoad const& budget) {
+                                  return Wire::CompileBudgetLoadFields { .budgetBytes = budget.budgetBytes,
+                                                                         .inFlightBytes = budget.inFlightBytes };
+                              }) };
 }
 
 NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
@@ -359,7 +363,11 @@ NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
                       .availableMemoryBytes = fields.availableMemoryBytes,
                       .freeScratchBytes = fields.freeScratchBytes,
                       .cache = CacheLoadFromWire(fields.cache),
-                      .cordoned = fields.cordoned };
+                      .cordoned = fields.cordoned,
+                      .compileBudget = fields.compileBudget.transform([](Wire::CompileBudgetLoadFields const& budget) {
+                          return CompileBudgetLoad { .budgetBytes = budget.budgetBytes,
+                                                     .inFlightBytes = budget.inFlightBytes };
+                      }) };
 }
 
 SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> payload, CallerContext const& caller)

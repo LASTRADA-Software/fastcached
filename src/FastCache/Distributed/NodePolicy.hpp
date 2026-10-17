@@ -357,6 +357,17 @@ static_assert(!OfferableSlotsAccepts<std::uint32_t> && !OfferableSlotsAccepts<in
 /// busy while the build compiles everything locally.
 inline constexpr std::uint64_t ScratchBudgetPerJobBytes = 128ULL << 20;
 
+/// A worker's compile byte budget and what it holds of it (#1667).
+///
+/// Both or neither, which is why it is one optional record rather than two optional
+/// numbers: the ceiling below is a quotient of the two, and a half-reported pair is a
+/// number nobody can divide.
+struct CompileBudgetLoad
+{
+    std::uint64_t budgetBytes { 0 };   ///< `--compile-inflight-max`, as resolved.
+    std::uint64_t inFlightBytes { 0 }; ///< What the running compiles hold of it now.
+};
+
 /// What a machine is doing right now, as the scheduler is told on each heartbeat.
 ///
 /// The dynamic counterpart of `NodeCapacity`, and separate for the reason that
@@ -389,6 +400,12 @@ struct NodeLoad
     /// cordoned. A `bool` rather than a count or a ceiling because it is a decision, not
     /// a resource -- `SlotCeilingsFor` turns it into a ceiling of zero, and names it.
     bool cordoned { false };
+
+    /// Its compile byte budget, or absent from a node with no worker or a peer older
+    /// than the field (#1667). The scheduler granted by slots alone and the worker admits
+    /// by slots AND bytes, so a worker whose budget was spent refused grants with
+    /// `EndpointBusy` that the scheduler went on issuing; this is how it hears the bytes.
+    std::optional<CompileBudgetLoad> compileBudget {};
 };
 
 namespace Detail
@@ -396,7 +413,7 @@ namespace Detail
     /// How many more jobs a resource with `available` bytes left supports.
     ///
     /// Expressed as "on top of what is already running", which is the shape all
-    /// three dynamic limits share and the reason it is worth naming once: a machine
+    /// four resource limits share and the reason it is worth naming once: a machine
     /// reports what is left AFTER its current jobs have taken theirs, so a ceiling
     /// of `available / budget` alone would count the running jobs' own share twice
     /// and shrink a busy machine to nothing the moment it started working.
@@ -414,7 +431,7 @@ namespace Detail
     }
 } // namespace Detail
 
-/// Which ceiling decided `AvailableSlots`: the registered count, one of the three
+/// Which ceiling decided `AvailableSlots`: the registered count, one of the four
 /// resources a heartbeat reports, or an operator's cordon.
 ///
 /// `Registered` is zero, and that is the safety property rather than an ordering
@@ -431,16 +448,33 @@ enum class SlotLimit : std::uint8_t
     Memory,
     /// What is left of its scratch filesystem.
     Scratch,
+    /// What is left of its compile byte budget (#1667).
+    CompileBudget,
     /// An operator cordoned it (#1303): it takes nothing new until the cordon is lifted
     /// or the node restarts.
     Cordoned,
     Last, ///< Not a limit, and has no row: `SlotLimitTable`'s length.
 };
 
+/// How a lease the scheduler cannot place on a worker held back by a limit is refused (#1667).
+///
+/// Private: never transmitted, never persisted. It names one of two `PickError`s, both
+/// codes every launcher already knows, so the column changes no wire. **The split is the
+/// operator's question, not the arithmetic's**: `Withdrawn` says the machines are doing
+/// something other than this fleet's work, `NoCapacity` that the fleet is full of its own.
+/// A compile byte budget spent by the compiles this fleet sent IS its own work, and calling
+/// it withdrawn read as half a fleet busy elsewhere (#1667).
+enum class SlotRefusal : std::uint8_t
+{
+    Withdrawn,  ///< Slots free on paper and none in practice: the machine is busy elsewhere.
+    NoCapacity, ///< The fleet's own work fills it.
+};
+
 /// One row per limit: what it is called, and what an operator does about it.
 ///
-/// The remedy is a column rather than prose somewhere else because the three
-/// reasons have *opposite* fixes -- buy a machine, free memory, free a disk -- and
+/// The remedy is a column rather than prose somewhere else because the four
+/// resource reasons have *opposite* fixes -- buy a machine, free memory, free a disk,
+/// raise a budget -- and
 /// a dashboard that named the limit without naming the fix would send an operator
 /// shopping for hardware they already own. That is the same argument `PickError`'s
 /// three-way split makes one layer up.
@@ -449,23 +483,36 @@ struct SlotLimitTraits
     SlotLimit limit;         ///< The limit this row describes.
     std::string_view name;   ///< Spelling a report uses.
     std::string_view remedy; ///< What an operator does about it.
+    SlotRefusal refusal;     ///< How a lease is refused when this limit binds a full worker.
 };
 
 /// Every limit, in enumerator order.
 inline constexpr EnumTable<SlotLimit, SlotLimitTraits> SlotLimitTable { {
     { .limit = SlotLimit::Registered,
       .name = "registered",
-      .remedy = "nothing is holding this machine back; it offers what it registered with." },
+      .remedy = "nothing is holding this machine back; it offers what it registered with.",
+      .refusal = SlotRefusal::NoCapacity },
     { .limit = SlotLimit::ExternalCpu,
       .name = "external-cpu",
-      .remedy = "somebody else is using this machine. Its own work is not the fleet's." },
-    { .limit = SlotLimit::Memory, .name = "memory", .remedy = "memory is nearly gone. A compile is budgeted at 1 GiB." },
+      .remedy = "somebody else is using this machine. Its own work is not the fleet's.",
+      .refusal = SlotRefusal::Withdrawn },
+    { .limit = SlotLimit::Memory,
+      .name = "memory",
+      .remedy = "memory is nearly gone. A compile is budgeted at 1 GiB.",
+      .refusal = SlotRefusal::Withdrawn },
     { .limit = SlotLimit::Scratch,
       .name = "scratch",
-      .remedy = "the scratch filesystem is nearly full. A compile is budgeted at 128 MiB." },
+      .remedy = "the scratch filesystem is nearly full. A compile is budgeted at 128 MiB.",
+      .refusal = SlotRefusal::Withdrawn },
+    { .limit = SlotLimit::CompileBudget,
+      .name = "compile-budget",
+      .remedy = "the bytes its running compiles hold have nearly spent --compile-inflight-max. Raise it there, "
+                "with the memory to back it, or add a worker.",
+      .refusal = SlotRefusal::NoCapacity },
     { .limit = SlotLimit::Cordoned,
       .name = "cordoned",
-      .remedy = "an operator cordoned this machine. Lift it with `fastcache-cli uncordon` there, or restart the node." },
+      .remedy = "an operator cordoned this machine. Lift it with `fastcache-cli uncordon` there, or restart the node.",
+      .refusal = SlotRefusal::Withdrawn },
 } };
 
 // A limit added to the enum without a row is a build failure rather than a report
@@ -483,14 +530,14 @@ static_assert(RowsInEnumeratorOrder(SlotLimitTable, &SlotLimitTraits::limit),
 
 /// The ceilings behind `AvailableSlots`, unfolded.
 ///
-/// That function returns a `min` of four numbers, and folding them loses the only
+/// That function returns a `min` of five numbers, and folding them loses the only
 /// thing an operator wants to know: a node offering 2 of its 16 slots is a
 /// different problem depending on whether somebody is *using* the machine, its
-/// memory is gone, or its scratch disk has filled -- and the fix differs in each
-/// case. Summing or collapsing them hides all three, exactly as summing the lease
-/// refusals hides the difference between an empty fleet and a busy one.
+/// memory is gone, its scratch disk has filled, or its compiles hold its byte budget --
+/// and the fix differs in each case. Summing or collapsing them hides all four, exactly
+/// as summing the lease refusals hides the difference between an empty fleet and a busy one.
 ///
-/// The three dynamic ceilings are `optional` for the reason `NodeLoad`'s fields
+/// The four dynamic ceilings are `optional` for the reason `NodeLoad`'s fields
 /// are: **absent is not zero**. A machine that could not read its own CPU has no
 /// CPU ceiling, which is a different claim from a ceiling of zero -- one says
 /// "scheduled on its other properties", the other says "take no work at all".
@@ -505,6 +552,9 @@ struct SlotCeilings
     std::optional<std::uint32_t> byMemory {};
     /// What its remaining scratch space supports, or absent when it did not say.
     std::optional<std::uint32_t> byScratch {};
+    /// What its remaining compile byte budget supports, or absent when it did not say or
+    /// holds nothing to measure a job by.
+    std::optional<std::uint32_t> byCompileBudget {};
     /// The minimum of whichever applied; what `AvailableSlots` returns.
     std::uint32_t available { 0 };
     /// Which ceiling produced `available`.
@@ -519,21 +569,22 @@ struct SlotCeilings
 /// Every ceiling that applies to this worker right now, and which one binds.
 ///
 /// The whole of `AvailableSlots`' arithmetic, spelled apart instead of folded. The
-/// three limits are the ones a heartbeat carries:
+/// four limits are the ones a heartbeat carries:
 ///
 ///   - **Somebody else is using the machine.** Host CPU busy, less what this fleet
 ///     is running here, is capacity that belongs to whoever is using it.
 ///   - **Memory is nearly gone.** What is left decides how many more jobs fit.
 ///   - **The scratch filesystem is nearly full.** Likewise, and it is the limit that
 ///     most often reaches zero on a long-lived build host.
+///   - **The compile byte budget is nearly spent** by the compiles running there (#1667).
 ///
 /// **`capacity.cache` is not read, and must not start to be**: how full a node's
 /// cache is says nothing about whether it can take another compile.
 ///
 /// **A cordon is applied last and wins every tie**, which is the one exception to
 /// `SlotCeilings::binding`'s first-in-enumerator-order rule, and deliberately so. The
-/// other three limits lift themselves -- the owner stops using the machine, memory frees,
-/// a build tree is cleaned -- while a cordon lifts only when a person acts. A report
+/// other four limits lift themselves -- the owner stops using the machine, memory frees,
+/// a build tree is cleaned, a compile finishes -- while a cordon lifts only when a person acts. A report
 /// naming `scratch` on a cordoned machine whose disk also filled would send an operator
 /// to free a disk and leave the machine out of the fleet with nothing saying why.
 /// @param capacity What the machine is.
@@ -548,6 +599,7 @@ struct SlotCeilings
                           .byExternalCpu = std::nullopt,
                           .byMemory = std::nullopt,
                           .byScratch = std::nullopt,
+                          .byCompileBudget = std::nullopt,
                           .available = registeredSlots,
                           .binding = SlotLimit::Registered };
 
@@ -613,6 +665,25 @@ struct SlotCeilings
         }
     }
 
+    // The byte budget, priced at what a running compile holds ON THIS WORKER now (#1667).
+    // A lease carries no size, so the only per-job figure there is to divide by is this
+    // worker's own mean; with nothing running there is no such figure, and no ceiling
+    // rather than an invented one -- absent is not zero. Measured where it bit: a
+    // flat 256 MiB budget on a 30-slot worker refused half of 4,274 grants on units of
+    // median 12.5 MiB while the scheduler, counting slots, saw room.
+    if (load.compileBudget.has_value() && load.inFlight != 0 && load.compileBudget->inFlightBytes != 0)
+    {
+        auto const& budget = *load.compileBudget;
+        auto const perJob = std::max<std::uint64_t>(1, budget.inFlightBytes / load.inFlight);
+        auto const left = budget.budgetBytes > budget.inFlightBytes ? budget.budgetBytes - budget.inFlightBytes : 0;
+        result.byCompileBudget = Detail::CeilingFrom(load.inFlight, left, perJob);
+        if (*result.byCompileBudget < result.available)
+        {
+            result.available = *result.byCompileBudget;
+            result.binding = SlotLimit::CompileBudget;
+        }
+    }
+
     if (load.cordoned)
     {
         result.available = 0;
@@ -626,7 +697,7 @@ struct SlotCeilings
 ///
 /// `OfferableSlots` answers what a machine is worth in general; this answers what it
 /// can take at this moment, and the difference is everything a heartbeat carries.
-/// Three limits, each of which lowers the count and none of which raises it --
+/// Five limits, each of which lowers the count and none of which raises it --
 /// `SlotCeilingsFor` above is the same arithmetic with each of them named, and this
 /// is the number it arrives at.
 ///

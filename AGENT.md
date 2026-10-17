@@ -416,7 +416,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   may inherit; POSIX marks both pipe ends close-on-exec, under the lock that covers the spawn.
 - A drain waits on a condition variable, never `atomic::wait` — an atomic wait can return without
   the notify and free the object the notifier is still inside. And it calls `Shutdown()` first.
-- `AvailableSlots` folds four ceilings into one, `SlotCeilingsFor` names each, and a tie names the
+- `AvailableSlots` folds five ceilings into one, `SlotCeilingsFor` names each, and a tie names the
   earlier limit in enumerator order — except a cordon, applied last and named on every tie.
 - A cordon is the worker PROCESS's state, never replicated and never persisted, so a restart lifts
   it. Stop, cordon and full are ONE locked decision with the slot take (`SlotAdmission`), and a

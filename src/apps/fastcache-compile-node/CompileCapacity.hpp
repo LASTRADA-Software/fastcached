@@ -166,23 +166,6 @@ class CompileCapacity
                 _owner->_bytesInFlight.fetch_sub(_bytes, std::memory_order_acq_rel);
         }
 
-        /// Raise this reservation to @p total, or leave it untouched.
-        ///
-        /// A codec envelope declares an expansion larger than the frame it arrived
-        /// in, and that larger figure is what the request actually costs. Raising
-        /// rather than taking a second reservation keeps one release on one object.
-        /// @param total The new total for this request.
-        /// @return True when the budget allowed it.
-        [[nodiscard]] bool TryRaiseTo(std::size_t total) noexcept
-        {
-            if (_owner == nullptr || total <= _bytes)
-                return true;
-            if (!_owner->TakeBytes(total - _bytes))
-                return false;
-            _bytes = total;
-            return true;
-        }
-
       private:
         CompileCapacity* _owner;
         std::size_t _bytes;
@@ -262,6 +245,12 @@ class CompileCapacity
     [[nodiscard]] std::size_t ByteBudget() const noexcept
     {
         return _byteBudget;
+    }
+
+    /// @return What the reservations alive now hold of the budget.
+    [[nodiscard]] std::size_t BytesInFlight() const noexcept
+    {
+        return _bytesInFlight.load(std::memory_order_acquire);
     }
 
     /// Whether @p footprint is a price this budget may be asked to pay at all.

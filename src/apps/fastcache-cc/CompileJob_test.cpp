@@ -1349,6 +1349,327 @@ TEST_CASE("What a clang object records about where it was built travels, and not
     }
 }
 
+TEST_CASE("An ASan build's line passes a worker whole", "[compile-job]")
+{
+    // #1677: clang's driver line for `-fsanitize=address` carries
+    // `-fsanitize-address-use-after-scope`, and the worker refused every such unit.
+    std::vector<std::string> const argv { "clang++",
+                                          "-O1",
+                                          "-g",
+                                          "-fsanitize=address,undefined",
+                                          "-fsanitize-address-use-after-scope",
+                                          "-fno-omit-frame-pointer",
+                                          "-c",
+                                          "a.cpp",
+                                          "-o",
+                                          "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+    auto const remote = RemoteCompileArgs(cmd, argv, "x86_64-pc-linux-gnu");
+    REQUIRE(remote.has_value());
+    REQUIRE(std::ranges::contains(*remote, "-fsanitize-address-use-after-scope"));
+    auto const& clang = DriverOf(Flavor::Clang);
+    for (auto const& argument: *remote)
+    {
+        INFO("argument " << argument);
+        CHECK(IsAcceptableJobArgument(argument, clang));
+    }
+
+    // The rest of the family, as clang 22 spells it.
+    for (auto const* flag: { "-fno-sanitize-address-use-after-scope",
+                             "-fsanitize-address-use-after-return=runtime",
+                             "-fsanitize-address-use-after-return=never",
+                             "-fsanitize-address-globals-dead-stripping",
+                             "-fno-sanitize-address-globals-dead-stripping",
+                             "-fsanitize-address-use-odr-indicator",
+                             "-fno-sanitize-address-use-odr-indicator" })
+    {
+        INFO("flag " << flag);
+        CHECK(IsAcceptableJobArgument(flag, clang));
+    }
+
+    // Enumerated, never a `-fsanitize-address-` prefix: an unlisted member is refused, and
+    // the one valued member takes a word, not a path.
+    CHECK_FALSE(IsAcceptableJobArgument("-fsanitize-address-foo", clang));
+    CHECK_FALSE(IsAcceptableJobArgument("-fsanitize-address-use-after-return=/tmp/x", clang));
+}
+
+// --- clang-cl's `-clang:<arg>` pass-through (#1672) ---------------------------
+
+TEST_CASE("A clang-cl pass-through is admitted by the argument it passes", "[compile-job][clang-cl]")
+{
+    // CMake writes the standard as `-clang:-std=c++23` for clang-cl, which has no
+    // `/std:c++23`, on EVERY unit of a C++23 build. Refused by absence, such a build was
+    // granted a lease, preprocessed twice and uploaded for every unit, and refused at the
+    // worker every time: it distributed nothing.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    REQUIRE(IsAcceptableJobArgument("-clang:-std=c++23", clangCl));
+    CHECK(IsAcceptableJobArgument("/clang:-std=c++23", clangCl));
+    // The pass-throughs a real Lastrada clang-cl tree carries on every unit beside it.
+    CHECK(IsAcceptableJobArgument("/clang:-Wno-unused-function", clangCl));
+    CHECK(IsAcceptableJobArgument("/clang:-fno-delayed-template-parsing", clangCl));
+
+    // The control that makes "judged by the inner argument" a claim rather than a
+    // coincidence: the inner argument standing alone gets the same answer under the
+    // grammar that parses it.
+    CHECK(IsAcceptableJobArgument("-std=c++23", DriverOf(Flavor::Clang)));
+    CHECK(IsAcceptableJobArgument("-fno-delayed-template-parsing", DriverOf(Flavor::Clang)));
+}
+
+TEST_CASE("A pass-through admits nothing its inner argument would be refused standing alone", "[compile-job][clang-cl]")
+{
+    // The prefix is not a way around the table: the side-artefact rows, every
+    // `DeniedArguments` row and the allowlist apply to what it passes. Each row here was
+    // refused before the pass-through existed too, so a change that loosened any of them
+    // shows here and not in the positive case above.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    for (auto const* hostile: { "-clang:-fplugin=x.dll",
+                                "-clang:-Xclang",
+                                "-clang:-B/tmp",
+                                "-clang:-Ifoo",
+                                "-clang:@rsp",
+                                "-clang:-MFdep.d",
+                                "-clang:-clang:-std=c++23",
+                                "-clang:-fno-such-flag",
+                                "/clang:-fpass-plugin=x.dll",
+                                "-clang:-fmodule-output=x.pcm" })
+    {
+        INFO("argument " << hostile);
+        CHECK_FALSE(IsAcceptableJobArgument(hostile, clangCl));
+    }
+
+    // The inner argument is judged by the GNU clang driver's grammar, where `-` is the
+    // only introducer and a bare word is an input file -- so neither an MSVC spelling,
+    // nor a bare word, nor nothing at all is passed through.
+    for (auto const* malformed: { "-clang:/O2", "-clang:c++-cpp-output", "-clang:", "/clang:" })
+    {
+        INFO("argument " << malformed);
+        CHECK_FALSE(IsAcceptableJobArgument(malformed, clangCl));
+    }
+
+    // And a GNU driver has no such prefix: there `-clang:` is not unwrapped at all.
+    CHECK_FALSE(IsAcceptableJobArgument("-clang:-std=c++23", DriverOf(Flavor::Clang)));
+}
+
+TEST_CASE("An operator entry cannot re-admit through a pass-through what a row refuses", "[compile-job][clang-cl]")
+{
+    // The refusal applies to the INNER argument above the operator list, exactly as it
+    // does to that argument standing alone. Before #1672 the whole argument was merely
+    // UNRECOGNISED, so `--allow-compile-arg=-clang:-fplugin=x` admitted a plugin loader
+    // that `--allow-compile-arg=-fplugin=x` could not -- a refusal by absence, re-opened
+    // by the one thing consulted after it.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    for (auto const* hostile: { "-clang:-fplugin=x.dll",
+                                "-clang:-Xclang",
+                                "-clang:-Ifoo",
+                                "-clang:-Bstage",
+                                "-clang:@rsp",
+                                "-clang:-fmodule-output=x.pcm",
+                                "-clang:c++-cpp-output" })
+    {
+        INFO("argument " << hostile);
+        std::vector<std::string> const naming { std::string { hostile } };
+        CHECK_FALSE(IsAcceptableJobArgument(hostile, clangCl, naming));
+    }
+}
+
+TEST_CASE("An operator entry naming a whole pass-through admits it as before", "[compile-job][clang-cl]")
+{
+    // An inner argument the table does not RECOGNISE is still the thing a site may
+    // extend, and the entry keeps its whole-argument, exact meaning.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    std::vector<std::string> const allowed { "-clang:-fsomething" };
+    REQUIRE_FALSE(IsAcceptableJobArgument("-clang:-fsomething", clangCl));
+    CHECK(IsAcceptableJobArgument("-clang:-fsomething", clangCl, allowed));
+    // Whole and exact: neither a longer spelling nor the other introducer is admitted.
+    CHECK_FALSE(IsAcceptableJobArgument("-clang:-fsomething=1", clangCl, allowed));
+    CHECK_FALSE(IsAcceptableJobArgument("/clang:-fsomething", clangCl, allowed));
+}
+
+TEST_CASE("What a clang object records about where it was built travels through the pass-through too",
+          "[compile-job][clang-cl]")
+{
+    // #1681's rows, reached the way Lastrada's clang-cl line spells two of them:
+    // `/clang:-fdebug-compilation-dir=.`, because the clang-cl driver does not take it bare. The
+    // inner argument meets the same rows under the inner grammar, so the pass-through admits the
+    // `.`-shaped value and nothing a row refuses.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    REQUIRE(IsAcceptableJobArgument("/clang:-fdebug-compilation-dir=.", clangCl));
+    CHECK(IsAcceptableJobArgument("/clang:-fcoverage-compilation-dir=.", clangCl));
+
+    // A directory that names a path is refused through the prefix exactly as standing alone.
+    CHECK_FALSE(IsAcceptableJobArgument("/clang:-fdebug-compilation-dir=/home/build", clangCl));
+    CHECK_FALSE(IsAcceptableJobArgument(R"(/clang:-fcoverage-compilation-dir=C:\build)", clangCl));
+
+    // Narrowing the deny prefix to its members did not admit the family: a `-fcoverage-*` no row
+    // names is still refused, by absence, bare and through the pass-through alike.
+    CHECK_FALSE(IsAcceptableJobArgument("-fcoverage-something", DriverOf(Flavor::Clang)));
+    CHECK_FALSE(IsAcceptableJobArgument("/clang:-fcoverage-something", clangCl));
+
+    // The coverage family's other members stay refused by ROW through the pass-through, with an
+    // operator naming each one whole.
+    for (auto const* hostile: { "-fcoverage-mapping", "-fcoverage-mcdc", "-fcoverage-prefix-map=a=b" })
+    {
+        INFO("argument " << hostile);
+        auto const passed = std::format("/clang:{}", hostile);
+        std::vector<std::string> const namingPassed { passed };
+        CHECK_FALSE(IsAcceptableJobArgument(passed, clangCl, namingPassed));
+    }
+}
+
+TEST_CASE("A real CMake clang-cl C++23 unit dispatches with every argument accepted", "[compile-job][clang-cl]")
+{
+    // One entry of a real tree, verbatim: the `compile_commands.json` of
+    // `D:\Lastrada\out\build\win64-clangcl-ninja-debug` (CMake + Ninja, clang-cl from Visual Studio 18, 2026-10-16),
+    // the unit `src/Toolbox/Diagram.cpp`. 5103 of that tree's 5138 units carry
+    // `-clang:-std=c++23`, and every one of them carries the `/clang:` warnings below.
+    // Quoting is resolved the way the process receives it (`-imsvc"C:\Program Files..."`
+    // arrives unquoted). The paths travel nowhere: the launcher drops each one, which is
+    // part of what this case proves.
+    std::vector<std::string> const argv {
+        R"(C:\PROGRA~1\MICROS~1\18\PROFES~1\VC\Tools\Llvm\x64\bin\clang-cl.exe)",
+        "/nologo",
+        "-TP",
+        "-DLASTRADA_ENABLE_DABASE=1",
+        "-DLIGHTWEIGHT_POOL_GROWTH_STRATEGY=BoundedOverflow",
+        "-DLIGHTWEIGHT_POOL_INITIAL_SIZE=4",
+        "-DLIGHTWEIGHT_POOL_MAX_IDLE_TIME_MS=0",
+        "-DLIGHTWEIGHT_POOL_MAX_LIFETIME_MS=0",
+        "-DLIGHTWEIGHT_POOL_MAX_SIZE=16",
+        "-DLIGHTWEIGHT_POOL_PREPARED_STATEMENT_CACHE_CAPACITY=0",
+        "-DLIGHTWEIGHT_POOL_VALIDATE_ON_BORROW=Yes",
+        "-DLIGHTWEIGHT_SHARED=1",
+        "-DNOMINMAX",
+        "-DWIN32_LEAN_AND_MEAN",
+        "-DWINVER=0x0A00",
+        "-D_ITERATOR_DEBUG_LEVEL=2",
+        "-D_LIB",
+        "-D_VC80_UPGRADE=0x0600",
+        "-D_WIN32_WINDOWS=0x0A00",
+        "-D_WIN32_WINNT=0x0A00",
+        R"(-ID:\Lastrada\src)",
+        R"(-imsvcC:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\ucrt)",
+        R"(-imsvcC:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um)",
+        R"(-imsvcC:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared)",
+        R"(-imsvcD:\Lastrada\out\build\win64-clangcl-ninja-debug\vcpkg_installed\x64-windows\include)",
+        "/DWIN32",
+        "/D_WINDOWS",
+        "/EHsc",
+        "/Ob0",
+        "/Od",
+        "/RTC1",
+        "-D_DEBUG",
+        "-clang:-std=c++23",
+        "-MDd",
+        "-Z7",
+        "/clang:-Wno-non-pod-varargs",
+        "/clang:-Wno-unused-function",
+        "/clang:-Wno-unused-variable",
+        "/clang:-Wno-unused-value",
+        "/clang:-Wno-unused-local-typedef",
+        "/clang:-Wno-backslash-newline-escape",
+        "/clang:-Wno-reorder-ctor",
+        "/clang:-Wno-array-parameter",
+        "/clang:-Wno-parentheses",
+        "/clang:-Wno-switch",
+        "/clang:-Wno-varargs",
+        "/clang:-Wno-unused-but-set-variable",
+        "/clang:-Wno-misleading-indentation",
+        "/clang:-Wno-overloaded-virtual",
+        "/clang:-Wno-microsoft-template",
+        "/clang:-Wno-comment",
+        "/clang:-Wno-return-type-c-linkage",
+        "/clang:-Wno-delete-non-abstract-non-virtual-dtor",
+        "/clang:-Wno-sometimes-uninitialized",
+        "/clang:-Wno-missing-braces",
+        "/clang:-Wno-unused-command-line-argument",
+        "/clang:-Wno-trigraphs",
+        "/clang:-fno-delayed-template-parsing",
+        "/EHsc",
+        "/Oy-",
+        "/bigobj",
+        "/FC",
+        "/diagnostics:classic",
+        "/nologo",
+        "/GS",
+        "/Zc:wchar_t",
+        "/external:W0",
+        "/wd4251",
+        "/wd4275",
+        "/wd4464",
+        "/wd4714",
+        "/wd4820",
+        "/wd4828",
+        "/wd4996",
+        "/wd5045",
+        "/Zc:forScope",
+        "/Zc:inline",
+        "/W3",
+        "/WX",
+        "/source-charset:utf-8",
+        "/clang:-fdebug-compilation-dir=.",
+        "/clang:-fcoverage-compilation-dir=.",
+        "-gno-codeview-command-line",
+        R"(/Fosrc\Toolbox\CMakeFiles\Toolbox.dir\Diagram.cpp.obj)",
+        R"(/Fdsrc\Toolbox\CMakeFiles\Toolbox.dir\Toolbox.pdb)",
+        "-c",
+        "--",
+        R"(D:\Lastrada\src\Toolbox\Diagram.cpp)",
+    };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    // The client's own construction of the remote line, target pin included.
+    auto const remote = RemoteCompileArgs(cmd, argv, "x86_64-pc-windows-msvc19.51.36252");
+    INFO("the launcher refused: " << remote.error_or(""));
+    REQUIRE(remote.has_value());
+    REQUIRE(std::ranges::contains(*remote, "-clang:-std=c++23"));
+
+    // Every argument, asked one at a time, so a failure names the one refused rather
+    // than only the first.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    for (auto const& argument: *remote)
+    {
+        INFO("argument " << argument);
+        CHECK(IsAcceptableJobArgument(argument, clangCl));
+    }
+
+    // And through the worker's own runner, which is what a lease actually reaches.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "clang-cl", argv.front() } }, ToolchainSurvey::Completed() };
+    auto job = Job(*remote);
+    job.fingerprint = "clang-cl";
+    auto const outcome = jobs.Run(job);
+    INFO("the worker refused: " << (outcome.has_value() ? std::string {} : outcome.error().detail));
+    REQUIRE(outcome.has_value());
+    CHECK(std::ranges::contains(runner.Argv(), "-clang:-std=c++23"));
+}
+
+TEST_CASE("A refused pass-through is named whole, as the client sent it", "[compile-job][clang-cl]")
+{
+    // The node condition `refused-compile-arguments` names what was refused, and an
+    // operator copies that name into `--allow-compile-arg`. Naming the INNER argument
+    // would hand them a spelling that matches nothing the client sends.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs {
+        runner, scratch.Path(), { { "clang-cl", R"(C:\LLVM\bin\clang-cl.exe)" } }, ToolchainSurvey::Completed()
+    };
+    auto job = Job({ "/O2", "-clang:-fno-such-flag" });
+    job.fingerprint = "clang-cl";
+    auto const outcome = jobs.Run(job);
+    REQUIRE_FALSE(outcome.has_value());
+    CHECK(outcome.error() == JobRefusal::RejectedArgument);
+    // The WHOLE list (#1681 names every refused argument): `/O2` passed, so the pass-through is the
+    // only name, whole -- and judged for the driver that unwraps it, so asking that driver's rules
+    // again about the name reaches the inner argument as the worker did.
+    REQUIRE(outcome.error().subjects.size() == 1);
+    CHECK(outcome.error().subjects.front().argument == "-clang:-fno-such-flag");
+    CHECK(outcome.error().subjects.front().judgedFor == Flavor::ClangCl);
+    CHECK(runner.Argv().empty());
+}
+
 TEST_CASE("Of the external-header family, what decides warnings travels and the directories never do", "[compile-job][msvc]")
 {
     // The rows are drawn from a measurement (see the `external:W` row): the level and
