@@ -1591,51 +1591,76 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     return body.contains('/') || body.contains('\\');
 }
 
+namespace
+{
+    /// The language a dispatched compile states for its input, or why it can state none.
+    ///
+    /// The extension, overridden by a driver that compiles everything as C++, overridden in turn
+    /// by the build's own selector. Out of `RemoteCompileArgs` so that function reads as the
+    /// per-argument walk it is: the two changes that met in it (#1680's pass-through refusal,
+    /// #1686's forwarded prefix map) took it past the cognitive-complexity budget together.
+    /// @param cmd The parsed command.
+    /// @param argv The full command line.
+    /// @param driver The driver's spec.
+    /// @return The language, or the reason the job cannot be dispatched.
+    [[nodiscard]] std::expected<SourceLanguage, std::string> DispatchedLanguage(ParsedCommand const& cmd,
+                                                                                std::span<std::string const> argv,
+                                                                                DriverSpec const& driver)
+    {
+        // Asked FIRST, before a single argument is examined: what this decides is
+        // whether the job can be dispatched at all, and a refusal that costs nothing is
+        // worth reaching before one that costs a scan.
+        auto language = LanguageOfSource(cmd.source);
+        if (!language.has_value())
+            return std::unexpected(std::format("no language is named unambiguously by the extension of {}", cmd.source));
+        if (auto const because = UncacheableBecause(*language); !because.empty())
+            return std::unexpected(std::format("{} is never dispatched: {}", DescribeLanguage(*language), because));
+
+        // The DRIVER overrides the extension where it has a default of its own: `g++
+        // -c a.c` compiles C++, so telling a worker `-x cpp-output` would have it
+        // compile as C what this machine compiles as C++, and store that under the key.
+        // Only the C row moves -- a driver that always compiles C++ says nothing about
+        // an Objective-C source, whose own driver default is unchanged.
+        if (*language == SourceLanguage::C && CompilesEverythingAsCxx(cmd.compiler))
+            language = SourceLanguage::Cxx;
+
+        // And the BUILD's own selector outranks both, which is the order the comment on
+        // `LanguageSelectors` describes and nothing implemented: `/TP` on a `.c` file
+        // means C++, whatever the extension or the driver would have said. Resolved
+        // here, before the language is used, so the flags appended below state what the
+        // build asked for rather than overriding it.
+        //
+        // A selector that cannot be reduced to a language -- one naming a FILE, or an
+        // `-x` value with no exact `SourceLanguage` -- is still refused. Refusing costs
+        // one local compile; guessing hands back an object nobody asked for.
+        for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))
+        {
+            auto const* row = MatchLanguageSelector(argv[i], driver.family);
+            if (row == nullptr)
+                continue;
+            auto const named = LanguageNamedBy(*row, argv[i], i + 1 < argv.size() ? argv[i + 1] : std::string_view {});
+            if (!named.has_value())
+                return std::unexpected(
+                    std::format("the command line names the input language itself ({}) in a form this launcher cannot "
+                                "restate to a worker",
+                                argv[i]));
+            language = named;
+        }
+        return *language;
+    }
+} // namespace
+
 std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCommand const& cmd,
                                                                        std::span<std::string const> argv,
                                                                        std::string_view targetTriple)
 {
     auto const& driver = DriverOf(cmd.flavor);
 
-    // Asked FIRST, before a single argument is examined: what this decides is
-    // whether the job can be dispatched at all, and a refusal that costs nothing is
-    // worth reaching before one that costs a scan.
-    auto language = LanguageOfSource(cmd.source);
+    // Asked FIRST, before a single argument is examined: whether the job can be dispatched at
+    // all, and in which language (`DispatchedLanguage`).
+    auto const language = DispatchedLanguage(cmd, argv, driver);
     if (!language.has_value())
-        return std::unexpected(std::format("no language is named unambiguously by the extension of {}", cmd.source));
-    if (auto const because = UncacheableBecause(*language); !because.empty())
-        return std::unexpected(std::format("{} is never dispatched: {}", DescribeLanguage(*language), because));
-
-    // The DRIVER overrides the extension where it has a default of its own: `g++
-    // -c a.c` compiles C++, so telling a worker `-x cpp-output` would have it
-    // compile as C what this machine compiles as C++, and store that under the key.
-    // Only the C row moves -- a driver that always compiles C++ says nothing about
-    // an Objective-C source, whose own driver default is unchanged.
-    if (*language == SourceLanguage::C && CompilesEverythingAsCxx(cmd.compiler))
-        language = SourceLanguage::Cxx;
-
-    // And the BUILD's own selector outranks both, which is the order the comment on
-    // `LanguageSelectors` describes and nothing implemented: `/TP` on a `.c` file
-    // means C++, whatever the extension or the driver would have said. Resolved
-    // here, before the language is used, so the flags appended below state what the
-    // build asked for rather than overriding it.
-    //
-    // A selector that cannot be reduced to a language -- one naming a FILE, or an
-    // `-x` value with no exact `SourceLanguage` -- is still refused. Refusing costs
-    // one local compile; guessing hands back an object nobody asked for.
-    for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))
-    {
-        auto const* row = MatchLanguageSelector(argv[i], driver.family);
-        if (row == nullptr)
-            continue;
-        auto const named = LanguageNamedBy(*row, argv[i], i + 1 < argv.size() ? argv[i + 1] : std::string_view {});
-        if (!named.has_value())
-            return std::unexpected(
-                std::format("the command line names the input language itself ({}) in a form this launcher cannot "
-                            "restate to a worker",
-                            argv[i]));
-        language = named;
-    }
+        return std::unexpected(language.error());
 
     // A shared PDB is a second artefact, and only the object comes back. Refused
     // before anything is sent, on the same reasoning as a module interface unit.
