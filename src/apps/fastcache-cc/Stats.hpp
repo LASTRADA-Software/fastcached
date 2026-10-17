@@ -184,6 +184,14 @@ struct DispatchRecording
 /// @return The state to record and the reason to tally it under.
 [[nodiscard]] DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexcept;
 
+/// The tally reason an UNREACHABLE dispatch is recorded under, by how its LEASE exchange ended
+/// (#1668): no connection made, a connection that broke, one accepted and never answered within
+/// the bound, or -- when the lease completed and a later leg failed -- the general sentence. A
+/// fixed sentence per way, never an endpoint, so the tally counts causes.
+/// @param leaseTransport `DispatchResult::leaseTransport`.
+/// @return The reason; never empty.
+[[nodiscard]] std::string_view UnreachableReasonFor(TransportFailure leaseTransport) noexcept;
+
 /// What the invocation log records as `Record::dispatchSpecifics` for what `Dispatch` returned.
 ///
 /// Beside `RecordingFor` and for its reason: `main.cpp` is in no test target, so which field
