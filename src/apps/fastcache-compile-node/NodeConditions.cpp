@@ -130,20 +130,7 @@ void EvaluateProcessConditions(NodeConditions& conditions, IMetricsSink const& m
 
 std::string ListDetail(std::string_view lead, std::vector<std::string> const& items)
 {
-    auto detail = std::string { lead };
-    for (auto const index: std::views::iota(std::size_t { 0 }, items.size()))
-    {
-        auto const separator = index == 0 ? std::string_view { " " } : std::string_view { ", " };
-        auto const rest = items.size() - index - 1;
-        // Room for this item AND for the count of whatever follows it, so the list is never cut
-        // with no room left to say how much was left out.
-        auto const tail = rest == 0 ? std::string {} : std::format(" and {} more", rest);
-        auto const candidate = std::format("{}{}", separator, EscapeNonUtf8(items[index]));
-        if (detail.size() + candidate.size() + tail.size() > Wire::MaxConditionDetailBytes)
-            return detail + std::format(" and {} more", items.size() - index);
-        detail += candidate;
-    }
-    return detail;
+    return ListWithinCeiling(lead, items, Wire::MaxConditionDetailBytes);
 }
 
 void WatchAcceptLoops(core::net::AcceptLoopHealth& health, NodeConditions& conditions)

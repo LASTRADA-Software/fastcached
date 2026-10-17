@@ -3,6 +3,8 @@
 #include "CompileJob.hpp"
 #include "StubObjectTestSupport.hpp"
 
+#include <FastCache/Protocol/NodeConditionWire.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -1359,10 +1361,82 @@ TEST_CASE("A refusal names the offending argument without echoing arbitrary byte
     // Each of those names something that is not the argument, so none says which driver judged
     // it: asked of the rules again, `-W?[31mred?` is a different argument from the one refused.
     // An argument named verbatim keeps its driver, which is what lets a reader re-ask the rules.
-    CHECK_FALSE(control.judgedFor.has_value());
-    CHECK_FALSE(huge.judgedFor.has_value());
-    CHECK_FALSE(invalid.judgedFor.has_value());
-    CHECK(JobError::RejectedArgumentNaming("-fanalyzer", Flavor::Gcc).judgedFor == Flavor::Gcc);
+    for (auto const* reduced: { &control, &huge, &invalid })
+    {
+        REQUIRE(reduced->subjects.size() == 1);
+        CHECK_FALSE(reduced->subjects.front().judgedFor.has_value());
+    }
+    auto const verbatim = JobError::RejectedArgumentNaming("-fanalyzer", Flavor::Gcc);
+    REQUIRE(verbatim.subjects.size() == 1);
+    CHECK(verbatim.subjects.front().judgedFor == Flavor::Gcc);
+}
+
+TEST_CASE("A runner names every argument it refuses, not the first", "[compile-job][refused-arguments]")
+{
+    // #1681. Stopping at the first refused argument named one per refusal, so an operator admitting
+    // it with `--allow-compile-arg` met the next only after a reload -- four rounds for one clang-cl
+    // line. Every refused argument is named, each once, in the order the job carried them; the
+    // allowed ones around them are not.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+    auto const refused = jobs.Run(Job({ "-O2", "-fanalyzer", "-Wall", "-fnew-flag", "-fanalyzer", "-Xclang" }));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == JobRefusal::RejectedArgument);
+    CHECK(runner.Argv().empty());
+
+    std::vector<std::string> named;
+    for (auto const& subject: refused.error().subjects)
+    {
+        named.push_back(subject.argument);
+        CHECK(subject.judgedFor == Flavor::Gcc);
+    }
+    CHECK(named == std::vector<std::string> { "-fanalyzer", "-fnew-flag", "-Xclang" });
+    CHECK(refused.error().detail
+          == "arguments -fanalyzer, -fnew-flag, -Xclang are not on this worker's accepted-flag list for its driver "
+             "family");
+}
+
+TEST_CASE("A single refused argument keeps the sentence it always had", "[compile-job][refused-arguments]")
+{
+    // The launcher records this sentence in its invocation log and its tests read it, so naming
+    // EVERY argument must not reword the common case of one.
+    constexpr std::string_view Sentence =
+        "argument -fanalyzer is not on this worker's accepted-flag list for its driver family";
+    CHECK(JobError::RejectedArgumentNaming("-fanalyzer", Flavor::Gcc).detail == Sentence);
+
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+    auto const refused = jobs.Run(Job({ "-O2", "-fanalyzer", "-fanalyzer" }));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().detail == Sentence);
+    CHECK(refused.error().subjects.size() == 1);
+}
+
+TEST_CASE("A refusal naming more arguments than fit counts the rest, and keeps every one",
+          "[compile-job][refused-arguments]")
+{
+    // The sentence rides the reply into the client's log, so it is cut where the node's own row
+    // would be -- with how many were left out SAID rather than the list stopping mid-name. The
+    // subjects, which the node lists from, keep every argument whatever the sentence holds.
+    std::vector<std::string> many;
+    for (auto const index: std::views::iota(0, 40))
+        many.push_back(std::format("-fdistinct-refused-argument-{:02}", index));
+    auto const error = JobError::RejectedArgumentsNaming(many, Flavor::Gcc);
+
+    CHECK(error.detail.size() <= FastCache::CompileCacheWire::MaxConditionDetailBytes);
+    CHECK(error.detail.starts_with("arguments -fdistinct-refused-argument-00, "));
+    CHECK(error.detail.ends_with(" are not on this worker's accepted-flag list for its driver family"));
+    auto const said = static_cast<std::size_t>(
+        std::ranges::count_if(many, [&](std::string const& argument) { return error.detail.contains(argument); }));
+    REQUIRE(said > 0);
+    REQUIRE(said < many.size());
+    // The FIRST ones are the ones named, and the count is of exactly the rest.
+    CHECK(std::ranges::all_of(many | std::views::take(said),
+                              [&](std::string const& argument) { return error.detail.contains(argument); }));
+    CHECK(error.detail.contains(std::format(" and {} more are not", many.size() - said)));
+    CHECK(error.subjects.size() == many.size());
 }
 
 TEST_CASE("The output flag follows the worker's own driver family", "[compile-job]")

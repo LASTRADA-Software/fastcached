@@ -169,10 +169,20 @@ is the reproducible lesson, since no unit test can reach either:
     worker is broken, compile elsewhere"), which already owns the right wire code and
     counter.
   - **`JobError::detail` carries client bytes onto the wire, so it is built by
-    `RejectedArgumentNaming` and never assigned directly.** It is encoded into the
-    reply and lands in the client's fallback log, so the argument is capped and
+    `RejectedArgumentsNaming` and never assigned directly.** It is encoded into the
+    reply and lands in the client's fallback log, so each argument is capped and
     reduced to printable ASCII at the one producer — which also makes it valid UTF-8
     whatever arrived, as the fleet requires of text a peer sent.
+  - **A refusal names EVERY argument the worker will not pass, never the first alone**
+    (#1681): stopping at the first made an operator admitting it meet the next only
+    after a reload, four rounds for one clang-cl line. `JobError::subjects` keeps them
+    all, each with its own `judgedFor` (a reduced name cannot be re-asked, and must not
+    take the question away from its verbatim siblings); the sentence lists them under
+    the condition detail's ceiling and COUNTS the rest (`ListWithinCeiling`, which
+    `ListDetail` also is). And it is still ONE compile: `RefusedArgumentsReport` files
+    compiles by the SET of named arguments they carried, so admitting one of a
+    compile's four arguments leaves it counted -- summing per-argument tallies would say
+    four compiles for one, and dropping it would say fewer are refused than are.
   - **A refusal by ABSENCE and a refusal by ROW are the same answer only while nothing
     else is consulted.** `--allow-compile-arg` (#293) is the something else, and it
     turned that sentence from a distinction without a difference into a hole: the

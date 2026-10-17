@@ -110,10 +110,8 @@ TEST_CASE("Only a refusal over an argument is this row's", "[node][conditions][r
     CapturingLogger logger;
     RefusedArgumentsReport report { conditions, logger, {} };
 
-    report.OnJobRefused(Cc::JobError {
-        .reason = Cc::JobRefusal::UnknownFingerprint, .detail = {}, .subject = {}, .judgedFor = std::nullopt });
-    report.OnJobRefused(Cc::JobError {
-        .reason = Cc::JobRefusal::ScratchUnavailable, .detail = {}, .subject = {}, .judgedFor = std::nullopt });
+    report.OnJobRefused(Cc::JobError { .reason = Cc::JobRefusal::UnknownFingerprint, .detail = {}, .subjects = {} });
+    report.OnJobRefused(Cc::JobError { .reason = Cc::JobRefusal::ScratchUnavailable, .detail = {}, .subjects = {} });
 
     CHECK(conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Clear);
     CHECK(logger.Snapshot().empty());
@@ -207,6 +205,81 @@ TEST_CASE("Changing the allowlist re-judges the row: what it admits leaves, the 
         CHECK(conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Raised);
         CHECK(RefusedRow(conditions).detail.contains("-fodd"));
     }
+}
+
+TEST_CASE("A compile refused over several arguments names each and is counted once", "[node][conditions][refused-arguments]")
+{
+    // #1681. A refusal names EVERY argument its job carried that the worker will not pass, and it
+    // is still ONE compile. A count summing each argument's refusals would say three compiles for
+    // one; and a compile stays refused while ANY of its arguments is, so admitting one of them must
+    // not take the compile off the count.
+    NodeConditions conditions;
+    CapturingLogger logger;
+    RefusedArgumentsReport report { conditions, logger, {} };
+    std::vector<std::string> const both { "-fnew-a", "-fnew-b" };
+    std::vector<std::string> const one { "-fnew-a" };
+    report.OnJobRefused(Cc::JobError::RejectedArgumentsNaming(one, Cc::Flavor::Gcc));
+    report.OnJobRefused(Cc::JobError::RejectedArgumentsNaming(both, Cc::Flavor::Gcc));
+
+    auto row = RefusedRow(conditions);
+    CHECK(row.detail.contains("-fnew-a"));
+    CHECK(row.detail.contains("-fnew-b"));
+    CHECK(row.detail.contains("2 compile(s)"));
+    // Logged once per ARGUMENT, so the second refusal's new argument is said and the repeat is not.
+    CHECK(LinesMentioning(logger, "-fnew-a") == 1);
+    CHECK(LinesMentioning(logger, "-fnew-b") == 1);
+
+    // Admitting `-fnew-a` clears the first compile and leaves the second, which is still refused
+    // over `-fnew-b`.
+    report.AllowlistChanged({ "-fnew-a" });
+    REQUIRE(conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Raised);
+    row = RefusedRow(conditions);
+    CHECK_FALSE(row.detail.contains("-fnew-a"));
+    CHECK(row.detail.contains("-fnew-b"));
+    CHECK(row.detail.contains("1 compile(s)"));
+
+    // And admitting the rest clears the row.
+    report.AllowlistChanged({ "-fnew-a", "-fnew-b" });
+    CHECK(conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Clear);
+}
+
+TEST_CASE("A refusal one of whose arguments the list in force admits names only the rest",
+          "[node][conditions][refused-arguments]")
+{
+    // The late-job rule per argument: a job judged by an older list names an argument the operator
+    // has since admitted beside one still refused. The row names the second, counts the compile,
+    // and never lists the first as refused.
+    NodeConditions conditions;
+    CapturingLogger logger;
+    RefusedArgumentsReport report { conditions, logger, { "-fnew-a" } };
+    std::vector<std::string> const both { "-fnew-a", "-fnew-b" };
+    report.OnJobRefused(Cc::JobError::RejectedArgumentsNaming(both, Cc::Flavor::Gcc));
+    auto const row = RefusedRow(conditions);
+    CHECK_FALSE(row.detail.contains("-fnew-a"));
+    CHECK(row.detail.contains("-fnew-b"));
+    CHECK(row.detail.contains("1 compile(s)"));
+}
+
+TEST_CASE("The row says how many named arguments it could not fit", "[node][conditions][refused-arguments]")
+{
+    // Every named argument of one refusal, long enough that the row cannot hold them all: the
+    // detail stays under its ceiling and counts the rest rather than stopping mid-name.
+    NodeConditions conditions;
+    CapturingLogger logger;
+    RefusedArgumentsReport report { conditions, logger, {} };
+    std::vector<std::string> arguments;
+    for (auto const index: std::views::iota(std::size_t { 0 }, RefusedArgumentsReport::MaxNamedArguments))
+        arguments.push_back(std::format("-fa-refused-argument-long-enough-to-crowd-the-row-{:02}", index));
+    report.OnJobRefused(Cc::JobError::RejectedArgumentsNaming(arguments, Cc::Flavor::Gcc));
+
+    auto const row = RefusedRow(conditions);
+    CHECK(row.detail.size() <= Wire::MaxConditionDetailBytes);
+    CHECK(row.detail.contains("1 compile(s)"));
+    auto const said = static_cast<std::size_t>(
+        std::ranges::count_if(arguments, [&](std::string const& argument) { return row.detail.contains(argument); }));
+    REQUIRE(said > 0);
+    REQUIRE(said < arguments.size());
+    CHECK(row.detail.ends_with(std::format(" and {} more", arguments.size() - said)));
 }
 
 TEST_CASE("Past the cap, arguments are counted and neither named nor logged", "[node][conditions][refused-arguments]")
