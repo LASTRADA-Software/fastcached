@@ -242,8 +242,10 @@ enum class FingerprintTree : std::uint8_t
 /// What a path-valued flag's value names.
 ///
 /// The role is what each consumer filters on, so a new flag never grows a
-/// branch: the preprocess line drops every role but IncludeDir, the parser
-/// captures ObjectOutput and DepFile, and the cache key relativizes them all.
+/// branch: the preprocess line drops every role but the three that decide which
+/// headers the text is made of (IncludeDir, ForcedInclude, PrecompiledHeaderInput --
+/// `DroppedFromPreprocess`), the parser captures ObjectOutput and DepFile, and the
+/// cache key relativizes them all.
 enum class PathValueRole : std::uint8_t
 {
     ObjectOutput, ///< The compiled object file (`/Fo`, `-o`).
@@ -274,6 +276,20 @@ enum class PathValueRole : std::uint8_t
     /// #203's "the mapping must be identical on every machine sharing the cache"
     /// rather than merely document it.
     PrefixMap,
+
+    /// A header the driver includes ahead of the source (`-include`, `/FI`). Like an
+    /// include directory it stays on the preprocess lines and never reaches a worker:
+    /// the dispatch preprocess inlines the header into the text the worker compiles,
+    /// so the worker has nothing left to read (#1666).
+    ForcedInclude,
+
+    /// A PRECOMPILED header the compile reads (`-include-pch`). It stays on the
+    /// preprocess lines as it always did, and the line is never dispatched: what it
+    /// names is a compiler's internal state rather than text, so no preprocess can
+    /// inline it, and it is a file on THIS machine. A row of its own, ahead of
+    /// `-include`, because the drivers resolve the longest spelling and so must this
+    /// table -- matched as `-include` with the value `-pch`, it would leave the line.
+    PrecompiledHeaderInput,
 };
 
 /// One spelling of a flag whose value is a filesystem path.
