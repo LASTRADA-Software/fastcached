@@ -2558,9 +2558,14 @@ void StoreCompiledObject(Cc::StorePermit /*permit*/,
     // the remote compile re-reports every warning inside libc++ or the CRT, which
     // under `-Werror` is a failed compile rather than noise.
     auto const preprocessRun = RunCaptureSplit(Cc::DispatchPreprocessCommand(cmd, argv));
+    // The note says WHY (#1665): which exit and the first error line, because "failed"
+    // alone took a manual re-run to read as `/WX` meeting a pragma `cl /E` ignores. The
+    // stats reason stays one fixed string so the summary still counts these together.
     if (preprocessRun.exitCode != 0)
-        return DeclineDispatch(
-            record, RefusedHere("the dispatch preprocess failed"), "dispatch preprocess failed; compiling locally");
+        return DeclineDispatch(record,
+                               RefusedHere("the dispatch preprocess failed"),
+                               std::format("dispatch preprocess failed ({}); compiling locally",
+                                           Cc::DescribeFailedPreprocess(preprocessRun.exitCode, preprocessRun.err)));
 
     // The DISPATCH identity, which is not the cache key's -- and it is built on the
     // BANNER ALONE, deliberately, where the key also folds the target.

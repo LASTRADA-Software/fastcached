@@ -1070,10 +1070,31 @@ struct MappedCompileDir
 /// not have been dispatched at all if it were cheap. Reusing the key's text instead
 /// would save that and break every `-Werror` build, which is not a trade.
 ///
+/// **Warnings-as-errors STAYS on this line, unlike the key probe's** (#1665). `cl /E`
+/// ignores `#pragma warning(disable: …)`, so under `/WX` a warning the source silences
+/// fails this preprocess (C2220) and the unit compiles locally. Dropping `/WX` here is
+/// not the fix it looks like: a PREPROCESSOR-phase warning is resolved in this run and
+/// never reaches the worker's text, so an UNSILENCED one would then pass remotely where
+/// the local compile fails. Measured with cl 19.51, `/W4 /WX`, an unsilenced `#define`
+/// redefinition (C4005): the local compile exits 2, while `/E` without `/WX` exits 0 and
+/// its `.i` compiles under `/WX` with exit 0 -- a build that fails locally and passes
+/// on the fleet. The key probe may drop it because a miss still compiles locally.
+///
 /// @param cmd The parsed command.
 /// @param argv The original full invocation.
 /// @return The preprocess invocation, argv[0] being the compiler.
 [[nodiscard]] std::vector<std::string> DispatchPreprocessCommand(ParsedCommand const& cmd,
                                                                  std::span<std::string const> argv);
+
+/// What a failed preprocess says about itself, for the line that reports it.
+///
+/// The exit status and the first line of @p diagnostics that names an error, else its
+/// first non-empty line, reduced to printable text a log may carry. `cl` echoes the
+/// source's name as its first stderr line, which says nothing, so an error line is
+/// preferred over position.
+/// @param exitCode The preprocess's exit status.
+/// @param diagnostics What it wrote to stderr.
+/// @return For example `exit 2: a.cpp(3): error C2220: the following warning is treated as an error`.
+[[nodiscard]] std::string DescribeFailedPreprocess(int exitCode, std::string_view diagnostics);
 
 } // namespace FastCache::Cc

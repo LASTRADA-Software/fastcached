@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "ArgumentDenials.hpp"
 #include "CmdLine.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
@@ -1846,6 +1847,40 @@ std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
         out.emplace_back(a);
     }
     return out;
+}
+
+namespace
+{
+    /// How the drivers spell a line that reports an ERROR, as opposed to a note, a
+    /// warning or `cl`'s echo of the source name: `a.cpp(3): error C2220`,
+    /// `a.cpp(3): fatal error C1083`, `a.cpp:3:1: error: ...`.
+    constexpr std::array<std::string_view, 3> ErrorLineMarkers { ": error ", ": fatal error ", " error: " };
+} // namespace
+
+std::string DescribeFailedPreprocess(int exitCode, std::string_view diagnostics)
+{
+    std::string_view chosen;
+    std::string_view firstNonEmpty;
+    for (auto const lineRange: std::views::split(diagnostics, '\n'))
+    {
+        auto line = std::string_view { lineRange.begin(), lineRange.end() };
+        if (line.ends_with('\r'))
+            line.remove_suffix(1);
+        if (line.empty())
+            continue;
+        if (firstNonEmpty.empty())
+            firstNonEmpty = line;
+        if (std::ranges::any_of(ErrorLineMarkers, [line](std::string_view marker) { return line.contains(marker); }))
+        {
+            chosen = line;
+            break;
+        }
+    }
+    if (chosen.empty())
+        chosen = firstNonEmpty;
+    if (chosen.empty())
+        return std::format("exit {}", exitCode);
+    return std::format("exit {}: {}", exitCode, PrintableArgument(chosen));
 }
 
 } // namespace FastCache::Cc

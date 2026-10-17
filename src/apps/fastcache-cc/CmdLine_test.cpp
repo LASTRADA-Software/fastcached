@@ -1162,6 +1162,44 @@ TEST_CASE("A precompiled header is still never dispatched beside a forced includ
     CHECK(FindDeniedArgument("/Fppch.pch", DriverFamily::Msvc) != nullptr);
 }
 
+TEST_CASE("The dispatch preprocess keeps warnings-as-errors, where the key probe drops it", "[dispatch][msvc]")
+{
+    // #1665's naive fix is refused on purpose, and this pins the refusal. A
+    // preprocessor-phase warning is resolved in the dispatch preprocess and never
+    // reaches the worker's text, so dropping `/WX` there would let an UNSILENCED one
+    // pass on the fleet where the local compile fails (measured; see the declaration).
+    std::vector<std::string> const argv { "cl", "/W4", "/WX", "/WX-", "/EHsc", "/c", "a.cpp", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+    auto const dispatch = DispatchPreprocessCommand(cmd, argv);
+    REQUIRE(std::ranges::contains(dispatch, "/WX"));
+    auto const remote = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+    REQUIRE(remote.has_value());
+    CHECK(std::ranges::contains(*remote, "/WX"));
+    // The control: the key probe drops it, and keeps `/WX-`, which is not a prefix match.
+    auto const probe = PreprocessCommand(cmd, argv);
+    CHECK_FALSE(std::ranges::contains(probe, "/WX"));
+    CHECK(std::ranges::contains(probe, "/WX-"));
+}
+
+TEST_CASE("A failed preprocess is described by its exit and its first error line", "[dispatch]")
+{
+    // `cl` echoes the source name first, which says nothing; the error line is the one
+    // that let #1665 be read without a manual re-run.
+    std::string_view const cl = "s.cpp\r\n"
+                                "s.cpp(3): error C2220: the following warning is treated as an error\r\n"
+                                "s.cpp(3): warning C4005: 'TRACE': macro redefinition\r\n";
+    REQUIRE(DescribeFailedPreprocess(2, cl)
+            == "exit 2: s.cpp(3): error C2220: the following warning is treated as an error");
+    CHECK(DescribeFailedPreprocess(1, "a.cpp:3:9: error: 'x.h' file not found\n")
+          == "exit 1: a.cpp:3:9: error: 'x.h' file not found");
+    // No error line at all: the first non-empty line, and with nothing written, the exit alone.
+    CHECK(DescribeFailedPreprocess(3, "\nsomething odd\n") == "exit 3: something odd");
+    CHECK(DescribeFailedPreprocess(4, "") == "exit 4");
+    // It is text a compiler wrote reaching a log, so it is reduced and capped.
+    CHECK(DescribeFailedPreprocess(2, std::string(500, 'x') + " error: y").size() < 120);
+}
+
 TEST_CASE("RemoteCompileArgs drops a separated flag together with its value")
 {
     // The failure this rejects is a stray bare value: dropping `-MF` but keeping
