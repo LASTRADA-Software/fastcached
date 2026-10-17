@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <iterator>
 #include <optional>
 #include <ranges>
@@ -218,6 +219,43 @@ TEST_CASE("The key probe and the dispatched line drop clang-cl's pass-through de
     // The control: a code-generating flag on the same line survives both.
     CHECK(std::ranges::contains(pp, "/EHsc"));
     CHECK(std::ranges::contains(*remote, "/EHsc"));
+}
+
+TEST_CASE("A source prefix map stays on the preprocess line and keeps the compile local")
+{
+    // `-ffile-prefix-map` and `-fmacro-prefix-map` rewrite `__FILE__` in the preprocessed
+    // text, so dropping them -- what every other path-valued row but the include directory
+    // gets -- would hash text the real compile does not produce. `-fdebug-prefix-map`
+    // changes no text and is the control: dropped as before.
+    for (std::string_view const flag: { "-ffile-prefix-map", "-fmacro-prefix-map" })
+    {
+        INFO("flag " << flag);
+        auto const map = std::format("{}=/home/ci/src/=", flag);
+        std::vector<std::string> const argv {
+            "g++", map, "-fdebug-prefix-map=/home/ci/src=.", "-O2", "-c", "/home/ci/src/tu.cpp", "-o", "tu.o",
+        };
+        auto const cmd = Parse(argv);
+        REQUIRE(cmd.parsedOk);
+
+        auto const pp = PreprocessCommand(cmd, argv);
+        CHECK(std::ranges::contains(pp, map));
+        CHECK_FALSE(std::ranges::contains(pp, "-fdebug-prefix-map=/home/ci/src=."));
+
+        // Refused for dispatch, by the argument -- not passed over as a path a worker need
+        // not see, which would have the worker embed the client's `#line` paths unmapped.
+        auto const remote = RemoteCompileArgs(cmd, argv, {});
+        REQUIRE_FALSE(remote.has_value());
+        CHECK(remote.error().contains(flag));
+        CHECK(remote.error().contains("rewrites the source paths"));
+    }
+
+    // The control for the refusal: the same line without the source map dispatches.
+    std::vector<std::string> const plain { "g++", "-fdebug-prefix-map=/home/ci/src=.", "-O2", "-c", "tu.cpp", "-o", "tu.o" };
+    auto const plainCmd = Parse(plain);
+    REQUIRE(plainCmd.parsedOk);
+    auto const remote = RemoteCompileArgs(plainCmd, plain, {});
+    INFO("refused: " << remote.error_or(""));
+    CHECK(remote.has_value());
 }
 
 TEST_CASE("The end-of-options marker stays with the source, which never travels")

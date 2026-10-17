@@ -1797,9 +1797,10 @@ if(_fc_cache_chosen)
     # all. `.agent/rules/compile-cache.md` records that as an accepted cost.
     #
     # `-fdebug-prefix-map` and not `-ffile-prefix-map`, which also implies
-    # `-fmacro-prefix-map` and would rewrite `__FILE__` -- in the preprocessed text
-    # the launcher's key is taken over, which the real compile would then not
-    # produce. Program-visible file names are not this module's to fix, and the
+    # `-fmacro-prefix-map` and would rewrite `__FILE__` -- the program's own text,
+    # which a module that only fronts the compiler has no business changing. A build
+    # that passes one ITSELF is keyed portably and kept on the preprocess line
+    # (`PathValueRole::SourcePrefixMap`). Program-visible file names are not this module's to fix, and the
     # launcher does not need it to: the preprocessed key alone sees a `__FILE__`
     # expansion, while the direct-mode key never does and `std::source_location`
     # reaches no key at all, so `fastcache-cc` reads the OBJECT instead and keys an

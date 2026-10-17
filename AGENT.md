@@ -198,8 +198,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   collapses `..` out of every note the launcher EMITS and out of none that it STORES.
 - A compiler with debug info on records the WORKING DIRECTORY, which is on no command line, so no key relativizes
   it; `-fdebug-prefix-map` closes it on ELF and on NEITHER COFF driver, an accepted cost rather than open work.
-  - Never `-ffile-prefix-map`, and no table row for it or `-fmacro-prefix-map` either: both
-    rewrite `__FILE__` INTO the text the key hashes.
+  - The module never ADDS `-ffile-prefix-map`/`-fmacro-prefix-map`; a build's own is a `SourcePrefixMap` row: HEAD
+    relativized, KEPT on the preprocess line (it rewrites `__FILE__`), never dispatched, build tree's place KEYED.
   - The key relativizes the rule's HEAD (`PathValueRole::PrefixMap`, a table COLUMN) and leaves
     the replacement literal; the build-tree rule is mapped LAST, and a root with a SPACE is not
     mapped at all. `ctest -R debug-prefix-map-rules`.

@@ -4685,10 +4685,10 @@ fleet*.
   compiles of 300 ms–2 s the ceiling is about 10–40×, not linear.
 - **`-g` embeds the worker's scratch path** in DWARF. Use **`-fdebug-prefix-map`**,
   which this launcher recognises and folds into the cache key, so two checkouts still
-  share. **Not `-ffile-prefix-map` or `-fmacro-prefix-map`**: they are deliberately not
-  recognised, and passing either costs cross-checkout sharing for that translation unit
-  — they rewrite `__FILE__` into the preprocessed text the key hashes, so the launcher
-  cannot relativize them without hashing text the real compile never produced. See
+  share. `-ffile-prefix-map` and `-fmacro-prefix-map` are keyed the same way and share
+  across checkouts too, but a command line carrying either **compiles locally and is never
+  dispatched**: they rewrite `__FILE__`, and a worker could not apply the client's rule to
+  the paths it embeds. See
   [the launcher's own account](fastcache-cc.md#debug-paths-in-a-replayed-object).
 - **Diagnostics from a failed remote compile are not shown.** A worker that
   reports a non-zero exit is retried locally and the *local* result is what you

@@ -290,6 +290,20 @@ enum class PathValueRole : std::uint8_t
     /// `-include`, because the drivers resolve the longest spelling and so must this
     /// table -- matched as `-include` with the value `-pch`, it would leave the line.
     PrecompiledHeaderInput,
+
+    /// A path rewrite that ALSO reaches the preprocessed text (`-ffile-prefix-map`,
+    /// `-fmacro-prefix-map`): it maps `__FILE__` and `__builtin_FILE`, which is what a
+    /// project adds so its objects stop naming its checkout -- Catch2's own CMake passes
+    /// `-ffile-prefix-map=<checkout>/=` on every compile.
+    ///
+    /// Keyed as `PrefixMap` is -- the head relativized, the replacement literal -- and
+    /// differing in the two places where reaching the text matters: it STAYS on the
+    /// preprocess line, so the key hashes the `__FILE__` the real compile produces, and
+    /// a line carrying one is never dispatched, since a worker compiling the client's
+    /// `#line`-marked text would embed `source_location` names the client's mapping never
+    /// touched. Unrecognised, the flag reached the key verbatim with the checkout's
+    /// absolute root in it, and every checkout of such a project missed.
+    SourcePrefixMap,
 };
 
 /// One spelling of a flag whose value is a filesystem path.

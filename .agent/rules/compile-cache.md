@@ -1694,16 +1694,32 @@ stops being one — the same confound that cost #493 a re-run.
   key — both flags tokenize to the same canonical text — while their objects
   differ. That is the #203 symptom reappearing inside the fix for it, and the only
   instrument that sees it is reading `comp_dir` directly.
-- **Only the DEBUG spelling is in the table.** `-fmacro-prefix-map` and
-  `-ffile-prefix-map` rewrite `__FILE__`, which lands in the preprocessed text the
-  key hashes — measured on both drivers with the source named absolutely, where
-  `-fdebug-prefix-map` leaves that text byte-identical and the other two do not.
-  A row for either would make the flag dropped from the preprocess line (every
-  role but `IncludeDir` is), so the key would hash text the real compile does not
-  produce, and a dispatched compile would bake the UNMAPPED `__FILE__` into an
-  object stored under the same key a locally mapped one uses. Unrecognised, they
-  reach the key verbatim and two checkouts miss — the safe direction, and the
-  behaviour that was already there.
+- **The module ADDS only the debug spelling; the table KEYS all three.**
+  `-fmacro-prefix-map` and `-ffile-prefix-map` rewrite `__FILE__`, which lands in the
+  preprocessed text the key hashes — measured on both drivers with the source named
+  absolutely, where `-fdebug-prefix-map` leaves that text byte-identical and the other
+  two do not. So they are a role of their own, `PathValueRole::SourcePrefixMap`, and
+  the role differs from `PrefixMap` in exactly the two places where reaching the text
+  matters:
+  - **It STAYS on the preprocess line** (`DroppedFromPreprocess`), so the key hashes
+    the `__FILE__` the real compile produces. Dropping it — what every role but
+    `IncludeDir` gets — is the reason this bullet used to forbid a row at all.
+  - **A line carrying one is never DISPATCHED** (`RemoteCompileArgs` refuses it by
+    name): a worker compiles text whose `#line` markers name the client's paths, so it
+    would embed `source_location` names unmapped, under the key a mapped one uses.
+  - **And the build tree's PLACE under the source root is keyed** whenever one is
+    present. `-ffile-prefix-map=<SRCROOT>/=` turns a generated header into
+    `build/gen.hpp` in one checkout and `out/build/r/gen.hpp` in another; nothing else
+    in the key records where the build tree sits (its paths tokenize as
+    `<BUILDTREE>`), a `source_location` there reaches no key text, and the result is
+    relative, so the root-binding scan cannot see it. A tree outside the source root
+    is keyed as OUTSIDE, never by its path.
+  - **What it cost while it was unrecognised**: it reached the key verbatim, absolute
+    root included. Catch2's own CMake passes `-ffile-prefix-map=<checkout>/=` on every
+    compile, so no two checkouts of Catch2 shared anything — measured 0 of 107 hits
+    from a second folder, 107 of 107 with the rows, every served object byte-identical
+    to that folder's own uncached compile. No `objkey`/`manifest` bump, by `v3`'s
+    argument in `ComputeKey`: one input stopped carrying a machine-specific string.
 - **A root with a SPACE is not mapped, and that is a refusal.** The rules are
   spliced into `CMAKE_<LANG>_FLAGS`, which is space-separated, so a rule naming
   `/Users/john doe/proj` reaches the driver as two arguments and every compile

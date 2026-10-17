@@ -972,13 +972,20 @@ replacements miss rather than exchange objects that disagree. The mapping has to
 be the same everywhere a cache is shared, and that is enforced by the key rather
 than left to a convention.
 
-`-ffile-prefix-map` and `-fmacro-prefix-map` are deliberately **not** recognised,
-and passing either costs cross-checkout sharing for that translation unit. They
-rewrite `__FILE__`, which lands in the preprocessed text the key hashes, so the
-launcher cannot relativize them without hashing text the real compile does not
-produce — and a dispatched compile would then bake the *unmapped* `__FILE__` into
-an object stored under the same key. Unrecognised, they reach the key verbatim
-and two checkouts simply miss, which is the safe direction.
+`-ffile-prefix-map` and `-fmacro-prefix-map` are recognised too, and they are
+what a project passes so its objects stop naming its checkout (Catch2 passes
+`-ffile-prefix-map=<checkout>/=` itself). The key relativizes the root they name
+and leaves the replacement literal, exactly as above, with two differences that
+come from their rewriting `__FILE__` in the preprocessed text:
+
+- they **stay on the preprocess line**, so the key hashes the `__FILE__` the real
+  compile produces;
+- a command line carrying one **compiles locally and is never dispatched**, because
+  a worker could not apply the client's rule to the paths it embeds.
+
+The key also records where the build tree sits under the source root whenever one
+is present, since the mapping rewrites a build-tree path through the source root's
+rule; two checkouts share when their build trees sit in the same place.
 
 A root containing a **space** is not mapped at all: these rules are spliced into
 `CMAKE_<LANG>_FLAGS`, which is space-separated, so one rule would arrive at the

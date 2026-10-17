@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -807,6 +808,50 @@ TEST_CASE("A prefix-map flag's root is relativized, so two checkouts still share
     // COFF, where no mapping exists, and it is written down in
     // `.agent/rules/compile-cache.md` rather than left to be rediscovered here.
     CHECK(keyFor(RootA, {}) == keyFor(RootB, {}));
+}
+
+TEST_CASE("A source prefix map's root is relativized, and the build tree's place under it is keyed")
+{
+    // Catch2's own CMake passes `-ffile-prefix-map=<checkout>/=` on every compile, so its
+    // objects name no checkout. Unrecognised, the flag reached the key verbatim and no two
+    // checkouts of Catch2 ever shared an object: measured, 0 of 107 hits from a second
+    // folder, and 107 of 107 once the row existed -- each served object byte-identical to
+    // that folder's own uncached compile.
+    auto const keyFor = [](std::string_view root, std::string_view build, std::string_view replacement) {
+        std::vector<std::string> const args {
+            "-O2", std::format("-ffile-prefix-map={}/={}", root, replacement), "-c", std::format("{}/src/tu.cpp", root)
+        };
+        return ComputeKey(KeyInputs { .compilerId = "g++ (GCC) 15.2.0",
+                                      .preprocessed = R"(const char* f(){return "src/tu.cpp";})",
+                                      .relativizedArgs = Relativize(args, root, build),
+                                      .dependencyPaths = {} });
+    };
+    constexpr std::string_view RootA = "/home/alice/work/catch2";
+    constexpr std::string_view RootB = "/srv/bob/deeper/catch2-copy";
+
+    auto const mapped = Relativize({ std::format("-fmacro-prefix-map={}/=", RootA) }, RootA, std::format("{}/build", RootA));
+    REQUIRE_FALSE(mapped.empty());
+    CHECK(mapped.front() == "-fmacro-prefix-map=<SRCROOT>/=");
+
+    // Two checkouts, the same mapping, the build tree in the same place: one key. This is
+    // the assertion that is red without the rows.
+    CHECK(keyFor(RootA, std::format("{}/build", RootA), "") == keyFor(RootB, std::format("{}/build", RootB), ""));
+
+    // The replacement half stays literal, exactly as `-fdebug-prefix-map`'s does.
+    CHECK(keyFor(RootA, std::format("{}/build", RootA), "") != keyFor(RootB, std::format("{}/build", RootB), "x/"));
+
+    // The map rewrites a generated header under the build tree to `build/gen.hpp` in one
+    // checkout and `out/build/r/gen.hpp` in the other, and a `source_location` there reaches
+    // no key text. So where the build tree sits under the source root separates the keys,
+    // and a tree outside it is recorded as outside, never by its path.
+    CHECK(keyFor(RootA, std::format("{}/build", RootA), "") != keyFor(RootB, std::format("{}/out/build/r", RootB), ""));
+    CHECK(keyFor(RootA, "/scratch/a-build", "") == keyFor(RootB, "/elsewhere/b-build", ""));
+    CHECK(keyFor(RootA, "/scratch/a-build", "") != keyFor(RootA, std::format("{}/build", RootA), ""));
+
+    // And a line with no source map keys exactly as it did -- the layout item is not
+    // appended, so no other build's key moved.
+    std::vector<std::string> const plain { "-O2", "-c", std::format("{}/src/tu.cpp", RootA) };
+    CHECK(Relativize(plain, RootA, std::format("{}/build", RootA)).size() == plain.size());
 }
 
 TEST_CASE("A prefix-map value with no replacement is relativized rather than refused")
