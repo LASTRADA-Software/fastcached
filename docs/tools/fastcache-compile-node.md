@@ -1214,6 +1214,12 @@ from. A ticket:
 - is minted for **this machine's** processes only: a node answers `MINT-TICKET` over
   loopback and refuses it from any other address.
 
+Whoever asks — the launcher, `fastcache-cli`, or this binary's own operator verbs
+(`--cluster-*`, `--enroll-*`) — gives up connecting to its node after **50 ms**. A
+loopback handshake takes well under a millisecond, while Windows answers a connect to a
+closed loopback port only after about 2 s, which a machine with no node would otherwise
+wait out before the verb went anywhere.
+
 `fastcache-cli explain-admission` says which route admitted a connection, and
 `explain-admission <machine>` where a machine stands in this node's roster. A ticket
 refused is counted by its reason (the `node_tickets_refused_*` series below).

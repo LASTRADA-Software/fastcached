@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/ConnectCeiling.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -481,17 +482,14 @@ struct ExchangeBudget
 
 /// @p budget with its connect ceiling at most @p ceiling, every other field as it was.
 ///
-/// Capped rather than replaced: an operator who set a SHORTER connect timeout keeps it. A
-/// non-positive connect is `core::net::DialOptions`' spelling of *leave the platform default in
-/// place*, which may be minutes, so it takes the ceiling too -- or `FASTCACHE_CONNECT_TIMEOUT=0s`
-/// would give the dial the cap exists for the longest wait of all. One helper for every such cap
-/// (`AtDialHint`, `MintBudget`), so the non-positive rule is written once.
+/// One helper for every cap on a BUDGET (`AtDialHint`, `MintBudget`), over the one rule for every
+/// cap on a connect (`ConnectAtMost`), which says what a shorter or a non-positive connect keeps.
 /// @param budget The budget as it stands.
 /// @param ceiling The longest the connect may take; positive.
 /// @return @p budget, its connect at most @p ceiling.
 [[nodiscard]] constexpr ExchangeBudget WithConnectAtMost(ExchangeBudget budget, std::chrono::milliseconds ceiling) noexcept
 {
-    budget.connect = budget.connect > std::chrono::milliseconds::zero() ? std::min(budget.connect, ceiling) : ceiling;
+    budget.connect = ConnectAtMost(budget.connect, ceiling);
     return budget;
 }
 

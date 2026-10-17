@@ -38,7 +38,7 @@ complaint about a flag you are no longer going to use.
 | Admin surface | `--admin-addr=<host:port>`, `$FASTCACHE_ADMIN_ADDR` — **usually unnecessary**, see below |
 | Credential | `--token-file=<path>` (preferred) or `$FASTCACHE_TOKEN` |
 | Dashboard credential | `--dashboard-token-file=<path>`, presented by `fleet` and `live-stats fleet` only; no environment variable |
-| Machine ticket source | `--mint-from=<host:port>`: where this machine's node mints the ticket a node on another machine is shown; the port counts, the host is always loopback, default the dialled node's port |
+| Machine ticket source | `--mint-from=<host:port>`: where this machine's node mints the ticket a node on another machine is shown; the port counts, the host is always loopback, default the dialled node's port. Connecting to it gives up after **50 ms** whatever `--connect-timeout` says — a lower value lowers it — so a machine with no node pays that, not the ~2 s Windows takes to refuse a closed loopback port |
 
 The same `$FASTCACHE_ADDR` that `fastcache-cc` reads, so a machine configured for
 the launcher is already configured for this. A variable that is *set but empty*

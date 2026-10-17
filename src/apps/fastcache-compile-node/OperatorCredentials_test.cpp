@@ -4,9 +4,11 @@
 
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/TicketChoice.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -99,4 +101,31 @@ TEST_CASE("An operator verb whose mint fails presents nothing, names why, and sa
     CHECK(said.front().contains("127.0.0.1:6674"));
     // A verb has no local compile to fall back on: its line ends with the verb's own cost.
     CHECK(said.front().ends_with(RefusedVerbFails));
+}
+
+TEST_CASE("An operator verb's mint connects under the loopback bound, whether a node answers or none runs", "[node][ticket]")
+{
+    // #1669: the mint dialled under a fixed 2 s of its own, which on Windows is the whole wait for a
+    // closed loopback port, so a verb on a machine with no node sat out the refusal before it went
+    // anywhere. Asserted at the dialer production hands `OperatorCredentials`, for the node that
+    // mints and for the one that is not there -- the case the bound exists for.
+    struct Row
+    {
+        char const* name;
+        std::vector<std::byte> reply; ///< Empty: the dial fails, as with no node on the port.
+    };
+    for (auto const& row:
+         { Row { .name = "a node that mints",
+                 .reply = Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes(std::string_view { "minted" })) },
+           Row { .name = "no node", .reply = {} } })
+    {
+        INFO(row.name);
+        Testing::ScriptedDialer dialer { { row.reply } };
+        OperatorCredentials operatorCredentials { NodeConfig {}, dialer, [](std::string_view) {} };
+
+        static_cast<void>(operatorCredentials.Credentials().Present("sched-a.internal:6675"));
+
+        REQUIRE(dialer.Dialed() == std::vector<std::string> { "127.0.0.1:6674" });
+        CHECK(dialer.OptionsOn(0).connectTimeout == Cc::LoopbackConnectBound);
+    }
 }
