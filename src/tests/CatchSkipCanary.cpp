@@ -1,58 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The shapes any replacement skip mechanism must survive (#1128, #1152).
+// The shapes the exit contract `SKIP_RETURN_CODE 4` rests on (#1128, #1152).
 //
-// ctest is told a Catch2 skip is a skip by `SKIP_RETURN_CODE 4`, and that is a defect
-// we could not close: Catch2's exit code IS its failed-assertion count, so a case
-// failing exactly four assertions is scored *skipped*. Three channels were measured
-// and all three are closed -- the exit status is fully occupied, the output is shared
-// with text the subject controls and cannot be anchored through the Windows command
-// line, and `FAIL_REGULAR_EXPRESSION` does not outrank `SKIP_RETURN_CODE`. The argument
-// is at the top of the top-level CMakeLists; the fix is a change of MECHANISM, #1152.
+// ctest is told a Catch2 skip is a skip by `SKIP_RETURN_CODE 4`, and that is exact only
+// because of a contract Catch2 has kept since 3.7.1: a run whose every case skipped exits
+// 4, and ANY assertion failure exits one fixed value, 42, whatever the count. Before that
+// the exit code WAS the failed-assertion count, so a case failing exactly four assertions
+// exited 4 and was scored *skipped* -- #1128, measured on 3.6.0 inside `100% tests passed`.
+// The top-level CMakeLists pins Catch2 EXACTLY, because a version-compatible find takes
+// whatever 3.x a machine has installed, older ones included.
 //
-// This binary exists so that argument has a READER. `check-catch-skip-exit-collision`
-// runs it and asserts the PREMISES rather than the conclusion, because a record saying
-// something cannot be done instructs the next session not to try -- and would become a
-// false rule the day Catch2 changed. It is deliberately NOT registered with
+// This binary exists so that contract has a READER. `check-catch-skip-exit-contract` runs
+// every shape below in its own process and asserts what each one exits, because the
+// contract is a property of the Catch2 BUILD the tree links, and a rule resting on one
+// becomes false the day that build changes. It is deliberately NOT registered with
 // `catch_discover_tests`: several cases fail on purpose.
 //
-// ## The structural property the whole design rests on
+// ## Why the shapes are still these
 //
-// `Totals::delta` puts a case in EXACTLY ONE bucket, and `failed` outranks `skipped`.
-// So a case that both skips and fails can never report `1 skipped` in its SUMMARY, on
-// any input -- which is why the summary line is a sound discriminator and Catch2's
-// `SKIPPED:` marker is not. The marker survives in the BODY of a failing case at every
-// width, measured at zero assertions and at padded.
-//
-// A property that holds on any input beats any number of measured shapes. The shapes
-// below exist for the cases where no such property is available.
-//
-// ## Why adding shapes cannot make a PATTERN safe
-//
-// Learned the expensive way. A decoy carrying the pattern's TAIL refutes a tail-only
-// pattern and certifies a same-line pattern as safe; a decoy carrying a WHOLE summary
-// line then refutes that one. Every shape here is one somebody thought of, and the
-// output channel is shared with an author who will think of others. That is the
-// argument for a launcher over any further pattern work.
+// They were collected (#1128, #1146) to defeat any PATTERN keyed on Catch2's output, and
+// they still record why the mechanism is the exit code and never a pattern: the output is
+// shared with text a case's author controls, a summary line changes SHAPE as its columns
+// widen, and a case that both skips and fails prints `SKIPPED:` in its body while its
+// summary says `1 failed`. A pattern has to survive every one of those; the exit contract
+// survives them by construction, and these shapes are what shows it does.
+#include <catch2/catch_session.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <ranges>
 #include <string>
 
-// The shape every environment-conditional skip in this tree has. Its output must MATCH
-// the shared pattern, or real skips start scoring as failures -- #499 returning.
+// The compile-time half of the contract, against the Catch2 this binary links: the 4 every
+// `catch_discover_tests` registration carries as `SKIP_RETURN_CODE` (and
+// `check-catch-skip-return-code` requires) IS Catch2's all-skipped code, and no failure can
+// spell it. The run-time half, that a failing case really exits with the failure code, is
+// `check-catch-skip-exit-contract`'s.
+static_assert(Catch::AllTestsSkippedExitCode == 4,
+              "Catch2's all-tests-skipped exit code is no longer 4, so every `SKIP_RETURN_CODE 4` in this tree "
+              "now scores a skip as a FAILURE -- #499 returning");
+static_assert(Catch::TestFailureExitCode != Catch::AllTestsSkippedExitCode,
+              "a failing run exits with the skip code again, so `SKIP_RETURN_CODE 4` scores failures as "
+              "SKIPPED -- #1128 returning");
+
+// The control: a case that passes exits 0, so a canary that exits non-zero for every shape
+// is a broken binary rather than a contract that holds.
+TEST_CASE("catch skip canary: a case that passes", "[canarypass]")
+{
+    CHECK(true);
+}
+
+// The shape every environment-conditional skip in this tree has. It must exit 4, or real
+// skips start scoring as failures -- #499 returning.
 TEST_CASE("catch skip canary: a case that skips", "[canaryskip]")
 {
     SKIP("this canary skips on purpose");
 }
 
-// The shape #1128 is about, and the reason the pattern may not be keyed on Catch2's
-// exit code: this exits **4**, which is indistinguishable from a skip by status alone.
-// Its output must NOT match the shared pattern.
-//
-// Exactly four, because four is the collision. Fewer or more would exit with a value
-// no skip mechanism ever claimed, so the case would pass for a reason that says nothing
-// about the defect.
+// The shape #1128 was about. On 3.6.0 this exited **4** and was scored SKIPPED; under the
+// contract it exits the failure code. Exactly four, because four was the collision.
 TEST_CASE("catch skip canary: a case that fails four assertions", "[canaryfail]")
 {
     CHECK(false);
@@ -61,13 +66,24 @@ TEST_CASE("catch skip canary: a case that fails four assertions", "[canaryfail]"
     CHECK(false);
 }
 
-// A case that BOTH skips and fails, which is what killed the obvious candidate.
-//
-// Keying on Catch2's `SKIPPED:` marker rather than on the summary would score this
-// SKIPPED -- and it fails four assertions. That would be WIDER than #1128: it hides any
-// number of failures in a case that also skips, where #1128 hides exactly four. Its
-// output must NOT match the shared pattern, and Catch2 itself already gets this right
-// by printing `1 failed` in the summary while printing `SKIPPED:` above it.
+// One failure and three hundred: the failure code must not depend on the count. Three
+// hundred is past the 255 the old count was clamped at, the other end of the old range.
+TEST_CASE("catch skip canary: a case that fails one assertion", "[canaryfailone]")
+{
+    CHECK(false);
+}
+
+TEST_CASE("catch skip canary: a case that fails three hundred assertions", "[canaryfailmany]")
+{
+    for (auto const i: std::views::iota(0, 300))
+    {
+        CHECK(i < 0);
+    }
+}
+
+// A case that BOTH skips and fails, which is what killed the obvious pattern: it prints
+// `SKIPPED:` in its body and `1 failed` in its summary. It must exit the failure code --
+// a skip somewhere in a case does not excuse a failure elsewhere in it.
 TEST_CASE("catch skip canary: a case that skips and fails", "[canarymixed]")
 {
     SECTION("skips")
@@ -84,21 +100,11 @@ TEST_CASE("catch skip canary: a case that skips and fails", "[canarymixed]")
     }
 }
 
-// The shape the first version of this canary could not produce, and the reason a
-// runtime check pointed at one input proves less than it looks (#1146).
-//
-// `SummaryColumn::addRow` left-pads a column to its widest row, and the first column
-// carries the case count and the assertion count together. Below ten assertions both
-// are one character wide and nothing moves; at ten or more the `1` becomes `" 1"`, and
-// the line changes SHAPE rather than only spacing -- Catch2's zero-suppression tests
-// `value != "0"`, and the padded `" 0"` is not `"0"`, so a `| 0 passed` column appears
-// that is absent from the narrow form.
-//
-// A bare `SKIP()` with no prior assertions is the ONE shape where neither happens,
-// and it was the only shape this canary had. Any pattern keyed on the narrow line
-// passes here and misses in production, where ctest then falls back to the exit code
-// and scores a legitimate skip as a FAILURE -- #499 returning through the change that
-// exists to prevent it.
+// The shape the first version of this canary could not produce (#1146): at ten or more
+// assertions the summary's first column is padded and the line changes SHAPE, gaining a
+// `| 0 passed` column -- Catch2's zero-suppression tests `value != "0"`, and the padded
+// `" 0"` is not `"0"`. Fatal to a pattern keyed on the narrow line; irrelevant to an exit
+// code, which is the point. It must exit 4.
 TEST_CASE("catch skip canary: a case that skips after ten or more assertions", "[canarypadskip]")
 {
     for (auto const i: std::views::iota(0, 12))
@@ -109,58 +115,8 @@ TEST_CASE("catch skip canary: a case that skips after ten or more assertions", "
     SKIP("this canary skips after enough assertions to widen the summary column");
 }
 
-// A skip message chosen to be hostile to the pattern rather than neutral.
-//
-// The tail of the summary line is the only pipe-free region carrying discrimination,
-// so the pattern lives there -- and text an author writes is echoed into the SKIPPED:
-// block above it. A case that FAILS while echoing the pattern's own text is the shape
-// that would turn a failure into a skip, which is the widening direction this ticket
-// refuses. It must not match.
-TEST_CASE("catch skip canary: a failing case whose text echoes the pattern", "[canarydecoy]")
-{
-    SECTION("skips with a hostile message")
-    {
-        SKIP("a message mentioning 1 skipped on purpose");
-    }
-
-    SECTION("fails")
-    {
-        CHECK(false);
-    }
-}
-
-// reload-batch's adversarial shape, which is STRONGER than the decoy above and is the
-// one that decides whether an unanchored pattern is usable at all (#1146).
-//
-// The decoy above only carries the pattern's TAIL, so it refutes a tail-only pattern
-// and nothing else. This one carries the WHOLE summary line, on ONE line, inside an
-// `INFO` -- and `SKIP_REGULAR_EXPRESSION` is a substring search over the case's entire
-// output, which includes names, `INFO` messages and stringified expressions. None of
-// that is text this project's check controls.
-//
-// So a pattern that merely requires `test cases:` and the tail to share a LINE is not
-// anchored: an author can put both on one line. Its real summary says `1 failed`, and
-// it must NOT match, or a case that only FAILS is scored SKIPPED -- #1128's own species
-// arriving through the mechanism meant to close it, and in the fail-OPEN direction.
-TEST_CASE("catch skip canary: a failing case echoing a whole summary line", "[canaryadversary]")
-{
-    std::string const report = "test cases: 1 | 1 skipped";
-    INFO("reporting: " << report);
-    CHECK(report.empty());
-}
-
-// ## What any future mechanism must survive
-//
-// The structural property the whole design rests on, stated because a property that
-// holds on ANY input beats any number of measured shapes: `Totals::delta` puts a case
-// in EXACTLY ONE bucket, and `failed` outranks `skipped`. So a case that both skips and
-// fails can never report `1 skipped` in its summary -- which is why the summary line is
-// a sound discriminator and Catch2's `SKIPPED:` marker is not. The marker survives in
-// the BODY of a failing case at every width, measured at zero and at padded.
-
-// Padding is UNBOUNDED, not one extra space. At a hundred-plus assertions the column
-// widens again, so any tolerance written for a fixed width dies here rather than at
-// twelve.
+// Padding is UNBOUNDED, not one extra space: at a hundred-plus assertions the column widens
+// again. It must exit 4.
 //
 //     12 assertions    test cases:  1 |  0 passed | 1 skipped     two spaces
 //    120 assertions    test cases:   1 |   0 passed | 1 skipped   three
@@ -174,12 +130,8 @@ TEST_CASE("catch skip canary: a case that skips after a hundred assertions", "[c
     SKIP("this canary skips after enough assertions to widen the column twice");
 }
 
-// The real-world shape, and how the live site reaches two digits: a skip in a LATER
-// section, after earlier sections have already run assertions into the same totals.
-//
-// A case-level skip aborts the case, so its totals stay small; a SECTION-level one lets
-// the other sections run, which is why the two site censuses differ -- assertions
-// BEFORE the skip against assertions in the whole case.
+// The real-world shape: a skip in a LATER section, after earlier sections have run
+// assertions into the same totals. It must exit 4.
 TEST_CASE("catch skip canary: a skip in a later section after earlier ones ran", "[canarysectionskip]")
 {
     SECTION("first section runs assertions")
@@ -194,4 +146,29 @@ TEST_CASE("catch skip canary: a skip in a later section after earlier ones ran",
     {
         SKIP("this section skips after earlier sections ran assertions");
     }
+}
+
+// A failing case whose skip message echoes the old pattern's tail. Text an author writes
+// reaches the output, never the exit code: it must exit the failure code.
+TEST_CASE("catch skip canary: a failing case whose text echoes the pattern", "[canarydecoy]")
+{
+    SECTION("skips with a hostile message")
+    {
+        SKIP("a message mentioning 1 skipped on purpose");
+    }
+
+    SECTION("fails")
+    {
+        CHECK(false);
+    }
+}
+
+// The adversarial shape (#1146): a case that only FAILS while carrying a WHOLE summary line,
+// on one line, in an `INFO`. It decided that no unanchored pattern was usable; under the
+// exit contract it must simply exit the failure code.
+TEST_CASE("catch skip canary: a failing case echoing a whole summary line", "[canaryadversary]")
+{
+    std::string const report = "test cases: 1 | 1 skipped";
+    INFO("reporting: " << report);
+    CHECK(report.empty());
 }

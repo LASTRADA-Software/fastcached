@@ -2130,10 +2130,10 @@ TEST_CASE("Each refusal tile names the counter it renders, in its own tile", "[d
     // spelling `fastcached_dispatch_leases_no_capacity_total` by hand would be the
     // second source of truth this change exists to avoid -- and #1306's own body
     // spelled it `fastcache_...`, which is in no tree.
-    // **One assertion for the whole table, deliberately.** Catch2 spends its exit
-    // status on the failed-assertion COUNT, and ctest is told `SKIP_RETURN_CODE 4`
-    // (#1128, open as #1152) -- so a case that naturally fails exactly four is scored
-    // SKIPPED rather than failed. Five rows checked individually did exactly that when
+    // **One assertion for the whole table, deliberately.** On Catch2 3.6.0 the exit
+    // status was the failed-assertion COUNT, and ctest is told `SKIP_RETURN_CODE 4`
+    // (#1128) -- so a case that naturally failed exactly four was scored SKIPPED rather
+    // than failed. Five rows checked individually did exactly that when
     // this fix was neutered: four red, reported as a skip. Folding them into one
     // comparison keeps the failure count at one and puts every mismatch in the message.
     auto const html = RenderFleetHtml(LeadingSnapshot(), NoHistory(), 10);

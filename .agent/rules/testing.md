@@ -2333,25 +2333,42 @@ means or it scores the skip as a *failure*. None of the five `catch_discover_tes
 registrations told it, so the binary printed `1 skipped` and ctest printed `***Failed`
 **for the very same run** (#499).
 
-**The first repair was `SKIP_RETURN_CODE 4`, and it opened #1128.** Catch2's exit code
-IS its failed-assertion count (clamped at 255), so a case failing exactly four
-assertions exits 4 and is scored *skipped* — a genuinely failing test reported inside
-`100% tests passed`, in all five binaries. **The repair for one state collapse was the
-site of the next, and it landed inside the mechanism chosen to prevent state collapse.**
+**The repair is `SKIP_RETURN_CODE 4`, and on Catch2 3.6.0 it opened #1128.** The exit
+code was then the failed-assertion count (clamped at 255), so a case failing exactly
+four assertions exited 4 and was scored *skipped* — a genuinely failing test reported
+inside `100% tests passed`, in all five binaries. **The repair for one state collapse was
+the site of the next, and it landed inside the mechanism chosen to prevent state
+collapse.** No other status was free to move the signal to: every value in 1..255 was
+reachable as a count, and moving 4 to 77 only relocated the collision to a case failing
+77 assertions — rarer, therefore quieter, the wrong direction for a false GREEN.
 
-**That is still what the tree carries, and it is a defect we could not close rather
-than a decision.** Every alternative was measured and every one is worse. Three
-channels, all closed — the argument is below, and the fix is a change of MECHANISM,
-tracked as open work at the end of this file. Do not read `catch-skip-return-code`'s
-green as the property being sound; it keeps the tree consistent with the least-bad
-option. `catch-skip-exit-collision` is the reader that will say when a premise moves.
+**Catch2 3.7.1 closed it from the other side, and the property is now exact.** Catch2
+standardised its exit codes, and since 3.9.0 they are Session API constants in
+`catch2/catch_session.hpp`: a run whose every case skipped exits **4**
+(`AllTestsSkippedExitCode`), ANY assertion failure exits **42** (`TestFailureExitCode`)
+whatever the count, a run that ran nothing exits 2. So 4 means skipped-and-nothing-failed,
+and a case that skips one `SECTION` and fails four assertions in another exits 42 and is
+scored failed. Measured on 3.16.1 through the canary: every skip-only shape exits 4,
+and one failure, four, three hundred and skip-beside-four-failures all exit 42.
 
-- **Channel one, the exit status, is fully occupied.** Every value in 1..255 is
-  reachable as an assertion count and 0 is success, so there is no free code to move
-  the skip signal to. Moving 4 to 77 relocates the collision to a case failing 77
-  assertions — rarer, therefore quieter, and rarity is the wrong direction for a false
-  GREEN.
-- **Channel two, the output, is shared with the SUBJECT.** `SKIP_REGULAR_EXPRESSION` is
+- **The EXACT pin is part of the rule.** The contract is a property of the Catch2
+  BUILD, and `CPMAddPackage`'s `find_package` takes any version-COMPATIBLE 3.x a machine
+  has installed: it took Fedora's 3.13 over the 3.6.0 the tree named, and would as
+  readily take an older 3.x where the collision returns, with no line of the tree
+  changed. So the top-level CMakeLists names one release with `FIND_PACKAGE_ARGUMENTS
+  "EXACT"`, and a bump is a deliberate edit.
+- **`catch-skip-exit-contract` is the reader.** It runs every shape of
+  `src/tests/CatchSkipCanary.cpp` in its own process against the Catch2 actually linked
+  and asserts the contract: skip-only shapes exit 4, every failing shape exits ONE value
+  that is neither 0 nor 4, a passing control exits 0. The canary `static_assert`s the 4
+  against `AllTestsSkippedExitCode` as well. A red there is a discovery about the linked
+  Catch2, never a reason to edit the check; `catch-skip-return-code`'s green says only
+  that every registration carries the property.
+
+What the 3.6.0 investigation measured about the other channels is still true, and is
+why the mechanism is the exit code and never a pattern:
+
+- **The output is shared with the SUBJECT.** `SKIP_REGULAR_EXPRESSION` is
   a substring search over the case's ENTIRE output — names, `INFO` messages,
   stringified expressions — none of which this project controls. A case that only
   **fails**, carrying the literal summary text in a message, is scored SKIPPED.
@@ -2364,8 +2381,8 @@ option. `catch-skip-exit-collision` is the reader that will say when a premise m
   into every failing test scoring as skipped, silently, at exit zero.** That is the
   most dangerous shape found in this whole investigation: worse than the defect it was
   repairing, and invisible to every check and every Linux gate.
-- **Channel three, composing them, does not exist.** `FAIL_REGULAR_EXPRESSION` does NOT
-  outrank `SKIP_RETURN_CODE` — measured; with both set a four-failure case is still
+- **Composing them does not exist.** `FAIL_REGULAR_EXPRESSION` does NOT outrank
+  `SKIP_RETURN_CODE` — measured on 3.6.0; with both set a four-failure case was still
   `***Skipped`. That was the one repair needing no new mechanism and no new process.
 - **Adding shapes cannot make a pattern safe**, and this is the argument that decides
   it rather than the constraint table. A decoy carrying the pattern's TAIL refutes a
@@ -2377,8 +2394,8 @@ option. `catch-skip-exit-collision` is the reader that will say when a premise m
   and CMake has **no POSIX character classes at all** — `[[:digit:]]` matches nothing,
   parsing as a literal character set.
 
-- **The SUMMARY line, never the `SKIPPED:` marker**, and the difference is the whole
-  design. Measured over nine case shapes: a case that skips one `SECTION` and fails
+- **Were a pattern ever needed: the SUMMARY line, never the `SKIPPED:` marker.**
+  Measured over nine case shapes: a case that skips one `SECTION` and fails
   another **prints the marker and fails**, so keying on the marker scores it skipped —
   which is *wider* than #1128, hiding any number of failures in a case that also skips
   rather than exactly four. Catch2 already gets the verdict right there, printing
@@ -2405,19 +2422,20 @@ option. `catch-skip-exit-collision` is the reader that will say when a premise m
   that ever carries a pattern on that command line must be checked against
   `& | < > ^ ( ) % " !` by a TEXT check, since CI is otherwise the first reader.
 - **Not `WILL_FAIL`, measured.** A canary that must be seen to fail is the obvious
-  reader for "does a four-failure case still fail", and it does not work: under the old
-  mechanism that case is scored **Skipped**, and ctest does not fail a skipped test
+  reader for "does a four-failure case still fail", and it does not work: under 3.6.0's
+  exit codes that case is scored **Skipped**, and ctest does not fail a skipped test
   carrying `WILL_FAIL` — the run reports `100% tests passed`. **The canary would be
-  green under exactly the defect it exists to catch.** `catch-skip-exit-collision` runs the
-  binary and reads its output instead, which is also the only thing in the tree that
-  can see a REPORTER change: a text scan over CMakeLists cannot.
+  green under exactly the defect it exists to catch.** `catch-skip-exit-contract` runs
+  the binary and reads what each shape EXITS instead, which is also the only thing in
+  the tree that can see the linked Catch2 change: a text scan over CMakeLists cannot.
 
 - **Measured, not inferred** — and this is the #499 measurement, kept as the record of
   how the false RED was established rather than as the current mechanism. One forced
   skip: `test cases: 1 | 1 skipped` with `BINARY EXIT: 4`, ctest `***Failed`; after
   `PROPERTIES SKIP_RETURN_CODE 4`, `***Skipped` and `100% tests passed`. **That last
   reading is exactly what #1128 turned out to mean for a case failing four
-  assertions**, which is why the property is gone.
+  assertions** on 3.6.0, which is why the property is only as sound as the exit
+  contract under it, and why that contract has a reader and a pinned Catch2.
 - **It is a false RED, which is the insidious direction.** Essentially every `SKIP`
   site in this tree is environment-conditional — a loopback bind, an IPv6 stack, a
   symlink, root, an MSVC-family driver, `AvailableCodecs().size() < 2` — so they fire
@@ -2477,8 +2495,8 @@ not be arranged reports a pass for a property nothing established (#685).
 **`SUCCEED` is right when the case RAN and there was nothing to assert. It is wrong when
 the case could not run.** That is the whole distinction, and `SKIP("reason")` is the
 whole fix — it exits 4, and every `catch_discover_tests` registration carries
-`SKIP_RETURN_CODE 4` so ctest scores it as skipped. That mechanism is known broken in
-the other direction (#1128, above); it is still the least-bad option available.
+`SKIP_RETURN_CODE 4` so ctest scores it as skipped. Under the pinned Catch2 that
+mechanism is exact; #1128, above, is the 3.6.0 exit code under which it was not.
 
 - **It fires where coverage is already thinnest.** All twenty-one sites converted for
   #685 were environment-conditional: no loopback listener, no IPv6 stack, no symlink
@@ -2569,12 +2587,13 @@ the reasons are different:
 - **The count** cannot see a crash at all. Measured: a truncated JUnit document
   still carries `failures="0" errors="0"` on the elements it did emit, and the
   console reporter prints no summary line whatsoever.
-- **The exit status** collides with itself. **Catch2 spends its exit status on
-  the failure count**, clamped at 255 — the same fact that gives #1128 its
-  `SKIP_RETURN_CODE 4` collision — so a run killed by SIGSEGV (128 + 11 = 139)
-  and a run with 139 failing assertions are *the same number*. And a short run
-  can exit **0**: measured in #1211 across six runs, exits `0 / 139 / 0 / 0 /
-  139 / 139` against element counts `551 / 507 / 551 / 551 / 518 / 518`.
+- **The exit status** cannot say the run was whole. On Catch2 3.6.0 it was the
+  failure count, clamped at 255 — the same fact that gave #1128 its
+  `SKIP_RETURN_CODE 4` collision — so a run killed by SIGSEGV (128 + 11 = 139) and a
+  run with 139 failing assertions were *the same number*; since 3.7.1 any failure
+  exits 42, which separates those two and nothing else. A short run can exit **0**:
+  measured in #1211 across six runs, exits `0 / 139 / 0 / 0 / 139 / 139` against
+  element counts `551 / 507 / 551 / 551 / 518 / 518`.
 - **Completeness** is what separates them, so it is asked FIRST and the status
   only refines it. It is read from the report's own terminator — `</testsuites>`
   for JUnit, one of `All tests passed`, a `test cases:` block or `No tests ran`
@@ -3075,13 +3094,3 @@ passed.
   does not judge whether a phrase is the right tripwire. Marked `untriaged:` and not
   `none:`, and `ctest -R rulebook-tripwires` prints the count against this issue on
   every run.
-
-- **[#1152](https://github.com/LASTRADA-Software/fastcached/issues/1152)** — ctest
-  cannot be told about a Catch2 skip through any property `catch_discover_tests`
-  offers, so `SKIP_RETURN_CODE 4` stays and a four-failure case is still scored
-  *skipped*. Three channels measured and closed (above); the fix is a launcher that
-  NORMALISES the exit code, which needs its Windows per-test process cost measured
-  before it is implemented — this host already has a contention-sensitive `hygiene`
-  class, and the mechanism adds ~3500 spawns. `src/tests/CatchSkipCanary.cpp` carries
-  the shapes it must survive; `catch-skip-exit-collision` asserts the premises so this
-  entry cannot rot into a false rule.

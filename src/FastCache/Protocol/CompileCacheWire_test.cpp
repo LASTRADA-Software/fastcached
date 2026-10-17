@@ -1803,10 +1803,10 @@ TEST_CASE("An absent runtime fact and a zero one survive as different answers", 
     REQUIRE(loud.has_value());
 
     // **`REQUIRE` and not `CHECK`, and the reason is the harness rather than the
-    // subject.** Catch2's exit code IS its failed-assertion count, and this project
-    // registers `SKIP_RETURN_CODE 4`, so a case that fails exactly FOUR assertions is
-    // scored SKIPPED rather than failed -- #1128, whose repair is a change of mechanism
-    // tracked as #1152. These four fail together under exactly the defect the case
+    // subject.** On Catch2 3.6.0 the exit code WAS the failed-assertion count, and this
+    // project registers `SKIP_RETURN_CODE 4`, so a case that failed exactly FOUR
+    // assertions was scored SKIPPED rather than failed -- #1128, closed by Catch2 3.7.1's
+    // fixed failure code. These four fail together under exactly the defect the case
     // exists to catch, so as `CHECK`s the case reported `***Skipped` while genuinely
     // red: measured, during the mutation run for this change. `REQUIRE` aborts at the
     // first failure, so the case can only ever report ONE -- which is deterministic and

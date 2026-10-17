@@ -704,8 +704,8 @@ TEST_CASE("A follower whose application cannot read a leader's snapshot refuses 
         //
         // A REQUIRE: a refusal decided before the leader was heard fails this and the two
         // below it together, and with the covered section that was exactly four -- which a
-        // Catch2 exit status collides with `SKIP_RETURN_CODE 4` (#1152). Measured, on this
-        // case, by moving the refusal above the leader being heard.
+        // Catch2 3.6.0 exit status collided with `SKIP_RETURN_CODE 4` (#1128). Measured, on
+        // this case, by moving the refusal above the leader being heard.
         REQUIRE(node.KnownLeader() == std::optional<NodeId> { "n1" });
         CHECK(node.CurrentRole() == Role::Follower);
         CHECK(MessagesOfType<PreVoteRequest>(node.Tick(At(ElectionMin.count() + 5))).empty());

@@ -942,8 +942,8 @@ def report(failures, notes, inconclusive, verdict):
     `SKIP_RETURN_CODE` takes exactly one value -- 77 here, already meaning *a
     prerequisite is missing*. Green would be worse: it would read as *the bound is
     proven* on precisely the loaded runs where nothing was proven. So the two share a
-    status and the OUTPUT is what tells them apart, which is the same
-    channel-is-fully-occupied problem as #1152 and wants the same kind of fix.
+    status and the OUTPUT is what tells them apart: one status cannot carry two
+    meanings, the limit #1128 ran into on the Catch2 side.
     """
     for note in notes:
         print("  " + note)

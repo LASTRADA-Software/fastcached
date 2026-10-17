@@ -876,7 +876,7 @@ TEST_CASE("The MSI's node registration installs with no property, never with a t
         auto const serviceRefusal = StartupPolicyRejection(Testing::Unwrap(started));
         INFO(serviceRefusal.value_or(std::string {}));
         // REQUIRE: one refusal per shape would fail as many assertions as there are shapes, and
-        // four is the exit code ctest reads as a skip (#1152).
+        // on Catch2 3.6.0 four was the exit code ctest read as a skip (#1128).
         REQUIRE_FALSE(serviceRefusal.has_value());
     }
 }

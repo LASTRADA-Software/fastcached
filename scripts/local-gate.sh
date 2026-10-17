@@ -978,10 +978,10 @@ gate_lock_run() {
 # The tests a leg did not run, BY NAME, read out of that leg's own ctest output.
 #
 # `100% tests passed, 0 tests failed out of 3543` was the only thing a gate log
-# said about tests, and under #1128 it is precisely the line that cannot be
-# trusted: a Catch2 case failing exactly four assertions exits 4, every
-# registration reads exit 4 as a skip, so ctest scores it `Skipped` and still
-# prints that. The correct reading is therefore *check the skipped list* -- and
+# said about tests, and under #1128 it was precisely the line that could not be
+# trusted: on Catch2 3.6.0 a case failing exactly four assertions exited 4, every
+# registration reads exit 4 as a skip, so ctest scored it `Skipped` and still
+# printed that. The correct reading was therefore *check the skipped list* -- and
 # the gate carried no skip data at all, so that instruction could not be carried
 # out by anybody, and a lane believing it had checked had not (#1130).
 #
@@ -5060,8 +5060,9 @@ run_preset() {
     # because the two are one statement -- a scope printed anywhere else is a line
     # nobody reads beside the figure it qualifies.
     echo "== $preset: $(target_set_report "$build_dir")"
-    # #1130: the totals line above is the one #1128 makes untrustworthy, so the
-    # skipped NAMES go in the log beside it, before the log this read is deleted.
+    # #1130: the totals line above is the one #1128 made untrustworthy, and a total
+    # never says WHICH, so the skipped NAMES go in the log beside it, before the
+    # log this read is deleted.
     skip_report "$preset" "$build_dir" < "$log"
 
     # #1159, and on the GREEN path is where it earns its place: a leg that ctest

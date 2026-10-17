@@ -331,10 +331,20 @@ if(FASTCACHED_BUILD_TESTS)
     # which /WX turns into a failure in code this project does not own. The find_package route
     # was already system (an IMPORTED target's include directories are), so this makes the two
     # routes agree rather than adding a special case.
+    #
+    # EXACT, because the test VERDICT depends on this version, not only the build. Every
+    # registration carries `SKIP_RETURN_CODE 4`, which is exact only under the exit codes Catch2
+    # standardised in 3.7.1 (a skip-only run exits 4, any failure 42); before that the exit code
+    # WAS the failed-assertion count and a case failing four assertions scored as skipped (#1128).
+    # `find_package(Catch2 <v>)` alone accepts any later 3.x -- it took Fedora's 3.13 over the 3.6
+    # this said, so one machine's gate judged with another Catch2 than CI's -- and nothing about
+    # that acceptance would stop at a version where the contract moved again. A distribution's
+    # Catch2 is still used when it IS this version; any other is passed over for the fetch.
     CPMAddPackage(
         NAME Catch2
         GITHUB_REPOSITORY catchorg/Catch2
-        VERSION 3.6.0
+        VERSION 3.16.1
+        FIND_PACKAGE_ARGUMENTS "EXACT"
         SYSTEM YES
     )
 
@@ -620,30 +630,29 @@ if(FASTCACHED_BUILD_TESTS)
     enable_testing()
 endif()
 
-# ## Why ctest still learns a Catch2 skip from `SKIP_RETURN_CODE 4`, and why that is
-# ## KNOWN BROKEN (#1128)
+# ## Why ctest learns a Catch2 skip from `SKIP_RETURN_CODE 4`, and why the Catch2 pin is EXACT
 #
-# Every `catch_discover_tests` registration in this tree carries `SKIP_RETURN_CODE 4`,
-# and **that is a defect we could not close rather than a decision.** Read this before
-# concluding it was never noticed, and read `.agent/rules/testing.md` before attempting
-# either of the two obvious repairs, both of which are measured dead ends.
+# Every `catch_discover_tests` registration in this tree carries `SKIP_RETURN_CODE 4`, and
+# under the Catch2 this tree pins that is EXACT. Catch2 3.7.1 standardised its exit codes,
+# and 3.9.0 made them Session API constants (`catch2/catch_session.hpp`): a run whose every
+# case skipped exits 4 (`AllTestsSkippedExitCode`), ANY assertion failure exits 42
+# (`TestFailureExitCode`) whatever the count, and a run that ran nothing exits 2. So 4 means
+# skipped-and-nothing-failed, and a case that skips one SECTION and fails another exits 42
+# and is scored failed. `catch-skip-exit-contract` runs those shapes on every build.
 #
-# **The defect.** Catch2's exit code IS its failed-assertion count, clamped at 255
-# (`catch_session.cpp`). So a case failing exactly four assertions exits 4 and ctest
-# scores it *skipped*. Measured on today's tree, through real ctest:
+# **Before 3.7.1 it was KNOWN BROKEN (#1128), and the EXACT pin is what keeps it fixed.**
+# Catch2's exit code was then its failed-assertion count, clamped at 255, so a case failing
+# exactly four assertions exited 4 and ctest scored it *skipped* -- measured through real
+# ctest on 3.6.0, inside `100% tests passed`, in all five Catch2 binaries; and no other
+# status was free to move the signal to, since every value in 1..255 was reachable as a
+# count. A version-COMPATIBLE `find_package` takes any 3.x a machine has installed -- it
+# took Fedora's 3.13 -- and an older one brings the collision back with no line of this tree
+# changed. The exit contract is a property of the Catch2 BUILD, so the pin names one.
 #
-#     four failing assertions        ***Skipped     <- a genuinely failing test
-#     skip in one SECTION + 4 fails  ***Skipped     <- and this one too
+# What the 3.6.0 investigation measured about the other channels is still true, and it is
+# why the mechanism is the exit code and never a pattern:
 #
-# Both report inside `100% tests passed`, in all five Catch2 binaries.
-#
-# **Channel one, the exit status, is fully occupied.** Every status in 1..255 is
-# reachable as an assertion count and 0 is success, so there is no free value to move
-# the skip signal to. Moving 4 to 77 relocates the collision to a case failing 77
-# assertions -- rarer, therefore quieter, and rarity is the wrong direction for a false
-# GREEN.
-#
-# **Channel two, the output, is shared with the subject.** `SKIP_REGULAR_EXPRESSION` is
+# **The output is shared with the subject.** `SKIP_REGULAR_EXPRESSION` is
 # a substring search over the case's ENTIRE output -- names, `INFO` messages,
 # stringified expressions -- none of which this project controls. A case that only
 # FAILS, carrying the literal summary text in a message, is scored SKIPPED. Closing that
@@ -655,15 +664,14 @@ endif()
 #     and an empty `SKIP_REGULAR_EXPRESSION` matches every line, so the remedy degrades
 #     into every failing test scoring as skipped. Silently, at exit zero.
 #
-# **Channel three, composing them, does not exist.** `FAIL_REGULAR_EXPRESSION` does NOT
-# outrank `SKIP_RETURN_CODE` -- measured; with both set, a four-failure case is still
-# `***Skipped`. That was the one repair needing no new mechanism, and it is not there.
+# **Composing them does not exist.** `FAIL_REGULAR_EXPRESSION` does NOT outrank
+# `SKIP_RETURN_CODE` -- measured; with both set, a four-failure case on 3.6.0 was still
+# `***Skipped`.
 #
-# So the property cannot be expressed by any property ctest offers on this registration,
-# and the fix is a different MECHANISM. That work is tracked, open, and linked from
-# `.agent/rules/testing.md`; `src/tests/CatchSkipCanary.cpp` carries the shapes any
-# replacement must survive, and `catch-skip-exit-collision` asserts the facts this
-# argument rests on so the conclusion cannot rot silently.
+# `src/tests/CatchSkipCanary.cpp` carries the shapes, and `catch-skip-exit-contract` runs
+# them and asserts the contract `SKIP_RETURN_CODE 4` rests on, so a Catch2 that changes its
+# exit codes again is a red rather than a silent false GREEN. The whole argument is in
+# `.agent/rules/testing.md`.
 # ----------------------------------------------------------------------------
 # Sibling libraries (no dependency on FastCache).
 

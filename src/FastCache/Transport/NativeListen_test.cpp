@@ -698,9 +698,10 @@ TEST_CASE("Every OS error an accept can answer reaches the accept loop as the di
     // past a failed connection, retries a tick, backs off, or stops.
     //
     // ONE assertion over every row, never one per row: rows sharing a code fail together when that
-    // code's disposition moves, four of them share one, and ctest scores a Catch2 exit of exactly 4
-    // as Skipped (#1152) -- so a per-row CHECK read "100% tests passed" for the very regression this
-    // case exists for (`ConnReset -> Exhausted`, measured). At most two assertions fail here.
+    // code's disposition moves, four of them share one, and on Catch2 3.6.0 ctest scored an exit of
+    // exactly 4 as Skipped (#1128) -- so a per-row CHECK read "100% tests passed" for the very
+    // regression this case exists for (`ConnReset -> Exhausted`, measured). At most two assertions
+    // fail here.
     std::vector<std::string> mismatches;
     for (auto const& expected: ExpectedAcceptErrors)
     {

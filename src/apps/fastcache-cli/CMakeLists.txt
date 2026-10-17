@@ -139,11 +139,10 @@ if(FASTCACHED_BUILD_TESTS)
     target_compile_definitions(fastcache-cli-tests PRIVATE FASTCACHE_CLI_VERSION="${FASTCACHED_VERSION_STRING}")
     include(Catch)
     # `SKIP_RETURN_CODE 4` tells ctest a Catch2 skip is a skip and not a failure
-    # (#499) -- and it is KNOWN BROKEN in the other direction: Catch2's exit code IS
-    # its failed-assertion count, so a case failing exactly four assertions is scored
-    # *skipped* (#1128). It stays because all three alternative channels were measured
-    # and are worse; the argument is at the top of the top-level CMakeLists and the
-    # fix is #1152. `catch-skip-return-code` enforces the property, and its green does
-    # not mean the property is sound.
+    # (#499), and under the Catch2 the top-level CMakeLists pins EXACTLY it is exact: a
+    # run whose every case skipped exits 4 and any failure exits 42, whatever the
+    # count. On 3.6.0 the exit code was the failure count, and a case failing four
+    # assertions was scored *skipped* (#1128). `catch-skip-return-code` requires the
+    # property, and `catch-skip-exit-contract` that it still means what it says.
     catch_discover_tests(fastcache-cli-tests PROPERTIES SKIP_RETURN_CODE 4 ENVIRONMENT_MODIFICATION "${FASTCACHED_ERROR_DIALOG_ENVIRONMENT}")
 endif()

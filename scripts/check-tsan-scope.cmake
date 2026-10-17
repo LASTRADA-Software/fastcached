@@ -343,7 +343,18 @@ endif()
 # bumps Catch2 the comparison becomes `x > x`, which is false forever: the
 # tripwire silently stops existing, which is the failure mode of every other
 # thing in this file.
-set(FastCachedCatch2TagLabelWatermark "3.6.0")
+#
+# **Raised to 3.16.1 with the scope left a tag expression, on purpose.** The bump
+# from 3.6.0 was made for Catch2's standardised exit codes (3.7.1: a skip-only run
+# exits 4 and any failure 42), which is what makes `SKIP_RETURN_CODE 4` exact, and
+# it fired this tripwire as designed. The half that was only SOURCED is now
+# MEASURED: the 3.16.1 source CPM fetched carries `ADD_TAGS_AS_LABELS` 5 times in
+# `extras/Catch.cmake`, beside `catch_discover_tests`' 11, and the release notes
+# place it in 3.8.0. So the move to `ctest -L` is possible now -- and it is a change
+# to `scripts/tsan-gate.sh` that has to carry the empty-scope refusal with it, which
+# is its own change rather than a rider on a dependency bump. Until somebody makes
+# it, the next bump past this version asks again.
+set(FastCachedCatch2TagLabelWatermark "3.16.1")
 
 set(FastCachedProjectCMakeLists "${FASTCACHED_SOURCE_DIR}/CMakeLists.txt")
 

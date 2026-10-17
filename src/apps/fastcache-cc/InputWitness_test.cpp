@@ -450,8 +450,9 @@ TEST_CASE("A value that is not a verdict answers its own row and never the neare
 {
     auto const& row = RowOf(InputStability::Last);
     // A REQUIRE: a `RowOf` that clamps to the nearest row answers `Unwitnessed`'s, which fails
-    // exactly four of the checks below, and a case failing exactly four assertions exits 4, which
-    // ctest scores as SKIPPED (`SKIP_RETURN_CODE 4`, #1152). Stopping here makes that one failure.
+    // exactly four of the checks below, and on Catch2 3.6.0 a case failing exactly four assertions
+    // exited 4, which ctest scored as SKIPPED (`SKIP_RETURN_CODE 4`, #1128). Stopping here makes
+    // that one failure.
     REQUIRE(&row == &UnknownStabilityRow);
     CHECK(row.stability == InputStability::Last);
     CHECK(row.store == StoreObject::No);

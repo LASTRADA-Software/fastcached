@@ -1121,8 +1121,8 @@ TEST_CASE("A node restarted after compacting holds in its application what its s
     // not the entries above it, which only a commit can bring back.
     //
     // The size is a REQUIRE: a missed restore fails every check below together, and
-    // exactly four of them used to -- which a Catch2 exit status collides with
-    // `SKIP_RETURN_CODE 4`, scoring the neutered fix SKIPPED rather than failed (#1152).
+    // exactly four of them used to -- which a Catch2 3.6.0 exit status collided with
+    // `SKIP_RETURN_CODE 4`, scoring the neutered fix SKIPPED rather than failed (#1128).
     // Measured on this case before this line was a REQUIRE.
     auto const covered = static_cast<std::size_t>(
         std::ranges::count_if(before, [snapshotIndex](AppliedEntry const& entry) { return entry.index <= snapshotIndex; }));

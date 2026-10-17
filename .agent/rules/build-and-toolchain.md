@@ -2449,8 +2449,8 @@ into the defect while sounding authoritative.
   different questions and only the second one found this.
 - **Say what the rule does NOT cover, in the refusal itself.** The same message now
   states that the script-driven `SKIP_RETURN_CODE 77` registrations are unaffected —
-  a shell script chooses its own exit code and a Catch2 binary spends its status on the
-  failed-assertion count. Without that clause the next reader over-applies the refusal
+  a shell script chooses its own exit code and a Catch2 binary does not. Without that
+  clause the next reader over-applies the refusal
   and deletes a property that is load-bearing somewhere else, which is the mirror
   failure and just as expensive.
 
