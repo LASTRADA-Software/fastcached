@@ -148,6 +148,25 @@ struct KeyInputs
                                                       std::string_view buildTree,
                                                       PathCanon::PathTransform const& resolve = {});
 
+/// The preprocessed text the key hashes: the probe's output with every line marker's PATH
+/// removed and its line number and flags kept.
+///
+/// The probe keeps its markers (`-E`, `/E`) because they carry the line structure: without
+/// them a comment inserted above a function left the text byte-identical while
+/// `std::source_location`, `__builtin_LINE` and every `-g` line table moved, so the edited
+/// file was served the object built before the edit. The marker's path is what made it
+/// unportable -- it is the checkout's absolute path -- and nothing in the object depends on
+/// it that a key could see: `__FILE__` is already expanded in the text, and a file name the
+/// compiler records after preprocessing (`source_location::file_name`, debug records) is
+/// root binding's and the prefix maps' to answer.
+///
+/// Both spellings are recognised: GNU's `# <line> "<path>" <flags>` and MSVC's
+/// `#line <line> "<path>"`. A line that is not a marker of either shape -- a `#pragma`, an
+/// assembler comment -- is kept verbatim, as is every other byte.
+/// @param text The probe's stdout.
+/// @return The text with each marker reduced to its line number and flags.
+[[nodiscard]] std::string KeyedPreprocessedText(std::string_view text);
+
 /// `RelativizeArgs` over a whole layout, its dependency root included: a path under
 /// `layout.dependencyRoot` becomes a `<DEPROOT>` token, so an include directory into a
 /// per-user dependency cache stops keeping the user's home in every key.

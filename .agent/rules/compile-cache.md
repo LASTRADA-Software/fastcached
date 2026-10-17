@@ -15,22 +15,29 @@ rule below has already been at least one of the two.
 
 ## The five rules the end-to-end tests assert
 
-<!-- agent-tripwire: Preprocess with line markers suppressed -->
+<!-- agent-tripwire: Preprocess KEEPING line markers; the key keeps their line numbers and drops their paths -->
 
 `fastcached` and `fastcache-cc` are both installed. Three things the launcher's
 cache key depends on, each of which has already caused a silent hit-rate
 collapse or a mis-serve and is now covered by regression tests:
 
-- **Preprocessing must suppress line markers** (`/EP` on MSVC, `-E -P` on GNU).
-  A `# 1 "/abs/path.cpp"` marker embeds the checkout path in the hashed text.
-  On MSVC that is `/EP` **alone**: `/EP` and `/P` are alternatives, not modifiers
-  — `/EP` preprocesses to stdout, `/P` to a `<base>.i` file, and MSVC documents
-  the pair as "to the file, without `#line`". Passing both left the launcher
-  hashing an empty stdout, so a Windows key carried nothing from the source and
-  an edited file was answered with the object built from the previous revision.
-  That is a wrong build rather than a cold cache, and direct mode hid it, since
-  its manifest hashes the source's own bytes — hence the e2e case that edits a
-  source with `FASTCACHE_NO_DIRECT=1` and requires a MISS.
+- **Preprocessing KEEPS line markers (`/E` on MSVC, `-E` on GNU), and the key keeps
+  their line numbers while dropping their paths** (`KeyedPreprocessedText`). A
+  `# 1 "/abs/path.cpp"` marker embeds the checkout path, which is why the probe used to
+  suppress markers outright (`/EP`, `-E -P`) -- and that threw the LINE STRUCTURE away
+  with the path: `-P` collapses blank and comment lines, so a comment inserted above a
+  function left the hashed text byte-identical while `std::source_location`,
+  `__builtin_LINE` and every `-g` line table moved. Measured end to end: the edited file
+  got a HIT whose function reported line 2 where the source said 5 (`objkey-v9` fixed it).
+  The path is safe to drop because nothing a key could see depends on it: `__FILE__` is
+  already expanded in the text, and a name recorded after preprocessing is root binding's
+  and the prefix maps' to answer.
+  - On MSVC never `/P` beside it: `/P` preprocesses to a `<base>.i` file rather than
+    stdout, and `/EP /P` left the launcher hashing an empty stdout, so a Windows key
+    carried nothing from the source and an edited file was answered with the object
+    built from the previous revision. Direct mode hid it, since its manifest hashes the
+    source's own bytes — hence the e2e case that edits a source with
+    `FASTCACHE_NO_DIRECT=1` and requires a MISS.
 - **`/` introduces an option only on Windows.** On POSIX it starts an absolute
   path, and treating it as an option leaves absolute paths unrelativized.
 - **Only machine-independent dependency paths may be hashed.** The dependency set
@@ -338,8 +345,8 @@ same on both — the same defect with no MSVC anywhere near it.
 
 <!-- agent-tripwire: Only machine-independent dependency paths are hashed, and a path is classified by what it *resolves to*, never by its spelling -->
 
-- **A key determines two artefacts, so it must be a function of both.** Preprocessing
-  suppresses line markers (`-E -P`, `/EP`) so a checkout path never reaches the key —
+- **A key determines two artefacts, so it must be a function of both.** The keyed text
+  carries no checkout path (each line marker is reduced to its line number) —
   which is what makes a key portable, and equally what made it *invariant under a header
   move*. Move a header without changing a byte of it and the token stream is identical:
   the object is still correct and was served, while the depfile, which is nothing but
@@ -696,7 +703,9 @@ same on both — the same defect with no MSVC anywhere near it.
 
     **The channel follows the FLAG, not the driver.** Both drivers put the notes on
     stdout when compiling and move them to stderr under `/EP`, where stdout carries the
-    preprocessed text and a note on it would corrupt that text. The three sites said
+    preprocessed text and a note on it would corrupt that text. The probe has since moved
+    to `/E` (`objkey-v9`), whose channel nobody here has MEASURED; it decides nothing,
+    because the probe reads notes from both streams and splits stdout unconditionally. The three sites said
     "`cl` on stderr"; #700 and the #821 review said "`cl` on stdout"; each was half
     right and neither had the rule. That is what makes a claim restated in three places
     dangerous — none of the three was placed to notice the question had a second

@@ -70,6 +70,12 @@ preprocess-only run moves the notes (clang-cl puts them on stderr under `/EP`,
 so that they do not corrupt the preprocessed stdout), so the probe splits stdout
 unconditionally and reads notes from both streams rather than guessing.
 
+The probe keeps its line markers (`-E`, `/E`) and the key keeps their line numbers
+while dropping their paths. Suppressing the markers (`-E -P`, `/EP`) collapsed blank
+and comment lines, so a comment inserted above a function kept the key while
+`std::source_location`, `__builtin_LINE` and the `-g` line tables moved, and the
+edited file was served the object built before the edit.
+
 Version-suffixed (`g++-14`, `clang-18`) and `.exe` forms are recognised. Any
 other `argv[0]` is treated as unknown and passed straight through uncached.
 

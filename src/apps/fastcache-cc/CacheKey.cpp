@@ -214,6 +214,73 @@ std::optional<std::string> UnkeyableArgument(std::span<std::string const> args, 
     return std::nullopt;
 }
 
+namespace
+{
+    /// The marker a line opens with, reduced to what the key keeps, or nothing when the
+    /// line is not a marker.
+    /// @param line One line without its terminator.
+    /// @return The line as written up to its line number, then what followed the quoted
+    ///         path, or nullopt.
+    [[nodiscard]] std::optional<std::string> ReducedMarker(std::string_view line)
+    {
+        auto rest = line;
+        if (!rest.starts_with('#'))
+            return std::nullopt;
+        rest.remove_prefix(1);
+        auto const skipBlanks = [&rest] {
+            while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t'))
+                rest.remove_prefix(1);
+        };
+        skipBlanks();
+        if (rest.starts_with("line") && rest.size() > 4 && (rest[4] == ' ' || rest[4] == '\t'))
+        {
+            rest.remove_prefix(4);
+            skipBlanks();
+        }
+        auto const digits = rest.substr(0, rest.find_first_not_of("0123456789"));
+        if (digits.empty())
+            return std::nullopt;
+        rest.remove_prefix(digits.size());
+        auto const throughLineNumber = line.substr(0, line.size() - rest.size());
+        skipBlanks();
+        if (!rest.starts_with('"'))
+            return std::nullopt;
+        // The path is a C string literal: a backslash escapes the next byte, so `\"` does not
+        // end it, and MSVC doubles every separator (`c:\\src\\a.cpp`).
+        auto at = std::size_t { 1 };
+        while (at < rest.size() && rest[at] != '"')
+            at += rest[at] == '\\' ? 2 : 1;
+        if (at >= rest.size())
+            return std::nullopt;
+        rest.remove_prefix(at + 1);
+        return std::format("{}{}", throughLineNumber, rest);
+    }
+} // namespace
+
+std::string KeyedPreprocessedText(std::string_view text)
+{
+    std::string out;
+    out.reserve(text.size());
+    while (!text.empty())
+    {
+        auto const end = text.find('\n');
+        auto const length = end == std::string_view::npos ? text.size() : end + 1;
+        auto const line = text.substr(0, length);
+        // The terminator (`\n`, or `\r\n`) is kept as written, so only the marker's path moves.
+        auto const terminatorSize = line.ends_with("\r\n") ? 2U : (line.ends_with('\n') ? 1U : 0U);
+        auto const body = line.substr(0, line.size() - terminatorSize);
+        if (auto const reduced = ReducedMarker(body))
+        {
+            out.append(*reduced);
+            out.append(line.substr(body.size()));
+        }
+        else
+            out.append(line);
+        text.remove_prefix(length);
+    }
+    return out;
+}
+
 std::string CacheCompilerId(std::string_view banner, std::string_view targetTriple)
 {
     if (targetTriple.empty())
@@ -343,7 +410,15 @@ std::string ComputeKey(KeyInputs const& inputs)
     // `dependency-root`. Bumped so the two generations never exchange an entry rather than
     // relying on their keys differing, which they do only for units that read a
     // dependency. `manifest-v9` moves with it, in the lock-step ComputeManifestKey records.
-    KeyDigest digest { "objkey-v8" };
+    //
+    // v9 is the line structure. `preprocessed` was `-E -P` / `/EP` output, which collapses
+    // blank and comment lines, so a comment inserted above a function kept the key while
+    // `source_location`, `__builtin_LINE` and the `-g` line tables moved: the edited file was
+    // served the object from before the edit (measured end to end: a HIT whose function
+    // reported line 2 where the source said 5). It is now `KeyedPreprocessedText` over output
+    // that keeps its markers. Every key moves, so the tag moves with them rather than leaving
+    // a v8 cache whose entries no current key can reach to be explained later.
+    KeyDigest digest { "objkey-v9" };
     digest.Field(inputs.compilerId);
     digest.Field(inputs.preprocessed);
     for (auto const& arg: inputs.relativizedArgs)

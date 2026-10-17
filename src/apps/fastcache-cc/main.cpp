@@ -1437,7 +1437,7 @@ class ScopedFile
 /// compile depends on.
 struct SourceProbe
 {
-    std::string preprocessed;                 ///< Preprocessor output, no line markers.
+    std::string preprocessed;                 ///< Preprocessor output, markers reduced to their lines.
     std::vector<std::string> dependencyPaths; ///< Dependencies as the compiler spelled them.
 
     /// Whether the probe's dependency record was READ, as opposed to reporting
@@ -1550,7 +1550,7 @@ struct ProbedDependencies
 
     if (driver.usesDepfile)
     {
-        SourceProbe probe { .preprocessed = std::move(run.out), .dependencyPaths = {} };
+        SourceProbe probe { .preprocessed = Cc::KeyedPreprocessedText(run.out), .dependencyPaths = {} };
         if (probeRequest.empty())
             return probe;
         // Non-empty, not merely present: the writability check above created the
@@ -1597,7 +1597,7 @@ struct ProbedDependencies
     auto const unreadable = split.notePaths.empty() && Cc::CarriesUnreadableIncludeNotes(run.err);
 
     reconciler.DependencyList(split.notePaths);
-    return SourceProbe { .preprocessed = std::move(split.preprocessed),
+    return SourceProbe { .preprocessed = Cc::KeyedPreprocessedText(split.preprocessed),
                          .dependencyPaths = std::move(split.notePaths),
                          .dependenciesUnreadable = unreadable };
 }

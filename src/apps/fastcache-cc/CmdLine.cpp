@@ -46,23 +46,23 @@ namespace
     // the launcher cares about. A new driver is a new row here plus a name
     // pattern below; the parsing logic itself never grows a branch.
 
-    // Both spellings must suppress line markers. `#line` / `# 1 "file"` markers
-    // embed the ABSOLUTE source path, which would make the preprocessed text —
-    // and therefore the cache key — differ between two checkouts of the same
-    // content at different paths, defeating cross-machine sharing entirely.
-    // MSVC: /EP writes to stdout without #line. GNU: -P suppresses markers.
+    // Both spellings KEEP line markers, and the key strips only the paths out of them
+    // (`KeyedPreprocessedText`). A `#line` / `# 1 "file"` marker embeds the ABSOLUTE source
+    // path, which would make the key differ between two checkouts of the same content; but
+    // suppressing the markers outright (`-E -P`, `/EP`) also threw away the LINE STRUCTURE.
+    // `-P` collapses blank and comment lines, so a comment inserted above a function left the
+    // hashed text byte-identical while `std::source_location`, `__builtin_LINE` and every
+    // `-g` line table moved -- measured on g++ and clang++: one key, two different objects,
+    // and the edited file was served the old object. The marker's line number is what keeps
+    // those lines in the key.
     //
-    // `/EP` ALONE, and the absence of `/P` here is the whole point. The two are
-    // not additive: `/EP` preprocesses to stdout, `/P` preprocesses to a FILE, and
-    // MSVC documents the pair as "write the file without #line directives". So
-    // passing both sent the preprocessed text to `<base>.i` and left the launcher
-    // hashing an essentially empty stdout — a key with no content in it at all,
-    // under which an edited source re-fetches the object built from the OLD text.
-    // Direct mode hides it (its manifest hashes the source's bytes), so it showed
-    // up only with FASTCACHE_NO_DIRECT=1, and it dropped a stray `.i` in the
-    // working directory on every probe besides.
-    constexpr std::array<std::string_view, 1> MsvcPreprocess { "/EP" };
-    constexpr std::array<std::string_view, 2> GnuPreprocess { "-E", "-P" };
+    // `/E` and never `/P` beside it. `/P` preprocesses to a FILE rather than stdout, and the
+    // pair `/EP /P` sent the text to `<base>.i` and left the launcher hashing an essentially
+    // empty stdout -- a key with no content in it at all, under which an edited source
+    // re-fetched the object built from the OLD text. Direct mode hid it (its manifest hashes
+    // the source's bytes), so it showed up only with FASTCACHE_NO_DIRECT=1.
+    constexpr std::array<std::string_view, 1> MsvcPreprocess { "/E" };
+    constexpr std::array<std::string_view, 1> GnuPreprocess { "-E" };
 
     /// Preprocess flags for text that is going to be COMPILED elsewhere, which
     /// keep the `#line` markers the key's own probe suppresses.
