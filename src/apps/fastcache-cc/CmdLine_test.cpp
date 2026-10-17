@@ -329,6 +329,39 @@ TEST_CASE("A depfile asked for without -MF is the one the driver writes, so a hi
     CHECK(Parse(msvc).depPath.empty());
 }
 
+TEST_CASE("A compile writing a file beside its object is not cached", "[launcher]")
+{
+    // #1691: a hit restores the object and the depfile, so a side file is missing afterwards
+    // or left over from another build (a `.dwo` the restored skeleton does not match).
+    for (std::string_view const flag: { "-gsplit-dwarf",
+                                        "-gsplit-dwarf=single",
+                                        "--coverage",
+                                        "-ftest-coverage",
+                                        "-ftime-trace",
+                                        "-ftime-trace=out.json",
+                                        "-fstack-usage",
+                                        "-save-temps",
+                                        "-save-temps=obj",
+                                        "-fdump-tree-all",
+                                        "-fsave-optimization-record",
+                                        "-fcallgraph-info",
+                                        "-aux-info" })
+    {
+        INFO(flag);
+        std::vector<std::string> const argv { "g++", std::string { flag }, "-O2", "-c", "a.cpp", "-o", "a.o" };
+        auto const cmd = Parse(argv);
+        CHECK(cmd.sideArtefact);
+        CHECK_FALSE(cmd.parsedOk);
+    }
+    // Controls: flags that change the object but write nothing beside it stay cacheable.
+    for (std::string_view const flag: { "-g", "-gdwarf-5", "-fprofile-arcs", "-fprofile-generate", "-ftrapv" })
+    {
+        INFO(flag);
+        std::vector<std::string> const argv { "g++", std::string { flag }, "-O2", "-c", "a.cpp", "-o", "a.o" };
+        CHECK(Parse(argv).parsedOk);
+    }
+}
+
 TEST_CASE("The end-of-options marker stays with the source, which never travels")
 {
     // CMake's clang-cl rule ends `-c -- $in`. The launcher dropped the source and forwarded

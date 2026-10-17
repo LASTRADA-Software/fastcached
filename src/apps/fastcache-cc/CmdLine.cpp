@@ -625,7 +625,7 @@ namespace
     /// and matches nothing here. It is left out rather than half-matched, because a
     /// row that fires on `-Xclang` alone would un-cache every build that passes any
     /// `-Xclang` flag at all.
-    constexpr std::array<SideArtefactFlag, 19> SideArtefacts { {
+    constexpr std::array<SideArtefactFlag, 29> SideArtefacts { {
         { .spelling = "/interface", .families = DriverFamily::Msvc },
         { .spelling = "-interface", .families = DriverFamily::Msvc },
         { .spelling = "/internalPartition", .families = DriverFamily::Msvc },
@@ -639,6 +639,23 @@ namespace
         { .spelling = "-fmodule-output", .families = DriverFamily::Gnu },
         { .spelling = "-fmodule-mapper", .families = DriverFamily::Gnu },
         { .spelling = "--precompile", .families = DriverFamily::Gnu },
+        // Files the GNU drivers write BESIDE the object, which a hit never restores (#1691):
+        // missing after a hit, or left over from another build -- for `-gsplit-dwarf` a
+        // `.dwo` whose id the restored skeleton does not match, for coverage a `.gcno` gcov
+        // then rejects. Measured: `-gsplit-dwarf` writes `a.dwo`, `--coverage` (and
+        // `-ftest-coverage`) `a.gcno`, clang `-ftime-trace` `a.json`, `-fstack-usage` `a.su`.
+        // `-save-temps`, the `-fdump-*` family, clang's `-fsave-optimization-record`,
+        // `-fcallgraph-info` and `-aux-info` write files by definition.
+        { .spelling = "-gsplit-dwarf", .families = DriverFamily::Gnu },
+        { .spelling = "--coverage", .families = DriverFamily::Gnu },
+        { .spelling = "-ftest-coverage", .families = DriverFamily::Gnu },
+        { .spelling = "-ftime-trace", .families = DriverFamily::Gnu },
+        { .spelling = "-fstack-usage", .families = DriverFamily::Gnu },
+        { .spelling = "-save-temps", .families = DriverFamily::Gnu },
+        { .spelling = "-fdump-", .families = DriverFamily::Gnu },
+        { .spelling = "-fsave-optimization-record", .families = DriverFamily::Gnu },
+        { .spelling = "-fcallgraph-info", .families = DriverFamily::Gnu },
+        { .spelling = "-aux-info", .families = DriverFamily::Gnu },
         // `cl`'s shared-PDB debug formats. The object only REFERS to the PDB, which holds
         // every translation unit's types, so a hit restores an object whose types were
         // never written anywhere. clang-cl reads these spellings as `/Z7` -- its own option
