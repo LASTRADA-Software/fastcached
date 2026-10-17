@@ -362,6 +362,33 @@ TEST_CASE("A compile writing a file beside its object is not cached", "[launcher
     }
 }
 
+TEST_CASE("A compile reading a file the key cannot see is not cached", "[launcher]")
+{
+    // #1692: a profile, a plugin, a specs file or a `-B` tool directory reaches neither the
+    // preprocessed text nor the depfile, so the key could not see it change.
+    for (std::string_view const flag: { "-fprofile-use",
+                                        "-fprofile-use=prof/",
+                                        "-fprofile-sample-use=a.prof",
+                                        "-fauto-profile=a.afdo",
+                                        "-fprofile-instr-use=a.profdata",
+                                        "-fplugin=x.so",
+                                        "-fpass-plugin=p.so",
+                                        "-specs=nano.specs",
+                                        "-B/opt/tools/" })
+    {
+        INFO(flag);
+        std::vector<std::string> const argv { "g++", std::string { flag }, "-O2", "-c", "a.cpp", "-o", "a.o" };
+        CHECK_FALSE(Parse(argv).parsedOk);
+    }
+    // Controls: generating a profile writes it at run time, not at compile time.
+    for (std::string_view const flag: { "-fprofile-generate", "-fprofile-instr-generate", "-fprofile-update=atomic" })
+    {
+        INFO(flag);
+        std::vector<std::string> const argv { "g++", std::string { flag }, "-O2", "-c", "a.cpp", "-o", "a.o" };
+        CHECK(Parse(argv).parsedOk);
+    }
+}
+
 TEST_CASE("The end-of-options marker stays with the source, which never travels")
 {
     // CMake's clang-cl rule ends `-c -- $in`. The launcher dropped the source and forwarded

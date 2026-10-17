@@ -612,8 +612,9 @@ namespace
         std::optional<Flavor> onlyFlavor {};
     };
 
-    /// Flags that make a compile write something BESIDES its object file, and one flag,
-    /// `cl`'s `/Yu`, that makes the object depend on a build artefact the key cannot see.
+    /// Flags that make a compile write something BESIDES its object file, and flags (`cl`'s
+    /// `/Yu`, the GNU profile and plugin flags) that make the object depend on a file the key
+    /// cannot see.
     ///
     /// One row per spelling, exactly as PathValues does it and for the same reason:
     /// an MSVC driver accepts `-` for every option, and a row matched on introducer
@@ -625,7 +626,7 @@ namespace
     /// and matches nothing here. It is left out rather than half-matched, because a
     /// row that fires on `-Xclang` alone would un-cache every build that passes any
     /// `-Xclang` flag at all.
-    constexpr std::array<SideArtefactFlag, 29> SideArtefacts { {
+    constexpr std::array<SideArtefactFlag, 37> SideArtefacts { {
         { .spelling = "/interface", .families = DriverFamily::Msvc },
         { .spelling = "-interface", .families = DriverFamily::Msvc },
         { .spelling = "/internalPartition", .families = DriverFamily::Msvc },
@@ -656,6 +657,20 @@ namespace
         { .spelling = "-fsave-optimization-record", .families = DriverFamily::Gnu },
         { .spelling = "-fcallgraph-info", .families = DriverFamily::Gnu },
         { .spelling = "-aux-info", .families = DriverFamily::Gnu },
+        // Files a GNU compile READS that reach neither the preprocessed text nor the depfile,
+        // so the key cannot see them change (#1692): `/Yu`'s reason, for the GNU drivers.
+        // Measured: `gcc -fprofile-use` with and without its `.gcda` gave identical `-E` text
+        // and depfiles and different objects -- one key. The profile flags (gcc's, the sample
+        // and auto-profile ones, clang's `-fprofile-instr-use`), plugins, `-specs=`, and `-B`,
+        // which swaps the compiler proper under the same driver banner.
+        { .spelling = "-fprofile-use", .families = DriverFamily::Gnu },
+        { .spelling = "-fprofile-sample-use", .families = DriverFamily::Gnu },
+        { .spelling = "-fauto-profile", .families = DriverFamily::Gnu },
+        { .spelling = "-fprofile-instr-use", .families = DriverFamily::Gnu },
+        { .spelling = "-fplugin", .families = DriverFamily::Gnu },
+        { .spelling = "-fpass-plugin", .families = DriverFamily::Gnu },
+        { .spelling = "-specs", .families = DriverFamily::Gnu },
+        { .spelling = "-B", .families = DriverFamily::Gnu },
         // `cl`'s shared-PDB debug formats. The object only REFERS to the PDB, which holds
         // every translation unit's types, so a hit restores an object whose types were
         // never written anywhere. clang-cl reads these spellings as `/Z7` -- its own option
