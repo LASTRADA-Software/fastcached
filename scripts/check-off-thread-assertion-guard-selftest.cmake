@@ -116,6 +116,25 @@ fc_case("bracket in an edge" "${anchor}${bracket}" FALSE "which this reader cann
 # 9. No build.ninja: a SKIP naming why, never a pass.
 fc_case("no build.ninja" "<none>" TRUE "SKIP: off-thread-assertion-guard")
 
+# 10. A distribution's Catch2, linked by its VERSIONED shared-library name. An uncovered binary
+#     on that spelling must be refused by name -- the case that separates "recognised" from
+#     "skipped", since a reader blind to the spelling passes it silently beside a covered anchor.
+set(systemCatch2 "/usr/lib64/libCatch2.so.3.13.0")
+fc_edge(systemBare node-tests Debug "src/apps/node/CMakeFiles/node-tests.dir/b.cpp.o | ${systemCatch2}")
+fc_case("versioned .so, uncovered" "${anchor}${systemBare}" FALSE "node-tests links Catch2 and its 'Debug' link line carries no OffThreadAssertionGuard")
+
+# 11. ...and a tree that reaches Catch2 ONLY that way is checked rather than refused as empty.
+fc_edge(systemAnchor FastCacheTest Debug "src/tests/CMakeFiles/FastCacheTest.dir/a.cpp.o ${guard} | ${systemCatch2}")
+fc_case("versioned .so only" "${systemAnchor}" TRUE "1 of 1 executable(s) linking Catch2 carry the guard")
+
+# 12. The macOS spelling puts the version BEFORE the suffix.
+fc_edge(dylibAnchor FastCacheTest Debug "a.cpp.o ${guard} | /opt/homebrew/lib/libCatch2.3.16.1.dylib")
+fc_case("versioned .dylib" "${dylibAnchor}" TRUE "1 of 1 executable(s) linking Catch2 carry the guard")
+
+# 13. A versioned `libCatch2Main` is still not Catch2: the boundary holds through a version.
+fc_edge(mainVersioned main-only Debug "x.cpp.o | /usr/lib64/libCatch2Main.so.3.13.0")
+fc_case("versioned Catch2Main is not Catch2" "${anchor}${mainVersioned}" TRUE "1 of 1 executable(s) linking Catch2 carry the guard")
+
 if(NOT failures STREQUAL "")
     foreach(failure IN LISTS failures)
         message(SEND_ERROR "off-thread-assertion-guard-selftest: ${failure}")
