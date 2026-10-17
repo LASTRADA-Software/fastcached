@@ -94,10 +94,11 @@
 # auto-detected per connection, so every supported client works here.
 #port: 6674
 
-# Depth of the kernel's accept queue. Raise it if bursts of parallel clients
-# (a `make -jN` driving fastcache-cc) see connection refusals. Clamped to the
-# kernel's own SOMAXCONN.
-#listen_backlog: 511
+# Depth of the kernel's accept queue. A burst of parallel clients (a `make -jN`
+# driving fastcache-cc) that finds it full is not refused: its connects are
+# retried by the kernel and run past the launcher's connect bound. Linux and
+# macOS clamp it to the kernel's own somaxconn; Windows holds it to 200..65535.
+#listen_backlog: 4096
 
 # --- Memory -----------------------------------------------------------------
 

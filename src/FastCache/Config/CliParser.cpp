@@ -121,8 +121,9 @@ namespace
 
     [[nodiscard]] std::expected<int, ConfigError> ParseListenBacklog(std::string_view sv)
     {
-        // The kernel clamps to its own SOMAXCONN ceiling, so we only guard
-        // against absurd or non-positive input; 1..65535 is plenty of headroom.
+        // A DEPTH, which the kernel clamps to its own ceiling (`ListenBacklogArgument`
+        // spells it per platform), so we only guard against absurd or non-positive
+        // input; 1..65535 is the range Windows' `SOMAXCONN_HINT` accepts at all.
         return ParsePositiveInt(sv).and_then([](std::size_t value) -> std::expected<int, ConfigError> {
             if (value == 0 || value > 65535)
                 return std::unexpected(
@@ -639,7 +640,7 @@ namespace
           .operand = "=<N>",
           .apply = AssignFrom<&Config::listenBacklog, ParseListenBacklog>(),
           .explicitBit = &CliResult::listenBacklogExplicit,
-          .description = "::listen() backlog depth (default 511; clamped to the kernel's SOMAXCONN)",
+          .description = "accept-queue depth (default 4096; POSIX clamps it to somaxconn, Windows to 200..65535)",
           .yamlKey = "listen_backlog",
           .same = FieldEq<&Config::listenBacklog>() },
         { .primary = "--storage-shards",

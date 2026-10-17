@@ -14,6 +14,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/StopAwareWait.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <algorithm>
 #include <array>
@@ -590,8 +591,9 @@ std::expected<void, NodeRefusal> ConsensusTier::Listen(SurfaceEndpoint const& bi
     {
         // Bound against THIS node's reactor, which is what makes `co_await Accept()`
         // and every read inside `RaftPeerServer` actually suspend. A blocking listener
-        // would serve the first peer that connects and never accept another.
-        auto listened = core::net::listen(_reactor, core::net::ListenOptions { .host = bind.host, .port = bind.port });
+        // would serve the first peer that connects and never accept another. With the accept queue
+        // every listener here asks for (`LoopListenOptions`), not core-cpp's default (#1679).
+        auto listened = core::net::listen(_reactor, LoopListenOptions(bind.host, bind.port));
 
         // The failure is the `expected`'s, and carries its own diagnostic.
         if (!listened.has_value())

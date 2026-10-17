@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Config/Config.hpp>
+#include <FastCache/Transport/ListenQueue.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -14,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -33,6 +38,7 @@
 #include <core/platform/Types.hpp>
 #include <core/platform/WinsockInit.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/ListenQueueLimit.hpp>
 #include <tests/ScopedSignalHandler.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -209,11 +215,124 @@ TEST_CASE("ClientListenOptions asks for 1 MiB buffers each way, whatever the sha
     auto const options = FastCache::ClientListenOptions("127.0.0.1", 11211, 64, sharing);
     CHECK(options.host == "127.0.0.1");
     CHECK(options.port == 11211);
-    CHECK(options.backlog == 64);
+    CHECK(options.backlog == FastCache::ListenBacklogArgument(64, FastCache::ThisPlatformBacklogSpelling));
     CHECK(options.sharing == sharing);
     CHECK(options.buffers.send == FastCache::ClientSocketBufferBytes);
     CHECK(options.buffers.receive == FastCache::ClientSocketBufferBytes);
     CHECK(FastCache::ClientSocketBufferBytes == std::size_t { 1 } << 20);
+}
+
+TEST_CASE("A queue depth is spelled the way each platform's listen reads it", "[net][listener][backlog]")
+{
+    // Both spellings on every platform, since the spelling is a parameter: POSIX takes the depth and
+    // clamps it, Windows holds a plain number to about 200 and reads a deep queue as
+    // `SOMAXCONN_HINT(depth)`, which winsock2.h defines as `-(depth)` (#1679, core-cpp#74).
+    CHECK(FastCache::ListenBacklogArgument(4096, FastCache::BacklogSpelling::Depth) == 4096);
+    CHECK(FastCache::ListenBacklogArgument(4096, FastCache::BacklogSpelling::Hint) == -4096);
+    CHECK(FastCache::ListenBacklogArgument(1, FastCache::BacklogSpelling::Hint) == -1);
+#if defined(_WIN32)
+    CHECK(FastCache::ThisPlatformBacklogSpelling == FastCache::BacklogSpelling::Hint);
+    CHECK(FastCache::ListenBacklogArgument(4096, FastCache::ThisPlatformBacklogSpelling) == SOMAXCONN_HINT(4096));
+#else
+    CHECK(FastCache::ThisPlatformBacklogSpelling == FastCache::BacklogSpelling::Depth);
+#endif
+}
+
+TEST_CASE("A loop's listener asks for the deep accept queue, and the daemon's depth defaults to it",
+          "[net][listener][backlog]")
+{
+    // The node's framed surfaces and its consensus listener bind through `LoopListenOptions`; the
+    // daemon's `--listen-backlog` defaults to the same depth. One figure, three listeners (#1679).
+    auto const options = FastCache::LoopListenOptions("127.0.0.1", 6674);
+    CHECK(options.host == "127.0.0.1");
+    CHECK(options.port == 6674);
+    CHECK(options.backlog
+          == FastCache::ListenBacklogArgument(FastCache::ListenQueueDepth, FastCache::ThisPlatformBacklogSpelling));
+    // Deeper than core-cpp's own default, or the helper asks for nothing a bare `ListenOptions`
+    // would not already get.
+    CHECK(FastCache::ListenQueueDepth > core::net::ListenOptions {}.backlog);
+    CHECK(FastCache::Config {}.listenBacklog == FastCache::ListenQueueDepth);
+}
+
+TEST_CASE("Every way this file binds leaves the kernel holding the depth it was asked for", "[net][listener][backlog]")
+{
+    // Read back from the KERNEL, not from the options: a value a helper returns proves nothing about
+    // what `::listen` was handed. Linux answers it (`TCP_INFO` on a listening socket), clamped to
+    // `net.core.somaxconn`.
+    auto const ceiling = FastCache::Testing::KernelListenCeiling();
+    if (!ceiling.has_value())
+        SKIP("this platform cannot report a listening socket's queue limit");
+    // A ceiling at or below core-cpp's default records the same limit for a listener that asked
+    // for depth and one that asked for nothing, so the case could not tell them apart.
+    if (*ceiling <= core::net::ListenOptions {}.backlog)
+        SKIP(std::format("net.core.somaxconn is {}, which cannot tell a deep queue from the default", *ceiling));
+    auto const expected = std::min(FastCache::ListenQueueDepth, *ceiling);
+
+    SECTION("BindAndListen, the blocking bind and the Windows accept thread's")
+    {
+        auto bound = BindLoopback(0);
+        REQUIRE(bound.has_value());
+        auto const port = FastCache::BoundPortOf(bound->handle);
+        // `BindLoopback` asks for 16, so this pins that the depth reaches `::listen` at all.
+        auto const asked = FastCache::Testing::ListenQueueLimitsOnPort(port);
+        REQUIRE(asked.has_value());
+        CHECK(Unwrap(asked) == std::vector { 16 });
+        FastCache::CloseNativeSocket(bound->handle);
+
+        auto const deep = FastCache::BlockingListener::Bind("127.0.0.1", 0);
+        REQUIRE(deep->IsBound());
+        auto const limits = FastCache::Testing::ListenQueueLimitsOnPort(deep->boundPort());
+        REQUIRE(limits.has_value());
+        CHECK(Unwrap(limits) == std::vector { expected });
+    }
+    SECTION("core::net::listen over LoopListenOptions, the node's surfaces and consensus listener")
+    {
+        core::net::PlatformLoop loop;
+        auto listened = core::net::listen(loop, FastCache::LoopListenOptions("127.0.0.1", 0));
+        REQUIRE(listened.has_value());
+        auto const limits = FastCache::Testing::ListenQueueLimitsOnPort((*listened)->boundPort());
+        REQUIRE(limits.has_value());
+        CHECK(Unwrap(limits) == std::vector { expected });
+    }
+    SECTION("core::net::listen over ClientListenOptions at the daemon's default depth")
+    {
+        core::net::PlatformLoop loop;
+        auto listened =
+            core::net::listen(loop,
+                              FastCache::ClientListenOptions(
+                                  "127.0.0.1", 0, FastCache::Config {}.listenBacklog, core::net::PortSharing::Exclusive));
+        REQUIRE(listened.has_value());
+        auto const limits = FastCache::Testing::ListenQueueLimitsOnPort((*listened)->boundPort());
+        REQUIRE(limits.has_value());
+        CHECK(Unwrap(limits) == std::vector { expected });
+    }
+    SECTION("an operator's --listen-backlog reaches ::listen as the depth it says, through both daemon paths")
+    {
+        // Parsed rather than assigned, so the value travels the way an operator's does. Below the
+        // ceiling and unlike either default, so the kernel's answer can only have come from it.
+        auto const args = std::array<char const*, 1> { "--listen-backlog=1000" };
+        auto const parsed = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(parsed.has_value());
+        auto const depth = parsed->config.listenBacklog;
+        REQUIRE(depth == 1000);
+        auto const wanted = std::min(depth, *ceiling);
+
+        core::net::PlatformLoop loop;
+        auto listened = core::net::listen(
+            loop, FastCache::ClientListenOptions("127.0.0.1", 0, depth, core::net::PortSharing::Exclusive));
+        REQUIRE(listened.has_value());
+        auto const onLoop = FastCache::Testing::ListenQueueLimitsOnPort((*listened)->boundPort());
+        REQUIRE(onLoop.has_value());
+        CHECK(Unwrap(onLoop) == std::vector { wanted });
+
+        // The Windows multi-reactor's accept thread binds through `BindAndListen` instead.
+        auto bound = FastCache::BindAndListen(core::net::defaultAddressResolver(), "127.0.0.1", 0, depth);
+        REQUIRE(bound.has_value());
+        auto const onThread = FastCache::Testing::ListenQueueLimitsOnPort(FastCache::BoundPortOf(bound->handle));
+        FastCache::CloseNativeSocket(bound->handle);
+        REQUIRE(onThread.has_value());
+        CHECK(Unwrap(onThread) == std::vector { wanted });
+    }
 }
 
 TEST_CASE("PortSharing::Shared lets several loops' listeners bind one port", "[net][listener][reuseport]")
