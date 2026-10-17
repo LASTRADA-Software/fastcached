@@ -320,8 +320,13 @@ TEST_CASE("A verification put-back keeps the served object aside until it is con
     {
         auto const disk = MakeDiskFiles();
         auto const result = RestoreServedObject(aside, served, *disk);
-        CHECK(result.verdict == HitVerdict::Inconclusive);
+        // Put back, so the verification was MADE: the fresh compile failed, which is an answer
+        // (#1707) rather than an attempt that could not be made.
+        CHECK(result.verdict == HitVerdict::FreshCompileFailed);
         CHECK(result.detail.empty());
+        auto const line = DescribeVerdict(result, "objkey-v3:abcdef");
+        CHECK(line.contains("FAILED"));
+        CHECK(line.contains("may be stale"));
         CHECK(ReadFileShared(served) == std::optional<std::string> { "SERVED OBJECT" });
         CHECK_FALSE(std::filesystem::exists(aside));
     }

@@ -739,6 +739,14 @@ than being read by position and misread. The report counts failed compiles only 
 records that carry an exit code, which is what tells a compiler killed from outside
 apart from a cache that broke the build.
 
+Three outcomes say what a plain `MISS` or `HIT` used to hide. `STALE` is a hit the
+launcher refused -- a dependency it replays is missing here -- and compiled for real; a key
+that is stale on every build is a defect worth chasing, not a cold cache. `UNSTORED` is a
+compile whose STORE did not land (refused, or the exchange failed), so the next build misses
+again; `detail` says which. `VERIFY-FAILED` is a hit `FASTCACHE_VERIFY` sampled whose fresh
+compile FAILED: a source that does not compile has no object of its own, so the one served
+for it is suspect -- the build keeps it, and a line on stderr says so.
+
 `INPUTS-MOVED` is a compile one of whose inputs changed while the key was taken or during
 the compile — an editor's save, a `git checkout` in another terminal — so the launcher did
 not store its object (a direct-mode manifest built from the content the key was taken over
@@ -788,7 +796,8 @@ never cached (1 translation units)
 ```
 
 The hit rate is computed over **cacheable** compiles — hits, misses, wrong objects
-(hits `FASTCACHE_VERIFY` rejected) and compiles an input moved during (`INPUTS-MOVED`),
+(hits `FASTCACHE_VERIFY` rejected), compiles an input moved during (`INPUTS-MOVED`), and
+`STALE`, `UNSTORED` and `VERIFY-FAILED`,
 every compile the cache was asked for — not all invocations, so an unreachable daemon does not silently look like a low hit
 rate — it is reported separately as `CACHE NOT REACHED`.
 

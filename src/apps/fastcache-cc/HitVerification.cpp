@@ -148,6 +148,11 @@ std::string DescribeVerdict(HitComparison const& comparison, std::string_view ke
             return withDetail(std::format("fastcache-cc: could not verify the hit for key {} -- the fresh compile or the "
                                           "comparison did not complete. Nothing is known about the cached object either way",
                                           key));
+        case HitVerdict::FreshCompileFailed:
+            return withDetail(std::format("fastcache-cc: the hit for key {} could not be confirmed -- compiling the same "
+                                          "source FAILED, though the cache served an object for it. The cached entry may "
+                                          "be stale; this build kept the served object",
+                                          key));
         case HitVerdict::Unsupported:
             // NOT phrased as a finding about the cache, and that is the whole point of
             // the state: an operator who reads this as a mismatch turns verification
@@ -178,7 +183,7 @@ HitComparison RestoreServedObject(std::filesystem::path const& aside,
                                         AtomicWriteStepName(written.error()),
                                         aside.string()));
     files.Remove(aside);
-    return inconclusive({});
+    return HitComparison { .verdict = HitVerdict::FreshCompileFailed, .comparison = std::nullopt, .detail = {} };
 }
 
 } // namespace FastCache::Cc

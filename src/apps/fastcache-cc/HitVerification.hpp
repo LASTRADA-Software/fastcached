@@ -61,6 +61,15 @@ enum class HitVerdict : std::uint8_t
     /// records -- a precise wrong answer, which is worse than none, and exactly how
     /// a verifier gets switched off for good.
     Unsupported,
+    /// Sampled, the served object was put back, and compiling the same source FAILED.
+    ///
+    /// Not `Inconclusive`, which is an attempt that could not be made: this one was made and
+    /// answered. A failed compile is never stored, so a source that does not compile has no
+    /// object of its own under any key -- and an object served for it is the strongest sign a
+    /// verifier can give that the entry is stale (a direct-mode hit for an edited source).
+    /// The innocent reading is a transient failure (out of memory), which is why the build
+    /// keeps the served object and the report names it (#1707).
+    FreshCompileFailed,
 };
 
 /// Verification is off; no hit is checked.
