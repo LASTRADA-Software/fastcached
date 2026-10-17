@@ -639,7 +639,7 @@ is where they are explained one by one.
 | `fastcached_dispatch_leases_granted_total` | Work is being distributed. |
 | `fastcached_dispatch_leases_released_total` | Clients are reporting their jobs done. |
 | `fastcached_dispatch_leases_no_worker_total` | The fleet is misconfigured — workers are up but nobody matches. |
-| `fastcached_dispatch_leases_no_capacity_total` | The fleet is too small. |
+| `fastcached_dispatch_leases_no_capacity_total` | The fleet is too small -- or, where a worker reads `limited-by: compile-budget`, its compiles hold its `--compile-inflight-max` instead: raise that on it. |
 | `fastcached_dispatch_leases_withdrawn_total` | The fleet is unavailable — slots free on paper, machines busy elsewhere. |
 | `fastcached_dispatch_leases_all_excluded_total` | The fleet is **unreachable from its clients** — every matching worker was on the asking client's exclusion list. A network problem, not a missing toolchain. |
 | `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. |

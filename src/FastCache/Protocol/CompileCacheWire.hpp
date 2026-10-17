@@ -5193,6 +5193,17 @@ static_assert(MaxHistoryBucketsPerHeartbeat * MaxHistoryBucketBytes <= HistoryPa
     return out;
 }
 
+/// A worker's compile byte budget as a heartbeat states it (#1667).
+///
+/// Two raw numbers rather than a ceiling: the scheduler prices the budget at the worker's own
+/// mean per running job (`Distributed::SlotCeilingsFor`), and nothing it can recompute travels.
+/// Engaged as a pair or not at all -- see `LoadFields::compileBudget`.
+struct CompileBudgetLoadFields
+{
+    std::uint64_t budgetBytes { 0 };   ///< The resolved `--compile-inflight-max`.
+    std::uint64_t inFlightBytes { 0 }; ///< What the running compiles hold of it.
+};
+
 /// What a worker reports about itself beyond its job count.
 ///
 /// Every field optional in the same sense `CapacityFields::reservedCores` is:
@@ -5262,6 +5273,12 @@ struct LoadFields
     /// **Owned, not a view**, for `CapacityFields::version`'s reason: this record is
     /// returned by value too.
     std::vector<std::string> interfaceAddresses {};
+
+    /// The worker's compile byte budget and what its running compiles hold of it (#1667),
+    /// or absent from a node with no worker and from a peer older than the field. Two u64
+    /// fields that travel both or neither: one without the other is a shape this build does
+    /// not know and is refused, never read as half an answer.
+    std::optional<CompileBudgetLoadFields> compileBudget {};
 };
 
 namespace Detail
@@ -5292,14 +5309,15 @@ inline constexpr std::size_t MaxCapacityRecordBytes =
 /// The longest load record `EncodeLoad` writes WITHOUT its two variable passengers, whose own
 /// shares cover them: CPU, memory, scratch, the cache record (the tier list, each tier four u64s,
 /// then hits and misses), the history field's prefix, the cordon byte, the conditions field's
-/// prefix, interface addresses.
+/// prefix, interface addresses, the compile budget and what is held of it.
 inline constexpr std::size_t MaxLoadRecordFixedBytes =
     Detail::FramedField(sizeof(std::uint32_t)) + Detail::FramedField(sizeof(std::uint64_t))
     + Detail::FramedField(sizeof(std::uint64_t))
     + Detail::FramedField(
         Detail::FramedField(CarriedCacheTiers * Detail::FramedField(4 * Detail::FramedField(sizeof(std::uint64_t))))
         + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(sizeof(std::uint64_t)))
-    + Detail::FramedField(0) + Detail::FramedField(1) + Detail::FramedField(0) + Detail::FramedField(MaxAddressListBytes);
+    + Detail::FramedField(0) + Detail::FramedField(1) + Detail::FramedField(0) + Detail::FramedField(MaxAddressListBytes)
+    + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(sizeof(std::uint64_t));
 
 /// The most join memos one NODE-ANNOUNCE carries: as many as a formation record keeps
 /// (`Cluster::MaxAskedJoins`, asserted equal where both are visible), so a node hands over every one.
@@ -5366,6 +5384,10 @@ static_assert(HistoryPayloadShare + ConditionPayloadShare + MaxNodeAnnounceOther
     // Absent as zero length; an engaged list is never empty -- see `EncodeNodeConditions`.
     auto const conditions = load.conditions.has_value() ? EncodeNodeConditions(*load.conditions) : std::vector<std::byte> {};
     auto const addresses = EncodeAddressList(load.interfaceAddresses);
+    auto const budget = WireFields::ToBigEndian<std::uint64_t>(load.compileBudget ? load.compileBudget->budgetBytes : 0);
+    auto const held = WireFields::ToBigEndian<std::uint64_t>(load.compileBudget ? load.compileBudget->inFlightBytes : 0);
+    auto const budgetField = load.compileBudget ? std::span<std::byte const> { budget } : std::span<std::byte const> {};
+    auto const heldField = load.compileBudget ? std::span<std::byte const> { held } : std::span<std::byte const> {};
     return WireFields::Encode(
         { load.cpuBusyPermille.has_value() ? std::span<std::byte const> { cpu } : std::span<std::byte const> {},
           load.availableMemoryBytes.has_value() ? std::span<std::byte const> { memory } : std::span<std::byte const> {},
@@ -5374,7 +5396,9 @@ static_assert(HistoryPayloadShare + ConditionPayloadShare + MaxNodeAnnounceOther
           std::span<std::byte const> { history },
           load.cordoned ? std::span<std::byte const> { Cordoned } : std::span<std::byte const> {},
           std::span<std::byte const> { conditions },
-          std::span<std::byte const> { addresses } });
+          std::span<std::byte const> { addresses },
+          budgetField,
+          heldField });
 }
 
 /// Read a live-load record back.
@@ -5446,6 +5470,19 @@ static_assert(HistoryPayloadShare + ConditionPayloadShare + MaxNodeAnnounceOther
     if (!addresses.has_value())
         return std::nullopt;
     out.interfaceAddresses = *std::move(addresses);
+    // Both or neither, and absent from every peer older than the pair.
+    auto const budget = at(8);
+    auto const held = at(9);
+    if (budget.empty() != held.empty())
+        return std::nullopt;
+    if (!budget.empty())
+    {
+        auto const budgetBytes = WireFields::FromBigEndian<std::uint64_t>(budget);
+        auto const heldBytes = WireFields::FromBigEndian<std::uint64_t>(held);
+        if (!budgetBytes.has_value() || !heldBytes.has_value())
+            return std::nullopt;
+        out.compileBudget = CompileBudgetLoadFields { .budgetBytes = *budgetBytes, .inFlightBytes = *heldBytes };
+    }
     return out;
 }
 
@@ -6920,6 +6957,15 @@ struct NodeRuntimeFields
     /// What `--fleet-id` pins this node to, or disengaged from a sender too old to say. Every node
     /// that says anything says this: unpinned is an answer, not an absence.
     std::optional<NodeFleetPinFields> fleetPin {};
+
+    /// The worker's in-flight byte budget as resolved (`--compile-inflight-max`, or what the slots
+    /// derive), or disengaged on a node with no worker or a sender too old to say (#1667). Beside
+    /// `compileSlots` because it is the OTHER ceiling a worker admits by, and a worker refusing
+    /// `EndpointBusy` with idle slots is only legible with both in view.
+    std::optional<std::uint64_t> compileInflightMaxBytes {};
+
+    /// The worker's per-request ceiling as resolved (`--compile-request-max`), disengaged as above.
+    std::optional<std::uint64_t> compileRequestMaxBytes {};
 };
 
 /// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
@@ -7227,6 +7273,8 @@ inline constexpr std::size_t SharedCacheStatusFieldCount = 5;
     // Absent as zero length; an engaged fleet id is never empty, and an engaged pin never encodes empty.
     auto const fleetId = runtime.fleetId.has_value() ? AsBytes(*runtime.fleetId) : std::span<std::byte const> {};
     auto const fleetPin = runtime.fleetPin.has_value() ? EncodeNodeFleetPin(*runtime.fleetPin) : std::vector<std::byte> {};
+    auto const inflightMax = Detail::OptionalBigEndian(runtime.compileInflightMaxBytes);
+    auto const requestMax = Detail::OptionalBigEndian(runtime.compileRequestMaxBytes);
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -7253,7 +7301,9 @@ inline constexpr std::size_t SharedCacheStatusFieldCount = 5;
                                 stateDirectoryReason,
                                 sharedCache,
                                 fleetId,
-                                fleetPin });
+                                fleetPin,
+                                inflightMax,
+                                requestMax });
 }
 
 /// Read a runtime record back.
@@ -7457,6 +7507,12 @@ inline constexpr std::size_t SharedCacheStatusFieldCount = 5;
     if (auto const fleetId = at(22); !fleetId.empty())
         out.fleetId = std::string { AsStringView(fleetId) };
     if (!ReadNodeFleetPin(at(23), out.fleetPin))
+        return std::nullopt;
+
+    // Fields 24 and 25, the worker's two byte ceilings (#1667): absent from a node with no worker
+    // and from every sender older than them, refused at any width but a u64's.
+    if (!Detail::ReadOptionalBigEndian(at(24), out.compileInflightMaxBytes)
+        || !Detail::ReadOptionalBigEndian(at(25), out.compileRequestMaxBytes))
         return std::nullopt;
 
     return out;

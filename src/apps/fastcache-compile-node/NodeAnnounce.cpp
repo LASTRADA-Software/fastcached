@@ -105,7 +105,8 @@ Wire::LoadFields SampleMachineLoad(IHostLoadSampler& loadSampler,
                                    CacheTier const* cacheTier,
                                    IMetricsSink const& metrics,
                                    std::uint32_t inFlight,
-                                   bool cordoned)
+                                   bool cordoned,
+                                   std::optional<Distributed::CompileBudgetLoad> compileBudget)
 {
     auto const sampled = loadSampler.Sample();
     // The cache is sampled here too, and per MACHINE rather than per registrar: a node with
@@ -117,7 +118,8 @@ Wire::LoadFields SampleMachineLoad(IHostLoadSampler& loadSampler,
                                                            .availableMemoryBytes = sampled.availableMemoryBytes,
                                                            .freeScratchBytes = sampled.freeScratchBytes,
                                                            .cache = CacheLoadOf(cacheTier, metrics),
-                                                           .cordoned = cordoned });
+                                                           .cordoned = cordoned,
+                                                           .compileBudget = compileBudget });
 }
 
 ReportableAddresses ReportableInterfaceAddresses(std::vector<std::string> addresses)
@@ -196,7 +198,13 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
     // conditional heartbeat that existed to step it. History is the MACHINE's and travels
     // on NODE-ANNOUNCE, which a node running no worker also sends -- see
     // `SampleMachineLoad`, which owns the argument for one carrier.
-    auto load = SampleMachineLoad(round.loadSampler, round.cacheTier, round.metrics, inFlight, round.capacity.IsCordoned());
+    auto load = SampleMachineLoad(round.loadSampler,
+                                  round.cacheTier,
+                                  round.metrics,
+                                  inFlight,
+                                  round.capacity.IsCordoned(),
+                                  Distributed::CompileBudgetLoad { .budgetBytes = round.capacity.ByteBudget(),
+                                                                   .inFlightBytes = round.capacity.BytesInFlight() });
     // Sampled beside the load for the load's reason -- one reading of one machine per round --
     // and handed to REGISTER as well, which carries no load record of its own.
     load.interfaceAddresses = AddressesToReport(round);

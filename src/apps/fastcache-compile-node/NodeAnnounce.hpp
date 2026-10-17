@@ -446,12 +446,15 @@ static_assert(RecordAwaitedInterval < SchedulerUnreachableCadence);
 /// @param metrics Where the cache figures are read.
 /// @param inFlight Jobs this node is running for the fleet.
 /// @param cordoned Whether this node is refusing new work.
+/// @param compileBudget Its compile byte budget and what is held of it; absent on a node with
+///        no worker (#1667).
 /// @return The wire record, with an empty history.
 [[nodiscard]] CompileCacheWire::LoadFields SampleMachineLoad(IHostLoadSampler& loadSampler,
                                                              CacheTier const* cacheTier,
                                                              IMetricsSink const& metrics,
                                                              std::uint32_t inFlight,
-                                                             bool cordoned);
+                                                             bool cordoned,
+                                                             std::optional<Distributed::CompileBudgetLoad> compileBudget);
 
 /// Why an interface address is left out of what a worker reports. PRIVATE: never
 /// transmitted, never persisted.

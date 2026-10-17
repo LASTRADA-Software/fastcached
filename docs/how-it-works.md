@@ -198,7 +198,7 @@ are different problems:
 | Refusal | Means | What to do |
 |---|---|---|
 | `no-worker` | Nothing in the fleet serves that toolchain fingerprint. | A [matching problem](#what-makes-two-machines-share-a-cache). Usually the whole answer. |
-| `no-capacity` | Every matching worker is full of this build's own work. | Add machines. |
+| `no-capacity` | Every matching worker is full of this build's own work: its slots, or its compile byte budget (`limited-by: compile-budget`). | Add machines, or raise that worker's `--compile-inflight-max`. |
 | `withdrawn` | Machines are there and unavailable — someone is using them, or a scratch disk filled. | Wait, or look at the machine. |
 | `already-in-flight` | Another client is compiling this exact key right now. | Nothing. This is the feature working. |
 

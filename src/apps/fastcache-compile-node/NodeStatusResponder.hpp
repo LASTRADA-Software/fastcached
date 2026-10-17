@@ -487,6 +487,10 @@ struct NodeRuntimeSources
     /// gets published is what only one thread can see.
     CompileCapacity const* capacity { nullptr };
 
+    /// The worker's resolved per-request ceiling (`CompileRequestMaxOf`), disengaged exactly
+    /// when `capacity` is null (#1667). The in-flight budget is `capacity`'s own.
+    std::optional<std::uint64_t> compileRequestMaxBytes {};
+
     /// This node's scheduler, for its role and the leader it knows about; null on a
     /// node that runs none -- which is why the role is ABSENT there rather than
     /// `Undecided`, a reading that would claim this node is in an election.

@@ -2658,7 +2658,10 @@ spelled it the same way, which is what makes this a drift rather than a discover
     listener's one pool folds to the LARGEST owner, so wherever the compile budget
     exceeds the cache's 256 MiB -- five or more slots, a raised `--compile-request-max`, a
     typed `--compile-inflight-max` -- the cache and shared-cache reads share it (#1338 is
-    why there is one pool).
+    why there is one pool). And the SCHEDULER prices it: a heartbeat carries the budget and
+    what the running compiles hold of it, and `SlotCeilingsFor` turns the remainder into a
+    `compile-budget` ceiling at this worker's own mean per job, so a worker out of bytes is
+    passed over rather than leased and refused; NODE-STATUS carries both ceilings.
     Checked on the DECLARED length before a payload byte is read, and refused with
     `EndpointBusy` and its own counter: slots were free and memory was not, so
     reporting it as `NoCapacity` would send an operator to buy machines that would
@@ -2859,10 +2862,10 @@ redirect, is in
 [`metrics-and-observability.md`](metrics-and-observability.md).
 
 **The ceilings behind `AvailableSlots` are reported, not just the minimum.** That
-function folds four numbers into one and the fold loses the only part an operator
+function folds five numbers into one and the fold loses the only part an operator
 can act on: a node offering 2 of its 16 slots is a different problem depending on
-whether somebody is *using* the machine, its memory is gone, or its scratch disk
-has filled, and the three have opposite fixes. `SlotCeilingsFor` is the same
+whether somebody is *using* the machine, its memory is gone, its scratch disk
+has filled, or its own compiles hold its byte budget, and the four have opposite fixes. `SlotCeilingsFor` is the same
 arithmetic with each ceiling named and `AvailableSlots` is one line over it, so
 there is one author for the subtraction. Two properties travel with it: the
 ceilings are `optional`, so a machine that could not read its CPU has *no* CPU
@@ -4016,14 +4019,6 @@ half from passing. The in-process fleet asserts it from addresses nobody listed
 ## Open work
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
-- **[#1667](https://github.com/LASTRADA-Software/fastcached/issues/1667)** — a worker's
-  memory ceilings are options now (`--compile-request-max`, `--compile-inflight-max`) and
-  the budget follows the slots, but three parts stay open there: `fastcache-cli node`
-  (NODE-STATUS) does not carry the two figures, because its runtime record is a positional
-  field list rather than a table, so only the worker's startup line states them; the
-  SCHEDULER does not know a worker's byte budget nor hear of its `EndpointBusy` refusals
-  (no RELEASE outcome, no heartbeat field), so it keeps granting leases a full worker will
-  refuse; and `CompileCapacity::Bytes::TryRaiseTo` has no caller.
 - **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
   has no cancellable seam, so a compile whose client has GONE runs to completion and this
   machine pays for an object nobody will read. The departure is already detected and

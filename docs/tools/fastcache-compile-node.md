@@ -3390,7 +3390,7 @@ opposite:
 | Refusal | Counter | What to do |
 | --- | --- | --- |
 | `no-worker` | `fastcached_dispatch_leases_no_worker_total` | Nothing serves that toolchain — a fingerprint mismatch. |
-| `no-capacity` | `fastcached_dispatch_leases_no_capacity_total` | The fleet is full of your own build. Add machines. |
+| `no-capacity` | `fastcached_dispatch_leases_no_capacity_total` | The fleet is full of your own build. Add machines -- or, where a worker reads `limited-by: compile-budget`, its compiles hold its `--compile-inflight-max` instead: raise that on it. |
 | `withdrawn` | `fastcached_dispatch_leases_withdrawn_total` | The machines are there and unavailable — somebody is using them, or a disk is full. |
 | `all-excluded` | `fastcached_dispatch_leases_all_excluded_total` | The machines are there and the clients cannot reach them — a network problem. |
 
@@ -4117,11 +4117,13 @@ These distinctions cost real debugging time when they are collapsed:
   grain a fleet total is computed over; summing the Workers table reports a fleet
   twice the size of the one you own.
 - **`limited-by` is the whole diagnosis.** A node offering 2 of its 16 slots is
-  three different problems: `external-cpu` means somebody is using that machine,
-  `memory` and `scratch` mean it is out of something. Buying hardware fixes
-  exactly one of them.
+  four different problems: `external-cpu` means somebody is using that machine,
+  `memory` and `scratch` mean it is out of something, and `compile-budget` means the
+  compiles it is running hold nearly all of `--compile-inflight-max`, priced at its own
+  mean per job. Buying hardware fixes exactly one of them.
 - **Do not add the lease refusals together.** `no-worker` is a misconfiguration,
-  `no-capacity` says buy more machines, `withdrawn` says your machines are busy
+  `no-capacity` says buy more machines (or raise a `compile-budget`-limited worker's
+  `--compile-inflight-max`), `withdrawn` says your machines are busy
   with something else, `all-excluded` says your clients cannot reach them, and
   `duplicate` says it is already being built. A total hides all five.
 - **A worker that is never *picked* looks exactly like a healthy one.** It

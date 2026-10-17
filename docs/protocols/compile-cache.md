@@ -84,7 +84,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x07` | storage-write-failed | The cache engine refused the write. |
 | `0x08` | unauthenticated | A credential is required and has not been accepted on this connection. |
 | `0x09` | no-worker | No registered worker matches the requested toolchain. |
-| `0x0a` | no-capacity | Every matching worker is at its slot limit. |
+| `0x0a` | no-capacity | Every matching worker is at its slot limit, or its compile byte budget is held by the compiles running there (`limited-by: compile-budget`). |
 | `0x0b` | already-in-flight | Another client is already compiling this key. |
 | `0x0c` | dispatch-not-permitted | This listener does not serve distributed execution. |
 | `0x0d` | unknown-lease | The lease token is unknown or has expired. |

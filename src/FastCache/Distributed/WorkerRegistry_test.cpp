@@ -1211,3 +1211,44 @@ TEST_CASE("What a heartbeat reported outlives the request that carried it", "[di
     REQUIRE(picked->interfaceAddresses.size() == 1);
     CHECK(picked->interfaceAddresses.front() == Unique);
 }
+
+TEST_CASE("A worker whose compile byte budget is spent is passed over until it frees",
+          "[distributed][registry][byte-budget]")
+{
+    // #1667: the scheduler granted by slots and the worker admitted by slots AND bytes, so a
+    // worker out of bytes refused `EndpointBusy` every grant the scheduler went on issuing.
+    // Thirty slots, ten running, and 250 of 256 MiB held: ten jobs of 25 MiB, room for none.
+    constexpr std::uint64_t MiB = 1ULL << 20;
+    Fixture fix;
+    auto const worker = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 30));
+    auto const spent =
+        NodeLoad { .inFlight = 10,
+                   .cpuBusyPermille = std::nullopt,
+                   .availableMemoryBytes = std::nullopt,
+                   .freeScratchBytes = std::nullopt,
+                   .compileBudget = CompileBudgetLoad { .budgetBytes = 256 * MiB, .inFlightBytes = 250 * MiB } };
+    REQUIRE(fix.registry.Heartbeat(worker, spent));
+    auto const refused = fix.registry.Pick(Gcc13);
+    REQUIRE_FALSE(refused.has_value());
+    // Slots free on paper, and still `NoCapacity`, never `Withdrawn`: the bytes are held by
+    // this fleet's own compiles, and "withdrawn" would read as a machine busy elsewhere.
+    REQUIRE(refused.error() == PickError::NoCapacity);
+
+    // It frees -- the next beat holds 100 MiB under the same ten jobs -- and is picked again.
+    REQUIRE(fix.registry.Heartbeat(
+        worker,
+        NodeLoad { .inFlight = 10,
+                   .cpuBusyPermille = std::nullopt,
+                   .availableMemoryBytes = std::nullopt,
+                   .freeScratchBytes = std::nullopt,
+                   .compileBudget = CompileBudgetLoad { .budgetBytes = 256 * MiB, .inFlightBytes = 100 * MiB } }));
+    CHECK(fix.registry.Pick(Gcc13).has_value());
+
+    // The control: the same ten jobs with no budget reported take no ceiling from it.
+    REQUIRE(fix.registry.Heartbeat(worker,
+                                   NodeLoad { .inFlight = 10,
+                                              .cpuBusyPermille = std::nullopt,
+                                              .availableMemoryBytes = std::nullopt,
+                                              .freeScratchBytes = std::nullopt }));
+    CHECK(fix.registry.Pick(Gcc13).has_value());
+}

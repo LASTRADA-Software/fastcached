@@ -181,7 +181,7 @@ A refusal is one of four, and they are counted apart on purpose:
 | Refusal | What it means | What to do |
 |---|---|---|
 | `no-worker` | Nobody in the fleet has this toolchain | Fix a toolchain mismatch |
-| `no-capacity` | Every matching worker is full of this fleet's own work | Add machines |
+| `no-capacity` | Every matching worker is full of this fleet's own work: its slots, or its compile byte budget (`limited-by: compile-budget`) | Add machines, or raise that worker's `--compile-inflight-max` |
 | `withdrawn` | Matching workers have pulled their capacity — busy with something else, or out of scratch | Nothing to buy; look at those machines |
 | `already-in-flight` | Somebody is building this exact key right now | Nothing. It is working |
 

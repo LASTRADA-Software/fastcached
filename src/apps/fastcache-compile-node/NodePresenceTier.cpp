@@ -111,7 +111,7 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
     // one, that worker owns heartbeat reports the number and `NodeReports()` prefers those
     // entries anyway. And a cordon is the worker PROCESS state, so a machine with no worker
     // cannot be cordoned: false is what is true, not what is convenient.
-    auto load = SampleMachineLoad(round.loadSampler, round.cacheTier, round.metrics, 0, false);
+    auto load = SampleMachineLoad(round.loadSampler, round.cacheTier, round.metrics, 0, false, std::nullopt);
 
     // This machine own closed buckets, so the fleet record of it survives an election.
     // Bounded per round: a node absent for a day has 1440 to hand over and the frame has a
