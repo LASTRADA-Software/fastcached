@@ -36,12 +36,28 @@
 namespace FastCache::PathCanon
 {
 
-/// A build's absolute roots on one machine. Both are native-form absolute
-/// paths (backslash separators on Windows).
+/// A build's absolute roots on one machine. All are native-form absolute
+/// paths (backslash separators on Windows); an empty root names nothing.
 struct Layout
 {
     std::string sourceRoot; ///< Checkout root — becomes the `<SRCROOT>` sentinel.
     std::string buildTree;  ///< Build output root — becomes the `<BUILDTREE>` sentinel.
+
+    /// Where this machine keeps the third-party sources a build reads from OUTSIDE its
+    /// checkout (CPM's source cache) — becomes the `<DEPROOT>` sentinel.
+    ///
+    /// A root of its own because its location is per machine and per user
+    /// (`~/.cache/...`) while its content is not: CPM files each dependency under the
+    /// commit it pinned, so `<DEPROOT>/core-cpp/<sha>/src` names the same bytes
+    /// everywhere. Under neither of the other roots, every include directory and
+    /// dependency path into it reached the key verbatim and no two machines whose users
+    /// differ shared an object.
+    ///
+    /// Only the LAUNCHER sets it. A server canonicalizes a stored value with the two roots
+    /// a STORE frame carries, so its behaviour cannot move; the launcher tokenizes this
+    /// root in a value's text regions itself before the store, and a server leaves
+    /// `<DEPROOT>` spans alone because they lie under no root it knows.
+    std::string dependencyRoot {};
 };
 
 /// The line grammars that locate path spans inside captured compiler text

@@ -77,7 +77,8 @@ class RootReconciler
     RootReconciler(std::string_view sourceRoot,
                    std::string_view buildTree,
                    IPathResolver& resolver,
-                   NarrowTextPolicy policy = {});
+                   NarrowTextPolicy policy = {},
+                   std::string_view dependencyRoot = {});
 
     /// Reconcile one path naming a FILE — an include note, a depfile entry.
     ///

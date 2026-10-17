@@ -119,7 +119,14 @@ answers at `127.0.0.1:6674` — at any other daemon, local or remote, when
 `FASTCACHE_ADDR` is exported when the build tree is created, at
 `-DFASTCACHE_ADDR=host:port` ahead of even that, nowhere if it is set empty — and injects `FASTCACHE_SOURCE_DIR` /
 `FASTCACHE_BINARY_DIR` from the source and binary directories, so those two need
-not be exported.
+not be exported. It also injects `FASTCACHE_DEPS_DIR` from CPM's source cache
+(`CPM_SOURCE_CACHE`), and with `fastcache-cc` as the launcher it maps `__FILE__`
+for the checkout and that cache (`-fmacro-prefix-map=<checkout>/=` and
+`-fmacro-prefix-map=<cache>/=deps/`). Together those are what let a second folder
+or a second machine reuse every object, test objects and objects built from
+dependency sources included: without the map a Catch2 test object names its
+checkout and is stored per checkout, and without the root an include directory
+into a cache under the user's home keeps that home in every key.
 
 **The configure environment seeds a build tree; it does not steer one.**
 `FASTCACHE_ADDR` and `FASTCACHE_SCHEDULER` (below) are taken from the environment
@@ -290,6 +297,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_ADDR` | `host:port` of the cache — a `fastcached`, or a `fastcache-compile-node`'s `--listen-node`. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:6674`) all resolve. Set but **empty** is the opt-out and means no caching -- but see the PowerShell note below, where that spelling does not reach the launcher. | `127.0.0.1:6674` |
 | `FASTCACHE_SOURCE_DIR` | Checkout source root, used for keying and path canonicalization. | unset — **no caching** |
 | `FASTCACHE_BINARY_DIR` | Build output root. | unset — **no caching** |
+| `FASTCACHE_DEPS_DIR` | Where this machine keeps third-party sources the build reads from **outside** the checkout — CPM's source cache. Keyed and replayed as a root of its own (`<DEPROOT>`), so two machines whose caches sit in different homes share objects; an object naming it is bound to the machine, as one naming the checkout is bound to the checkout. | unset — such paths are keyed as written, which shares only between builds keeping them in one place |
 | `FASTCACHE_PREFETCH_GROUP` | Prefetch grouping id. **Not** part of the cache key, so it never partitions the cache. | `default` |
 | `FASTCACHE_VERBOSE` | Print `HIT`/`MISS` and fall-back diagnostics to stderr. | unset (quiet) |
 | `FASTCACHE_NO_STATS` | Do not record invocations to the statistics log. | unset (recording on) |
@@ -579,7 +587,7 @@ them -- the direct-mode key never sees the `__FILE__` expansion, and
 **object** before storing it.
 
 An object whose program data names neither `FASTCACHE_SOURCE_DIR`,
-`FASTCACHE_BINARY_DIR` nor the compile's working directory is stored and shared
+`FASTCACHE_BINARY_DIR`, `FASTCACHE_DEPS_DIR` nor the compile's working directory is stored and shared
 exactly as before. One that names any of them is stored under a key that also
 folds in the directories it NAMES -- each absolute and resolved, so a relative
 export (`.`) identifies the checkout as well as an absolute one -- with a marker in
@@ -980,8 +988,11 @@ come from their rewriting `__FILE__` in the preprocessed text:
 
 - they **stay on the preprocess line**, so the key hashes the `__FILE__` the real
   compile produces;
-- a command line carrying one **compiles locally and is never dispatched**, because
-  a worker could not apply the client's rule to the paths it embeds.
+- on a dispatched compile, `-fmacro-prefix-map` **travels to the worker verbatim**:
+  the worker applies the rule to this machine's paths in the text it is handed and
+  opens nothing, so its object is the one a local compile would have written. A line
+  carrying `-ffile-prefix-map` **compiles locally**, because that flag also rewrites
+  debug records, which a worker maps by rules of its own.
 
 The key also records where the build tree sits under the source root whenever one
 is present, since the mapping rewrites a build-tree path through the source root's

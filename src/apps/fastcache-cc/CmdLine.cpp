@@ -452,7 +452,8 @@ namespace
         { .spelling = "-fmacro-prefix-map",
           .role = PathValueRole::SourcePrefixMap,
           .families = DriverFamily::Gnu,
-          .valueTailSeparator = '=' },
+          .valueTailSeparator = '=',
+          .remote = RemoteLine::Forwarded },
         { .spelling = "-ffile-prefix-map",
           .role = PathValueRole::SourcePrefixMap,
           .families = DriverFamily::Gnu,
@@ -1608,6 +1609,23 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
         // (the headers are already inlined, and the path names nothing there).
         if (auto const match = MatchPathValueFlag(a, IntroducersOf(driver.family), driver.family))
         {
+            // A source prefix map cannot be dropped: the worker compiles text whose `#line`
+            // markers name the CLIENT's paths, so without the client's rule its
+            // `source_location` would name them unmapped. `-fmacro-prefix-map` TRAVELS -- the
+            // worker applies it to those strings and opens nothing -- so its row is forwarded
+            // ahead of the role's refusal, which `-ffile-prefix-map` still meets: it also
+            // rewrites debug records the worker maps by its own rules.
+            if (match->flag.remote == RemoteLine::Forwarded)
+            {
+                // A separated value travels with its flag, as the build wrote both.
+                out.emplace_back(a);
+                if (match->value.empty() && i + 1 < argv.size())
+                {
+                    out.emplace_back(argv[i + 1]);
+                    skipUntil = i + 2;
+                }
+                continue;
+            }
             if (auto const because = UndispatchableBecause(match->flag.role); !because.empty())
                 return std::unexpected(std::format("{} {}", match->flag.spelling, because));
             // Only a bare occurrence consumes the next argument; a fused one already

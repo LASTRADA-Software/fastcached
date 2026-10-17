@@ -157,7 +157,18 @@ std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
                                         std::string_view buildTree,
                                         PathCanon::PathTransform const& resolve)
 {
-    PathCanon::Layout const layout { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } };
+    return RelativizeArgs(
+        args,
+        PathCanon::Layout { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } },
+        resolve);
+}
+
+std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
+                                        PathCanon::Layout const& layout,
+                                        PathCanon::PathTransform const& resolve)
+{
+    std::string_view const sourceRoot = layout.sourceRoot;
+    std::string_view const buildTree = layout.buildTree;
     std::vector<std::string> out;
     out.reserve(args.size() + 1);
     for (auto const& arg: args)
@@ -323,7 +334,16 @@ std::string ComputeKey(KeyInputs const& inputs)
     // what a FETCH does on meeting its marker, and an older entry was written by neither
     // rule. `manifest-v7` moves with it, in the lock-step ComputeManifestKey describes --
     // and for a second reason of its own, since direct mode is where the defect lived.
-    KeyDigest digest { "objkey-v7" };
+    //
+    // v8 retires every value stored before the dependency root (`FASTCACHE_DEPS_DIR`,
+    // `PathCanon::Layout::dependencyRoot`). This construction is unchanged and the golden
+    // vector moved for the tag alone; what changed is what a value's text regions may carry
+    // -- a `<DEPROOT>` span a launcher of this generation localizes and an older one would
+    // replay verbatim -- and the root-bound marker's part names, which gained
+    // `dependency-root`. Bumped so the two generations never exchange an entry rather than
+    // relying on their keys differing, which they do only for units that read a
+    // dependency. `manifest-v9` moves with it, in the lock-step ComputeManifestKey records.
+    KeyDigest digest { "objkey-v8" };
     digest.Field(inputs.compilerId);
     digest.Field(inputs.preprocessed);
     for (auto const& arg: inputs.relativizedArgs)

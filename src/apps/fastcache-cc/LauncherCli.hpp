@@ -154,6 +154,7 @@ namespace EnvName
     constexpr std::string_view Addr = "FASTCACHE_ADDR";
     constexpr std::string_view SourceDir = "FASTCACHE_SOURCE_DIR";
     constexpr std::string_view BinaryDir = "FASTCACHE_BINARY_DIR";
+    constexpr std::string_view DepsDir = "FASTCACHE_DEPS_DIR";
     constexpr std::string_view PrefetchGroup = "FASTCACHE_PREFETCH_GROUP";
     constexpr std::string_view Verbose = "FASTCACHE_VERBOSE";
     constexpr std::string_view NoStats = "FASTCACHE_NO_STATS";

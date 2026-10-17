@@ -24,9 +24,10 @@ namespace
         std::string PathCanon::Layout::* root;
     };
 
-    constexpr std::array<ReconciledRoot, 2> ReconciledRoots { {
+    constexpr std::array<ReconciledRoot, 3> ReconciledRoots { {
         { .part = CheckoutPart::SourceRoot, .root = &PathCanon::Layout::sourceRoot },
         { .part = CheckoutPart::BuildTree, .root = &PathCanon::Layout::buildTree },
+        { .part = CheckoutPart::DependencyRoot, .root = &PathCanon::Layout::dependencyRoot },
     } };
 
     /// @param path A path. @param root A root, or empty.
@@ -164,12 +165,16 @@ std::string WithoutTrailingSeparator(std::string root)
 RootReconciler::RootReconciler(std::string_view sourceRoot,
                                std::string_view buildTree,
                                IPathResolver& resolver,
-                               NarrowTextPolicy policy):
+                               NarrowTextPolicy policy,
+                               std::string_view dependencyRoot):
     _resolver { resolver },
     _asGiven { .sourceRoot = WithoutTrailingSeparator(std::string { sourceRoot }),
-               .buildTree = WithoutTrailingSeparator(std::string { buildTree }) },
+               .buildTree = WithoutTrailingSeparator(std::string { buildTree }),
+               .dependencyRoot = WithoutTrailingSeparator(std::string { dependencyRoot }) },
     _resolved { .sourceRoot = resolver.ResolveDirectory(_asGiven.sourceRoot),
-                .buildTree = resolver.ResolveDirectory(_asGiven.buildTree) },
+                .buildTree = resolver.ResolveDirectory(_asGiven.buildTree),
+                .dependencyRoot =
+                    _asGiven.dependencyRoot.empty() ? std::string {} : resolver.ResolveDirectory(_asGiven.dependencyRoot) },
     _policy { policy }
 {
 }

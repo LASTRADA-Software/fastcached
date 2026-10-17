@@ -163,7 +163,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Preprocess with line markers suppressed — `/EP` **alone** on MSVC, never `/EP /P`.
 - `/` introduces an option only on a Windows layout; on POSIX it starts a path.
 - Only machine-independent dependency paths are hashed, and a path is classified
-  by what it *resolves to*, never by its spelling.
+  by what it *resolves to*, never by its spelling. A CPM cache is a ROOT (`<DEPROOT>`, `FASTCACHE_DEPS_DIR`).
 - The toolchain headers the key drops are covered by the compiler's *banner*, so every driver
   is asked for one the way it answers: `cl` has no `--version`, and bare `cl` is its probe.
 - A root and the paths a driver emits are reconciled on both sides, or neither.
@@ -198,8 +198,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   collapses `..` out of every note the launcher EMITS and out of none that it STORES.
 - A compiler with debug info on records the WORKING DIRECTORY, which is on no command line, so no key relativizes
   it; `-fdebug-prefix-map` closes it on ELF and on NEITHER COFF driver, an accepted cost rather than open work.
-  - The module never ADDS `-ffile-prefix-map`/`-fmacro-prefix-map`; a build's own is a `SourcePrefixMap` row: HEAD
-    relativized, KEPT on the preprocess line (it rewrites `__FILE__`), never dispatched, build tree's place KEYED.
+  - `-ffile-prefix-map`/`-fmacro-prefix-map` are `SourcePrefixMap` rows: HEAD relativized, KEPT on the preprocess line,
+    build tree's place KEYED; the module ADDS the macro one under `fastcache-cc`, which a worker is SENT.
   - The key relativizes the rule's HEAD (`PathValueRole::PrefixMap`, a table COLUMN) and leaves
     the replacement literal; the build-tree rule is mapped LAST, and a root with a SPACE is not
     mapped at all. `ctest -R debug-prefix-map-rules`.

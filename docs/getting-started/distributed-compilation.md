@@ -1011,9 +1011,9 @@ minute and is spent once.
 - **`-g` embeds the worker's scratch path** in DWARF. Use **`-fdebug-prefix-map`**,
   which this launcher recognises and folds into the cache key, so two checkouts still
   share. `-ffile-prefix-map` and `-fmacro-prefix-map` are keyed the same way and share
-  across checkouts too, but a command line carrying either **compiles locally and is never
-  dispatched**: they rewrite `__FILE__`, and a worker could not apply the client's rule to
-  the paths it embeds. See
+  across checkouts too. `-fmacro-prefix-map` travels to the worker verbatim, which applies
+  it to the client's paths; a line carrying `-ffile-prefix-map` **compiles locally**, since
+  it also rewrites debug records a worker maps by its own rules. See
   [the launcher's own account](../tools/fastcache-cc.md#debug-paths-in-a-replayed-object).
 - **Diagnostics from a failed remote compile are not shown.** A worker reporting
   a non-zero exit is retried locally and the local result is what you see —

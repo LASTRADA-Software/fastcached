@@ -433,7 +433,7 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
     // to disagree about what was hashed, and the retirement check would go vacuous
     // in the one edit it exists to catch.
     auto const key = ComputeKey(inputs);
-    CHECK(key == "7323057f60d9ffaca969b16ef293ceaa");
+    CHECK(key == "e86dc84efc6cb5de598620cc334f4ee7");
 
     // What the vector alone cannot say: that the tag has not been put BACK. See
     // Generation -- reverting the tag and re-pasting the vector is one edit
@@ -445,6 +445,8 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
         { .key = "objkey-v5", .digest = "b89cce126e819bbb6868c7a6065e01cb" },
         // The v6 -> v7 bump changed nothing but the tag, so this is the outgoing vector.
         { .key = "objkey-v6", .digest = "e7d074ee4bda35d76e6bf65eba71e7b1" },
+        // The v7 -> v8 bump (the dependency root) changed nothing but the tag either.
+        { .key = "objkey-v7", .digest = "7323057f60d9ffaca969b16ef293ceaa" },
     });
     RequireNoRetiredDigest<std::string_view>(key, Retired);
 }

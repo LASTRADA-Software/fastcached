@@ -212,38 +212,10 @@ option(TRACY_ON_DEMAND "Tracy: only collect data while a profiler is connected" 
 option(FASTCACHED_BUILD_TUI "Build core-cpp's terminal UI (fastcache-cli live-stats)" ON)
 
 # ----------------------------------------------------------------------------
-# Compiler caching. Loaded before any compiler invocation so that CPM-fetched
-# dependencies also get cached. CompileCache.cmake prefers our own fastcache-cc
-# launcher (when installed and a daemon answers, at 127.0.0.1:6674 unless
-# FASTCACHE_ADDR says otherwise), falls back to sccache and then ccache, and
-# silently no-ops when none is usable or USE_COMPILER_CACHE=OFF. It also declares
-# the USE_COMPILER_CACHE option.
-
-include(CompileCache)
-
-# No MSVC-style link in a debug-info configuration is incremental -- on every such build,
-# never only a launcher-fronted one. Here, before any dependency or target exists, so all
-# of them read it. Why: cmake/IncrementalLink.cmake.
-include(IncrementalLink)
-
-# Default install/runtime/library output directories.
-if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/target")
-endif()
-if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/target")
-endif()
-
-# ----------------------------------------------------------------------------
-# Dependencies via CPM (tries find_package first).
+# Where dependency sources live, decided BEFORE the compiler cache is loaded: the cache module
+# hands this location to fastcache-cc as its dependency root (FASTCACHE_DEPS_DIR), which is what
+# lets two machines whose caches sit in different homes share objects.
 #
-# Fetched BEFORE the pedantic/sanitizer/clang-tidy includes so the global
-# add_compile_options() / CMAKE_CXX_CLANG_TIDY they install only apply to our
-# own targets (defined later in this directory), not to third-party code where
-# -Werror -Wconversion is not our problem to fix.
-
-set(CPM_USE_LOCAL_PACKAGES ON CACHE BOOL "Prefer system-installed packages over CPM downloads")
-
 # Share fetched dependency SOURCES across build trees, per machine (#545).
 #
 # Without this every fresh build tree re-clones Catch2, yaml-cpp, zstd and lz4 -- and
@@ -295,6 +267,39 @@ if(NOT DEFINED CPM_SOURCE_CACHE AND NOT DEFINED ENV{CPM_SOURCE_CACHE})
             "build tree as before; set FASTCACHED_CPM_CACHE to share them")
     endif()
 endif()
+
+# ----------------------------------------------------------------------------
+# Compiler caching. Loaded before any compiler invocation so that CPM-fetched
+# dependencies also get cached. CompileCache.cmake prefers our own fastcache-cc
+# launcher (when installed and a daemon answers, at 127.0.0.1:6674 unless
+# FASTCACHE_ADDR says otherwise), falls back to sccache and then ccache, and
+# silently no-ops when none is usable or USE_COMPILER_CACHE=OFF. It also declares
+# the USE_COMPILER_CACHE option.
+
+include(CompileCache)
+
+# No MSVC-style link in a debug-info configuration is incremental -- on every such build,
+# never only a launcher-fronted one. Here, before any dependency or target exists, so all
+# of them read it. Why: cmake/IncrementalLink.cmake.
+include(IncrementalLink)
+
+# Default install/runtime/library output directories.
+if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/target")
+endif()
+if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/target")
+endif()
+
+# ----------------------------------------------------------------------------
+# Dependencies via CPM (tries find_package first).
+#
+# Fetched BEFORE the pedantic/sanitizer/clang-tidy includes so the global
+# add_compile_options() / CMAKE_CXX_CLANG_TIDY they install only apply to our
+# own targets (defined later in this directory), not to third-party code where
+# -Werror -Wconversion is not our problem to fix.
+
+set(CPM_USE_LOCAL_PACKAGES ON CACHE BOOL "Prefer system-installed packages over CPM downloads")
 
 include(cmake/CPM.cmake)
 

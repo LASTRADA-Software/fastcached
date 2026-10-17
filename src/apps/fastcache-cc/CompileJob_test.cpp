@@ -836,6 +836,21 @@ TEST_CASE("IsAcceptableJobArgument admits the code-generation flags a compile ca
     CHECK(IsAcceptableJobArgument("", DriverOf(Flavor::Gcc)));
 }
 
+TEST_CASE("A worker applies the client's macro prefix map, and refuses one that is no rule", "[compile-job]")
+{
+    // The rule's two halves ARE paths, so the separator test every other `-f` value must pass
+    // would refuse it -- and dispatching a build that maps `__FILE__` would then fail on every
+    // worker. The compiler rewrites strings by it and opens neither half.
+    CHECK(IsAcceptableJobArgument("-fmacro-prefix-map=/home/alice/work/fc/=", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-fmacro-prefix-map=/home/alice/.cache/cpm/=deps/", DriverOf(Flavor::Clang)));
+    // No `=` is no rule, which a driver rejects or ignores; neither is worth a job.
+    CHECK_FALSE(IsAcceptableJobArgument("-fmacro-prefix-map=/home/alice", DriverOf(Flavor::Gcc)));
+    // Its debug-reaching sibling stays off a worker's line: the client keeps such a compile.
+    CHECK_FALSE(IsAcceptableJobArgument("-ffile-prefix-map=/home/alice/work/fc/=", DriverOf(Flavor::Gcc)));
+    // GNU-only, as the launcher's row is: `cl` has no such switch.
+    CHECK_FALSE(IsAcceptableJobArgument("-fmacro-prefix-map=C:/w/=", DriverOf(Flavor::Cl)));
+}
+
 TEST_CASE("IsAcceptableJobArgument refuses everything the allowlist does not name", "[compile-job]")
 {
     // The default is refusal. A path-shaped argument is refused as before, but so is

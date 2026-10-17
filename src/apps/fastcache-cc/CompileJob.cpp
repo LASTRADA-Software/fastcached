@@ -100,6 +100,11 @@ namespace
         /// the `-f` space is enumerated rather than prefixed -- so it is defence in
         /// depth beneath the allowlist, never a substitute for it.
         NoPathSeparator,
+        /// A `<from>=<to>` path-rewrite rule, whose two halves are paths and are allowed
+        /// separators: the compiler rewrites the strings it EMBEDS by them and opens neither.
+        /// Only a row naming a rewrite the compiler applies to text is this kind, and one
+        /// without an `=` is refused, since a driver reads it as no rule at all.
+        PrefixMapRule,
     };
 
     /// One entry in the allowlist of accepted argument shapes.
@@ -177,7 +182,7 @@ namespace
     /// exceeds Clang's 256-deep expression nesting limit and fails to compile. A
     /// stated extent only diagnoses rows being ADDED, so the `static_assert` below
     /// the table closes the other direction.
-    constexpr std::array<AllowedArg, 353> AllowedArgs {
+    constexpr std::array<AllowedArg, 354> AllowedArgs {
         // -- optimization ------------------------------------------------------
         AllowedArg { .spelling = "O", .families = DriverFamily::Any },
         AllowedArg { .spelling = "O0", .families = DriverFamily::Any },
@@ -554,6 +559,12 @@ namespace
             .spelling = "fpatchable-function-entry=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fopenmp-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "flto=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        // The client's own `__FILE__` / `source_location` rewrite: the worker compiles text
+        // whose `#line` markers name the client's paths, and applying the client's rule to
+        // them is what makes its object the one the client's compile would have written.
+        // GNU-only, as the launcher's row is; `-ffile-prefix-map` is not here because it also
+        // rewrites debug records, which a worker maps by rules of its own.
+        AllowedArg { .spelling = "fmacro-prefix-map=", .families = DriverFamily::Gnu, .value = ArgValue::PrefixMapRule },
         AllowedArg { .spelling = "fvect-cost-model=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg {
             .spelling = "fstack-protector-guard=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
@@ -678,6 +689,8 @@ namespace
             return body == row.spelling;
         if (!body.starts_with(row.spelling))
             return false;
+        if (row.value == ArgValue::PrefixMapRule)
+            return body.substr(row.spelling.size()).contains('=');
         // The shape rule, composed inside the prefix rather than deleted with it.
         return !body.contains('/') && !body.contains('\\');
     }

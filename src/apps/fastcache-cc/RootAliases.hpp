@@ -22,6 +22,10 @@ enum class CheckoutPart : std::uint8_t
     SourceRoot,
     /// `FASTCACHE_BINARY_DIR`, made absolute.
     BuildTree,
+    /// `FASTCACHE_DEPS_DIR`, made absolute: the machine's third-party source cache. An
+    /// object naming it is as machine-bound as one naming the checkout, and is bound the
+    /// same way; empty names nothing, as every part does.
+    DependencyRoot,
     /// The compile's working directory.
     WorkingDirectory,
     /// The count; not a part.

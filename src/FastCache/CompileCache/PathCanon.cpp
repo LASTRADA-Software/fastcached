@@ -17,6 +17,7 @@ namespace
 
     constexpr std::string_view SrcRootSentinel = "<SRCROOT>";
     constexpr std::string_view BuildTreeSentinel = "<BUILDTREE>";
+    constexpr std::string_view DependencyRootSentinel = "<DEPROOT>";
 
     /// Either separator, because a compiler emits both and often in one path.
     [[nodiscard]] constexpr bool IsPathSeparator(char c) noexcept
@@ -207,9 +208,29 @@ namespace
     /// to compute once rather than to remember.
     struct FoldedRoots
     {
-        std::string sourceRoot; ///< Comparison form of `Layout::sourceRoot`.
-        std::string buildTree;  ///< Comparison form of `Layout::buildTree`.
+        std::string sourceRoot;     ///< Comparison form of `Layout::sourceRoot`.
+        std::string buildTree;      ///< Comparison form of `Layout::buildTree`.
+        std::string dependencyRoot; ///< Comparison form of `Layout::dependencyRoot`.
     };
+
+    /// One root a path can be canonicalized against: its sentinel, where the layout keeps
+    /// it, and where its folded form lives. Adding a root is a row.
+    struct RootRow
+    {
+        std::string_view sentinel;         ///< The token the root becomes.
+        std::string Layout::* root;        ///< The root in native form.
+        std::string FoldedRoots::* folded; ///< The same root's comparison form.
+    };
+
+    /// Every root, in TIE-BREAK order: of two roots equally deep, the earlier row wins.
+    /// The build tree first is the rule for a build tree nested at the source root; the
+    /// dependency root before the source root, because a cache that is both must keep
+    /// naming its dependencies by the machine-independent token.
+    constexpr std::array<RootRow, 3> RootRows { {
+        { .sentinel = BuildTreeSentinel, .root = &Layout::buildTree, .folded = &FoldedRoots::buildTree },
+        { .sentinel = DependencyRootSentinel, .root = &Layout::dependencyRoot, .folded = &FoldedRoots::dependencyRoot },
+        { .sentinel = SrcRootSentinel, .root = &Layout::sourceRoot, .folded = &FoldedRoots::sourceRoot },
+    } };
 
     /// Fold a layout's roots into their comparison forms, once.
     /// @param layout Producing machine's roots.
@@ -217,7 +238,8 @@ namespace
     [[nodiscard]] FoldedRoots FoldRoots(Layout const& layout)
     {
         return FoldedRoots { .sourceRoot = ComparisonForm(layout.sourceRoot),
-                             .buildTree = ComparisonForm(layout.buildTree) };
+                             .buildTree = ComparisonForm(layout.buildTree),
+                             .dependencyRoot = ComparisonForm(layout.dependencyRoot) };
     }
 
     /// Rewrite a single native path to a token. Longest matching root wins.
@@ -229,19 +251,22 @@ namespace
     {
         // Only this one varies per call; the roots arrive already folded.
         std::string const pathCmp = ComparisonForm(absolutePath);
-        std::string_view const srcCmp = folded.sourceRoot;
-        std::string_view const buildCmp = folded.buildTree;
-
-        bool const srcMatch = IsSegmentPrefix(pathCmp, srcCmp);
-        bool const buildMatch = IsSegmentPrefix(pathCmp, buildCmp);
 
         // Longest root wins so a build tree nested under the source root maps to
-        // <BUILDTREE>, not <SRCROOT>. Depth rather than size -- see RootDepth.
-        if (buildMatch && (!srcMatch || RootDepth(buildCmp) >= RootDepth(srcCmp)))
-            return std::string { BuildTreeSentinel } + '/' + PosixTail(absolutePath, layout.buildTree.size());
-        if (srcMatch)
-            return std::string { SrcRootSentinel } + '/' + PosixTail(absolutePath, layout.sourceRoot.size());
-        return std::string { absolutePath };
+        // <BUILDTREE>, not <SRCROOT>. Depth rather than size -- see RootDepth; a tie
+        // keeps the earlier row, which is what `>` rather than `>=` says.
+        RootRow const* best = nullptr;
+        for (auto const& row: RootRows)
+        {
+            std::string_view const rootCmp = folded.*(row.folded);
+            if (!IsSegmentPrefix(pathCmp, rootCmp))
+                continue;
+            if (best == nullptr || RootDepth(rootCmp) > RootDepth(folded.*(best->folded)))
+                best = &row;
+        }
+        if (best == nullptr)
+            return std::string { absolutePath };
+        return std::string { best->sentinel } + '/' + PosixTail(absolutePath, (layout.*(best->root)).size());
     }
 
     /// True when `path` opens with a drive specifier (`C:`), whatever follows it.
@@ -360,18 +385,9 @@ namespace
     ///         recognized sentinel.
     [[nodiscard]] std::string LocalizeOne(std::string_view token, Layout const& layout)
     {
-        // Sentinel -> the root it localizes against. Adding a sentinel is a new row.
-        struct SentinelRoot
-        {
-            std::string_view sentinel;
-            std::string Layout::* root;
-        };
-        constexpr std::array<SentinelRoot, 2> Roots { {
-            { .sentinel = SrcRootSentinel, .root = &Layout::sourceRoot },
-            { .sentinel = BuildTreeSentinel, .root = &Layout::buildTree },
-        } };
-
-        for (auto const& [sentinel, root]: Roots)
+        // Sentinel -> the root it localizes against: the same rows the canonicalizer
+        // walks, so a root added there is localized here without a second list.
+        for (auto const& [sentinel, root, folded]: RootRows)
         {
             if (!token.starts_with(sentinel))
                 continue;
@@ -806,7 +822,7 @@ namespace
 
 bool IsWindowsLayout(Layout const& layout) noexcept
 {
-    return IsWindowsRoot(layout.sourceRoot) || IsWindowsRoot(layout.buildTree);
+    return std::ranges::any_of(RootRows, [&layout](RootRow const& row) { return IsWindowsRoot(layout.*(row.root)); });
 }
 
 Anchor AnchorForLayout(std::string_view path, Layout const& layout) noexcept
@@ -841,12 +857,13 @@ RootRelation RelateToLayout(std::string_view path, Layout const& layout)
     // every path under every root.
     std::string const pathCmp = ComparisonForm(path);
     auto const folded = FoldRoots(layout);
-    auto const source = RelateFolded(pathCmp, folded.sourceRoot);
-    auto const build = RelateFolded(pathCmp, folded.buildTree);
     // Strongest answer wins, and `Under` outranking `NearMiss` is the whole content
     // of this function: with a build tree spelled as the source root's sibling, a
     // path inside it is a near miss of one root and correctly under the other.
-    return std::max(source, build);
+    auto strongest = RootRelation::Outside;
+    for (auto const& row: RootRows)
+        strongest = std::max(strongest, RelateFolded(pathCmp, folded.*(row.folded)));
+    return strongest;
 }
 
 std::string Canonicalize(std::string_view absolutePath, Layout const& layout)

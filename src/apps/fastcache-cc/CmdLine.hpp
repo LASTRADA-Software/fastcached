@@ -306,6 +306,23 @@ enum class PathValueRole : std::uint8_t
     SourcePrefixMap,
 };
 
+/// What a dispatched compile's line does with a path-valued flag.
+///
+/// Private: read where the worker's line is built and never stored or sent, so no
+/// enumerator carries a value.
+enum class RemoteLine : std::uint8_t
+{
+    /// Left off: the value names something on THIS machine the worker has no use for --
+    /// headers already inlined, an object and a depfile the client writes itself.
+    Dropped,
+    /// Sent verbatim: a rewrite the worker's compiler must apply to the client's paths in
+    /// the text it is handed, opening none of them (`-fmacro-prefix-map`). Asked AHEAD of the
+    /// role's `UndispatchableBecause`, which is what lets one row of a refused role travel:
+    /// `-ffile-prefix-map`, which also rewrites debug records a worker maps by its own rules,
+    /// stays refused by the role.
+    Forwarded,
+};
+
 /// One spelling of a flag whose value is a filesystem path.
 struct PathValueFlag
 {
@@ -339,6 +356,10 @@ struct PathValueFlag
     /// parser refuses the bare spelling as uncacheable rather than reading
     /// `-clang:dep.d` as a path. CMake's Ninja generator emits the fused form (#1531).
     bool joinedOnly { false };
+
+    /// What a dispatched compile's line does with it. A column rather than a role test,
+    /// because two rows of one role differ here.
+    RemoteLine remote { RemoteLine::Dropped };
 };
 
 /// Every flag whose value is a filesystem path, in one table.

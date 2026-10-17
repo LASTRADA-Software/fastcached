@@ -386,6 +386,9 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              // else, so the summary carrying the recipe is load-bearing
                              // rather than decorative -- asserted separately below.
                              "FASTCACHE_MSVC_DEPS_PREFIX",
+                             // The third root: without it on the help page an operator
+                             // reading why two machines never share has nothing to find.
+                             "FASTCACHE_DEPS_DIR",
                              // The three below are not the launcher's own -- they are
                              // the usual per-user state locations, documented as
                              // `UsageEntry` rows rather than `EnvVarSpec` ones -- so

@@ -221,41 +221,54 @@ TEST_CASE("The key probe and the dispatched line drop clang-cl's pass-through de
     CHECK(std::ranges::contains(*remote, "/EHsc"));
 }
 
-TEST_CASE("A source prefix map stays on the preprocess line and keeps the compile local")
+TEST_CASE("A source prefix map stays on the preprocess line; the macro map travels, the file map stays local")
 {
     // `-ffile-prefix-map` and `-fmacro-prefix-map` rewrite `__FILE__` in the preprocessed
     // text, so dropping them -- what every other path-valued row but the include directory
     // gets -- would hash text the real compile does not produce. `-fdebug-prefix-map`
     // changes no text and is the control: dropped as before.
+    auto const lineWith = [](std::string const& map) {
+        return std::vector<std::string> {
+            "g++", map, "-fdebug-prefix-map=/home/ci/src=.", "-O2", "-c", "/home/ci/src/tu.cpp", "-o", "tu.o",
+        };
+    };
     for (std::string_view const flag: { "-ffile-prefix-map", "-fmacro-prefix-map" })
     {
         INFO("flag " << flag);
         auto const map = std::format("{}=/home/ci/src/=", flag);
-        std::vector<std::string> const argv {
-            "g++", map, "-fdebug-prefix-map=/home/ci/src=.", "-O2", "-c", "/home/ci/src/tu.cpp", "-o", "tu.o",
-        };
+        auto const argv = lineWith(map);
         auto const cmd = Parse(argv);
         REQUIRE(cmd.parsedOk);
 
         auto const pp = PreprocessCommand(cmd, argv);
         CHECK(std::ranges::contains(pp, map));
         CHECK_FALSE(std::ranges::contains(pp, "-fdebug-prefix-map=/home/ci/src=."));
-
-        // Refused for dispatch, by the argument -- not passed over as a path a worker need
-        // not see, which would have the worker embed the client's `#line` paths unmapped.
-        auto const remote = RemoteCompileArgs(cmd, argv, {});
-        REQUIRE_FALSE(remote.has_value());
-        CHECK(remote.error().contains(flag));
-        CHECK(remote.error().contains("rewrites the source paths"));
     }
 
-    // The control for the refusal: the same line without the source map dispatches.
-    std::vector<std::string> const plain { "g++", "-fdebug-prefix-map=/home/ci/src=.", "-O2", "-c", "tu.cpp", "-o", "tu.o" };
-    auto const plainCmd = Parse(plain);
-    REQUIRE(plainCmd.parsedOk);
-    auto const remote = RemoteCompileArgs(plainCmd, plain, {});
-    INFO("refused: " << remote.error_or(""));
-    CHECK(remote.has_value());
+    // The macro map TRAVELS, verbatim: the worker compiles text whose `#line` markers name
+    // this machine's paths, and its `source_location` agrees with ours only under our rule.
+    // Neither is it a path the worker opens, so it is no reason to keep the compile local.
+    {
+        auto const map = std::string { "-fmacro-prefix-map=/home/ci/src/=" };
+        auto const argv = lineWith(map);
+        auto const remote = RemoteCompileArgs(Parse(argv), argv, {});
+        INFO("refused: " << remote.error_or(""));
+        REQUIRE(remote.has_value());
+        CHECK(std::ranges::contains(*remote, map));
+        // The debug map beside it is still the worker's own business and does not travel.
+        CHECK_FALSE(std::ranges::contains(*remote, "-fdebug-prefix-map=/home/ci/src=."));
+    }
+
+    // The file map keeps the line local, by the argument: it also rewrites the debug records a
+    // worker maps by rules of its own, so neither sending nor dropping it reproduces our object.
+    {
+        auto const map = std::string { "-ffile-prefix-map=/home/ci/src/=" };
+        auto const argv = lineWith(map);
+        auto const remote = RemoteCompileArgs(Parse(argv), argv, {});
+        REQUIRE_FALSE(remote.has_value());
+        CHECK(remote.error().contains("-ffile-prefix-map"));
+        CHECK(remote.error().contains("rewrites the source paths"));
+    }
 }
 
 TEST_CASE("The end-of-options marker stays with the source, which never travels")
