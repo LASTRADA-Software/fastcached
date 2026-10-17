@@ -1539,7 +1539,7 @@ Consequences that are each load-bearing:
   `--bind` is the obvious answer to "is this port local",
   and it is wrong for a reason nothing in this tree stated until now. Under
   activation the unit owns the address -- the shipped
-  `fastcache-compile-node.socket` says `ListenStream=6676`, every interface -- and
+  `fastcache-compile-node.socket` says `ListenStream=6674`, every interface -- and
   `--bind`/`--port` are read by nothing. The value is still *in* the configuration;
   it has simply stopped describing anything. So a keyless node carrying a stale
   `--bind=127.0.0.1` in its configuration, plus `--fleet-open`, passed the startup

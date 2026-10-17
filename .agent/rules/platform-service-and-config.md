@@ -74,6 +74,18 @@ readable and silently ignored. Every rule below has already been one of them.
     the docs and the reference configuration cite under `/var/` against the unit's
     `CacheDirectory=`, and fails OPEN on a path outside `/var/`, which reads the same
     for a node started by hand.
+  - **And it listens where this machine's CLIENTS dial, which is 6674 on every
+    platform** (#1676). The socket said 6676 on the reasoning that a scheduler hands
+    out a worker's endpoint, so the port is "never a client-side default" -- true of
+    the compile port, false once #290 put the node's cache verbs behind the same
+    socket: `fastcache-cc`, `CompileCache.cmake` and `fastcache-cli` all default to
+    `127.0.0.1:6674`, so no local build reached the node's cache while the docs said
+    one needed nothing set. The MSI already registers the node on its default and
+    `fastcached` DISABLED beside it; on Linux the socket takes the port from the
+    daemon `%post` starts by `Conflicts=fastcached.service` **and** `Before=` -- with
+    no ordering the two ran in parallel and the bind failed `Address already in use`,
+    and `After=` is a cycle through `sockets.target`. The packaging e2e steps assert
+    the takeover, the .rpm one across a boot with both enabled.
   - **An owned path is created only when it is absent AND is not a file, and is
     otherwise handed over as whatever it already is.** The field is `ownedPaths`
     and not `ownedDirectories` because `storage_path` is allowed to name ONE CoW
