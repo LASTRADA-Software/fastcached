@@ -297,6 +297,38 @@ TEST_CASE("A line naming the host CPU is never dispatched, and nothing else is m
     CHECK(remote.has_value());
 }
 
+TEST_CASE("A depfile asked for without -MF is the one the driver writes, so a hit restores it")
+{
+    // #1689: `-MD`/`-MMD` alone make gcc and clang write `<object minus extension>.d`; the
+    // launcher knew a depfile only through `-MF`, so a HIT left it absent and a Makefile build
+    // lost every header dependency of the object. Names measured on both drivers.
+    struct Row
+    {
+        std::vector<std::string> args;
+        std::string_view depPath;
+    };
+    for (auto const& [args, depPath]: {
+             Row { { "-MMD", "-c", "a.cpp", "-o", "out/a.o" }, "out/a.d" },
+             Row { { "-MD", "-c", "a.cpp", "-o", "out/a.cpp.o" }, "out/a.cpp.d" },
+             Row { { "-MMD", "-c", "a.cpp", "-o", "out/noext" }, "out/noext.d" },
+             Row { { "-MMD", "-c", "a.cpp", "-o", "dir.v2/obj" }, "dir.v2/obj.d" },
+             Row { { "-c", "a.cpp", "-o", "w.o", "-Wp,-MMD,deps/k.d" }, "deps/k.d" },
+             Row { { "-MMD", "-MF", "named.d", "-c", "a.cpp", "-o", "a.o" }, "named.d" }, // -MF names it outright
+             Row { { "-c", "a.cpp", "-o", "a.o" }, "" },                                  // none asked for
+         })
+    {
+        std::vector<std::string> argv { "g++" };
+        argv.insert(argv.end(), args.begin(), args.end());
+        INFO(argv.back());
+        auto const cmd = Parse(argv);
+        REQUIRE(cmd.parsedOk);
+        CHECK(cmd.depPath == depPath);
+    }
+    // An MSVC driver writes no GNU depfile, whatever its line says.
+    std::vector<std::string> const msvc { "cl.exe", "/c", "a.cpp", "/Foa.obj" };
+    CHECK(Parse(msvc).depPath.empty());
+}
+
 TEST_CASE("The end-of-options marker stays with the source, which never travels")
 {
     // CMake's clang-cl rule ends `-c -- $in`. The launcher dropped the source and forwarded

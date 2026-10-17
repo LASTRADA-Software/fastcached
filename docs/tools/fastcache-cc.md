@@ -76,6 +76,10 @@ and comment lines, so a comment inserted above a function kept the key while
 `std::source_location`, `__builtin_LINE` and the `-g` line tables moved, and the
 edited file was served the object built before the edit.
 
+A depfile asked for without naming it -- `-MD`/`-MMD` alone, which make the
+driver write `<object without its extension>.d`, or Kbuild's `-Wp,-MMD,<file>` --
+is restored by a hit exactly as one named with `-MF` is.
+
 `-march=native` (and `-mcpu=`/`-mtune=native`) is keyed by the CPU the compiler
 resolves it to on the machine that compiles, read from its `-###` listing, so a
 shared cache never hands one CPU's object to another. Such a compile is never

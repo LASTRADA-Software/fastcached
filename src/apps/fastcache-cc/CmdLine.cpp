@@ -1345,6 +1345,44 @@ std::optional<std::span<std::string_view const>> PreprocessedInputFlagsFor(Drive
     return std::nullopt;
 }
 
+namespace
+{
+    /// The depfile a GNU driver writes when the line asks for one WITHOUT naming it.
+    ///
+    /// `-MD` / `-MMD` alone make gcc and clang write the dependency record beside the object:
+    /// the `-o` path with its last extension replaced by `.d`, or `.d` appended when it has
+    /// none (measured on both: `a.o` -> `a.d`, `a.cpp.o` -> `a.cpp.d`, `noext` -> `noext.d`).
+    /// `-Wp,-MD,<file>` and `-Wp,-MMD,<file>` (Kbuild's spelling) name it outright. Unknown to
+    /// the launcher, a HIT restored the object and no depfile, and a Makefile build lost every
+    /// header dependency of that object (#1689).
+    /// @param args    The compile arguments (excluding the compiler).
+    /// @param objPath The object the line writes.
+    /// @return The depfile, or empty when the line asks for none.
+    [[nodiscard]] std::string ImpliedDepFile(std::span<std::string const> args, std::string_view objPath)
+    {
+        constexpr std::array<std::string_view, 2> NamingPrefixes { "-Wp,-MD,", "-Wp,-MMD," };
+        constexpr std::array<std::string_view, 2> ImplyingSwitches { "-MD", "-MMD" };
+        std::string named;
+        bool implied = false;
+        for (auto const& arg: args)
+        {
+            for (auto const prefix: NamingPrefixes)
+                if (arg.starts_with(prefix) && arg.size() > prefix.size())
+                    named = arg.substr(prefix.size());
+            if (std::ranges::contains(ImplyingSwitches, arg))
+                implied = true;
+        }
+        if (!named.empty())
+            return named;
+        if (!implied || objPath.empty())
+            return {};
+        auto const nameStart = objPath.find_last_of("/\\") + 1; // npos + 1 wraps to 0
+        auto const dot = objPath.find_last_of('.');
+        auto const stem = dot == std::string_view::npos || dot < nameStart ? objPath : objPath.substr(0, dot);
+        return std::format("{}.d", stem);
+    }
+} // namespace
+
 ParsedCommand ParseCommand(std::span<std::string const> argv)
 {
     ParsedCommand out;
@@ -1465,6 +1503,10 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     // covers a precompiled header.
     if (auto const language = LanguageOfSource(out.source); language.has_value() && !UncacheableBecause(*language).empty())
         out.sideArtefact = true;
+
+    // A dependency record the line asks for without naming it with `-MF` (#1689).
+    if (out.depPath.empty() && out.flavor != Flavor::Unknown && DriverOf(out.flavor).usesDepfile && argv.size() > 1)
+        out.depPath = ImpliedDepFile(argv.subspan(1), out.objPath);
 
     out.parsedOk = !out.source.empty() && !out.objPath.empty() && sawCompileOnly && !preprocessOnly && !out.sideArtefact
                    && !out.separatedPassThrough;
